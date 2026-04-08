@@ -69,6 +69,14 @@ pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
     libavutil
 )
 
+# OpenCV (可选，用于可视化)
+find_package(OpenCV QUIET)
+if(OpenCV_FOUND)
+    message(STATUS "OpenCV found: ${OpenCV_VERSION}")
+else()
+    message(STATUS "OpenCV not found, visualization disabled")
+endif()
+
 # Rockchip MPP
 if(ENABLE_MPP_DECODER OR ROCKCHIP_PLATFORM)
     find_path(MPP_INCLUDE_DIR rk_mpi.h
@@ -233,6 +241,14 @@ list(APPEND POSTPROC_SOURCES
     src/backends/postproc_factory.cpp
 )
 
+# 可视化 (OpenCV)
+if(OpenCV_FOUND)
+    list(APPEND VISUAL_SOURCES
+        src/backends/opencv_visualizer.cpp
+    )
+    add_compile_definitions(ENABLE_VISUAL)
+endif()
+
 # =============================================================================
 # 可执行文件
 # =============================================================================
@@ -243,6 +259,7 @@ add_executable(video_pipeline
     ${PREPROC_SOURCES}
     ${INFER_SOURCES}
     ${POSTPROC_SOURCES}
+    ${VISUAL_SOURCES}
 )
 
 target_include_directories(rk_video_pipeline PRIVATE
@@ -269,6 +286,11 @@ endif()
 target_link_libraries(video_pipeline PRIVATE
     PkgConfig::FFMPEG
 )
+
+if(OpenCV_FOUND)
+    target_link_libraries(video_pipeline PRIVATE ${OpenCV_LIBS})
+    target_include_directories(video_pipeline PRIVATE ${OpenCV_INCLUDE_DIRS})
+endif()
 
 if(MPP_LIBRARY)
     target_link_libraries(video_pipeline PRIVATE ${MPP_LIBRARY})

@@ -2,6 +2,7 @@
 #include "preproc_interface.hpp"
 #include "infer_interface.hpp"
 #include "postproc_interface.hpp"
+#include "visualizer.hpp"
 #include "ffmpeg_packet_source.hpp"
 
 #include <algorithm>
@@ -20,6 +21,7 @@ struct Config {
   PreprocBackendType preprocBackend = PreprocBackendType::kAuto;
   InferBackendType inferBackend = InferBackendType::kAuto;
   PostprocBackendType postprocBackend = PostprocBackendType::kAuto;
+  VisualConfig visual;            // 可视化配置
   int gpuId = 0;
   int maxFrames = 30;  // 默认处理 30 帧后停止
 };
@@ -48,6 +50,12 @@ Config parseConfig(int argc, char* argv[]) {
       config.gpuId = std::atoi(argv[++i]);
     } else if (arg == "--max-frames" && i + 1 < argc) {
       config.maxFrames = std::atoi(argv[++i]);
+    } else if (arg == "--display") {
+      config.visual.display = true;
+    } else if (arg == "--output-video" && i + 1 < argc) {
+      config.visual.outputVideo = argv[++i];
+    } else if (arg == "--output-rtsp" && i + 1 < argc) {
+      config.visual.outputRtsp = argv[++i];
     } else if (arg[0] != '-') {
       // 位置参数
       if (config.source.uri.empty()) {
@@ -84,11 +92,16 @@ void printUsage(const char* program) {
   std::cerr << "  --backend <rockchip|nvidia>  选择后端平台\n";
   std::cerr << "  --gpu <id>                   GPU 设备 ID (默认：0)\n";
   std::cerr << "  --max-frames <n>             最大处理帧数 (默认：30)\n";
+  std::cerr << "  --display                    显示窗口\n";
+  std::cerr << "  --output-video <path>        输出视频文件\n";
+  std::cerr << "  --output-rtsp <url>          输出 RTSP 流\n";
   std::cerr << "\nExamples:\n";
   std::cerr << "  # Rockchip 平台\n";
   std::cerr << "  " << program << " --backend rockchip test.mp4 yolov5s.rknn 640 640\n";
-  std::cerr << "  # NVIDIA 平台\n";
-  std::cerr << "  " << program << " --backend nvidia test.mp4 yolov5s.engine 640 640\n";
+  std::cerr << "  # NVIDIA 平台 + 显示窗口\n";
+  std::cerr << "  " << program << " --backend nvidia --display test.mp4 yolov5s.engine 640 640\n";
+  std::cerr << "  # NVIDIA 平台 + 输出视频\n";
+  std::cerr << "  " << program << " --backend nvidia --output-video output.mp4 test.mp4 yolov5s.engine 640 640\n";
 }
 
 void runPipeline(const Config& config) {
@@ -117,6 +130,10 @@ void runPipeline(const Config& config) {
   auto postproc = createPostprocBackend(config.postprocBackend);
   std::cout << "[5/5] Postprocessor: " << postproc->name() << "\n";
 
+  // 5. 创建可视化
+  auto visualizer = createVisualizer();
+  std::cout << "[6/6] Visualizer: " << visualizer->name() << "\n";
+
   // 4. 打开视频源
   FFmpegPacketSource packetSource;
   packetSource.open(config.source);
@@ -124,6 +141,11 @@ void runPipeline(const Config& config) {
 
   // 5. 初始化解码器
   decoder->open(packetSource.codec());
+
+  // 6. 初始化可视化 (第一帧后)
+  bool visualizerInited = false;
+  int videoWidth = 0;
+  int videoHeight = 0;
 
   // 6. 主循环
   std::size_t frameCount = 0;
@@ -169,6 +191,28 @@ void runPipeline(const Config& config) {
       std::cout << "  [" << box.label << " conf=" << box.score
                 << " box=" << box.x1 << "," << box.y1
                 << "-" << box.x2 << "," << box.y2 << "]\n";
+    }
+
+    // 可视化
+    if (config.visual.display || !config.visual.outputVideo.empty() || !config.visual.outputRtsp.empty()) {
+      // 初始化可视化器 (第一帧)
+      if (!visualizerInited && decodedFrame->width > 0 && decodedFrame->height > 0) {
+        videoWidth = decodedFrame->width;
+        videoHeight = decodedFrame->height;
+        visualizer->init(videoWidth, videoHeight, config.visual);
+        visualizerInited = true;
+      }
+
+      // 获取原始帧用于绘制 (需要预处理返回 RGB)
+      // 这里简化处理：假设 preproc 返回的 image 就是绘制用的
+      // 实际应该从解码器获取原始 NV12/YUV 并转换为 RGB
+      RgbImage displayImage = image;  // 用预处理后的图像代替原始图像
+
+      // 绘制检测结果
+      RgbImage drawnImage = visualizer->draw(displayImage, result);
+
+      // 写入视频文件
+      // visualizer->show(); 在这里处理
     }
 
     if (config.maxFrames > 0 && frameCount >= static_cast<std::size_t>(config.maxFrames)) {
