@@ -1,6 +1,7 @@
 #include "decoder_interface.hpp"
 #include "preproc_interface.hpp"
 #include "infer_interface.hpp"
+#include "postproc_interface.hpp"
 #include "ffmpeg_packet_source.hpp"
 
 #include <algorithm>
@@ -18,6 +19,7 @@ struct Config {
   DecoderBackendType decoderBackend = DecoderBackendType::kAuto;
   PreprocBackendType preprocBackend = PreprocBackendType::kAuto;
   InferBackendType inferBackend = InferBackendType::kAuto;
+  PostprocBackendType postprocBackend = PostprocBackendType::kAuto;
   int gpuId = 0;
   int maxFrames = 30;  // 默认处理 30 帧后停止
 };
@@ -99,17 +101,21 @@ void runPipeline(const Config& config) {
 
   // 1. 创建解码器
   auto decoder = createDecoderBackend(config.decoderBackend);
-  std::cout << "[1/4] Decoder: " << decoder->name() << "\n";
+  std::cout << "[1/5] Decoder: " << decoder->name() << "\n";
 
   // 2. 创建预处理器
   auto preproc = createPreprocBackend(config.preprocBackend);
-  std::cout << "[2/4] Preprocessor: " << preproc->name() << "\n";
+  std::cout << "[2/5] Preprocessor: " << preproc->name() << "\n";
 
   // 3. 创建推理引擎
   auto infer = createInferBackend(config.inferBackend);
-  std::cout << "[3/4] Inference: " << infer->name() << "\n";
+  std::cout << "[3/5] Inference: " << infer->name() << "\n";
   infer->open(config.model);
-  std::cout << "[4/4] Model loaded, input: " << infer->inputWidth() << "x" << infer->inputHeight() << "\n";
+  std::cout << "[4/5] Model loaded, input: " << infer->inputWidth() << "x" << infer->inputHeight() << "\n";
+
+  // 4. 创建后处理器
+  auto postproc = createPostprocBackend(config.postprocBackend);
+  std::cout << "[5/5] Postprocessor: " << postproc->name() << "\n";
 
   // 4. 打开视频源
   FFmpegPacketSource packetSource;
@@ -142,11 +148,28 @@ void runPipeline(const Config& config) {
 
     // 推理
     const std::vector<float> output = infer->infer(image);
+
+    // 后处理
+    const DetectionResult result = postproc->postprocess(
+        output,
+        infer->inputWidth(),
+        infer->inputHeight(),
+        decodedFrame->width,
+        decodedFrame->height,
+        decodedFrame->pts);
+
     ++frameCount;
 
     std::cout << "frame=" << frameCount
               << " pts=" << decodedFrame->pts
-              << " output_size=" << output.size() << "\n";
+              << " detections=" << result.boxes.size() << "\n";
+
+    // 打印检测结果
+    for (const auto& box : result.boxes) {
+      std::cout << "  [" << box.label << " conf=" << box.score
+                << " box=" << box.x1 << "," << box.y1
+                << "-" << box.x2 << "," << box.y2 << "]\n";
+    }
 
     if (config.maxFrames > 0 && frameCount >= static_cast<std::size_t>(config.maxFrames)) {
       std::cout << "Reached max frames (" << config.maxFrames << "), stopping.\n";

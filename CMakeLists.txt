@@ -152,6 +152,7 @@ set(COMMON_SOURCES
 set(DECODER_SOURCES "")
 set(PREPROC_SOURCES "")
 set(INFER_SOURCES "")
+set(POSTPROC_SOURCES "")
 
 # MPP 解码器
 if(ENABLE_MPP_DECODER)
@@ -226,6 +227,12 @@ if(ENABLE_TRT_INFER)
     endif()
 endif()
 
+# 后处理 (YOLO 后处理)
+list(APPEND POSTPROC_SOURCES
+    src/backends/yolo_postproc.cpp
+    src/backends/postproc_factory.cpp
+)
+
 # =============================================================================
 # 可执行文件
 # =============================================================================
@@ -235,6 +242,7 @@ add_executable(video_pipeline
     ${DECODER_SOURCES}
     ${PREPROC_SOURCES}
     ${INFER_SOURCES}
+    ${POSTPROC_SOURCES}
 )
 
 target_include_directories(rk_video_pipeline PRIVATE
@@ -297,5 +305,6 @@ message(STATUS "RGA Preproc: ${ENABLE_RGA_PREPROC}")
 message(STATUS "CUDA Preproc: ${ENABLE_CUDA_PREPROC}")
 message(STATUS "RKNN Infer: ${ENABLE_RKNN_INFER}")
 message(STATUS "TensorRT Infer: ${ENABLE_TRT_INFER}")
+message(STATUS "Postproc: ON")
 message(STATUS "===========================")
 message(STATUS "")
