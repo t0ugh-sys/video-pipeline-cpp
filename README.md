@@ -71,6 +71,8 @@ video-pipeline-cpp/
 │   ├── decoder_interface.hpp    # 解码器接口
 │   ├── preproc_interface.hpp    # 预处理接口
 │   ├── infer_interface.hpp      # 推理接口
+│   ├── postproc_interface.hpp   # 后处理接口
+│   ├── detection.hpp            # 检测结果结构体
 │   ├── pipeline_types.hpp       # 共享数据类型
 │   ├── ffmpeg_packet_source.hpp # FFmpeg 解复用
 │   └── backends/
@@ -79,7 +81,8 @@ video-pipeline-cpp/
 │       ├── rga_preprocessor.hpp # Rockchip RGA 预处理
 │       ├── cuda_preprocessor.hpp# CUDA 预处理
 │       ├── rknn_infer.hpp       # RKNN 推理
-│       └── trt_infer.hpp        # TensorRT 推理
+│       ├── trt_infer.hpp        # TensorRT 推理
+│       └── yolo_postproc.hpp    # YOLO 后处理
 │
 ├── src/
 │   ├── main.cpp                 # 统一入口
@@ -91,11 +94,17 @@ video-pipeline-cpp/
 │       ├── cuda_preprocessor.cpp
 │       ├── rknn_infer.cpp
 │       ├── trt_infer.cpp
+│       ├── yolo_postproc.cpp     # YOLO 后处理实现
 │       ├── decoder_factory.cpp
 │       ├── preproc_factory.cpp
-│       └── infer_factory.cpp
+│       ├── infer_factory.cpp
+│       └── postproc_factory.cpp
+│
+├── models/
+│   └── coco_labels.txt          # COCO 80 类标签
 │
 ├── CMakeLists.txt
+├── LICENSE
 └── README.md
 ```
 
@@ -127,18 +136,26 @@ video-pipeline-cpp/
 ## 处理流程
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  FFmpeg     │────▶│  Decoder    │────▶│ Preprocessor│────▶│  Inference  │
-│  Demux      │     │ (MPP/NVDEC) │     │ (RGA/CUDA)  │     │ (RKNN/TRT)  │
-└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
+┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
+│  FFmpeg     │────▶│  Decoder    │────▶│ Preprocessor│────▶│  Inference  │────▶│ Postprocess │
+│  Demux      │     │ (MPP/NVDEC) │     │ (RGA/CUDA)  │     │ (RKNN/TRT)  │     │ (YOLO NMS)  │
+└─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘     └─────────────┘
 ```
+
+## 支持的 YOLO 模型
+
+| 模型 | 输出格式 | NMS |
+|------|----------|-----|
+| YOLOv8 | (batch, 84, 8400) = 4 bbox + 80 classes | 需要 |
+| YOLO26 (一对一) | (batch, 300, 6) = x1,y1,x2,y2,conf,class | **不需要** |
+| YOLO26 (一对多) | (batch, 84, 8400) | 需要 |
 
 ## 已知限制
 
 - 这是"最小可改造工程骨架"，不是完整生产工程
 - CUDA 预处理需要完整实现零拷贝路径
-- 当前未实现检测框解析、显示和推流
+- 当前未实现显示和推流
 
 ## License
 
-MIT
+MIT License - 详见 [LICENSE](LICENSE) 文件
