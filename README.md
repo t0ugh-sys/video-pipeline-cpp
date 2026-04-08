@@ -1,4 +1,4 @@
-# rk-video-pipeline-cpp
+# video-pipeline-cpp
 
 一个支持 **Rockchip** 和 **NVIDIA** 双平台的视频推理最小工程骨架。
 
@@ -18,7 +18,7 @@ cmake -S . -B build -DPLATFORM=rockchip
 cmake --build build -j4
 
 # 运行
-./build/rk_video_pipeline --backend rockchip test.mp4 yolov5s.rknn 640 640
+./build/video_pipeline --backend rockchip test.mp4 yolov5s.rknn 640 640
 ```
 
 ### NVIDIA 平台
@@ -28,7 +28,7 @@ cmake -S . -B build -DPLATFORM=nvidia
 cmake --build build -j4
 
 # 运行
-./build/rk_video_pipeline --backend nvidia test.mp4 yolov5s.engine 640 640
+./build/video_pipeline --backend nvidia test.mp4 yolov5s.engine 640 640
 ```
 
 ### 自动检测
@@ -38,19 +38,20 @@ cmake -S . -B build
 cmake --build build -j4
 
 # 运行时指定后端
-./build/rk_video_pipeline --backend rockchip test.mp4 model.rknn
-./build/rk_video_pipeline --backend nvidia test.mp4 model.engine
+./build/video_pipeline --backend rockchip test.mp4 model.rknn
+./build/video_pipeline --backend nvidia test.mp4 model.engine
 ```
 
 ## 命令行参数
 
 ```
-Usage: rk_video_pipeline [options] <video_or_rtsp> <model_file> [width] [height]
+Usage: video_pipeline [options] <video_or_rtsp> <model_file> [width] [height]
 
 Options:
   --backend <rockchip|nvidia>  选择后端平台
   --gpu <id>                   GPU 设备 ID (默认：0)
   --max-frames <n>             最大处理帧数 (默认：30)
+  -h, --help                   显示帮助
 ```
 
 ## 环境变量
@@ -65,7 +66,7 @@ Options:
 ## 目录结构
 
 ```
-rk-video-pipeline-cpp/
+video-pipeline-cpp/
 ├── include/
 │   ├── decoder_interface.hpp    # 解码器接口
 │   ├── preproc_interface.hpp    # 预处理接口
@@ -137,3 +138,7 @@ rk-video-pipeline-cpp/
 - 这是"最小可改造工程骨架"，不是完整生产工程
 - CUDA 预处理需要完整实现零拷贝路径
 - 当前未实现检测框解析、显示和推流
+
+## License
+
+MIT
