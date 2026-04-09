@@ -11,6 +11,10 @@ extern "C" {
 #include <stdexcept>
 #include <cstring>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace {
 
 void checkAvStatus(int status, const char* message) {
@@ -30,7 +34,12 @@ NvdecDecoder::~NvdecDecoder() {
 void NvdecDecoder::open(VideoCodec codec) {
   close();
 
-  // 1. 创建 CUDA 硬件设备上下文
+#ifdef _WIN32
+  // Windows: 使用 cuvid 解码器，不需要 CUDA 上下文
+  // FFmpeg 会自动使用 h264_cuvid/hevc_cuvid 解码器
+  (void)codec;
+#else
+  // Linux: 创建 CUDA 硬件设备上下文
   int ret = av_hwdevice_ctx_create(
       &hw_device_ctx_,
       AV_HWDEVICE_TYPE_CUDA,
@@ -38,9 +47,14 @@ void NvdecDecoder::open(VideoCodec codec) {
       nullptr,
       0);
   checkAvStatus(ret, "Failed to create CUDA hardware device context");
+#endif
 
-  // 2. 查找解码器
+  // 2. 查找解码器 (Windows: cuvid, Linux: h264_cuvid with CUDA)
+#ifdef _WIN32
+  const AVCodec* av_codec = avcodec_find_decoder_by_name("h264_cuvid");
+#else
   const AVCodec* av_codec = avcodec_find_decoder(toAVCodec(codec));
+#endif
   if (!av_codec) {
     throw std::runtime_error("Codec not found");
   }
@@ -51,7 +65,8 @@ void NvdecDecoder::open(VideoCodec codec) {
     throw std::runtime_error("Failed to allocate codec context");
   }
 
-  // 4. 设置硬件加速
+#ifndef _WIN32
+  // 4. 设置硬件加速 (Linux only)
   codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
   if (!codec_ctx_->hw_device_ctx) {
     throw std::runtime_error("Failed to reference hardware device context");
@@ -61,19 +76,30 @@ void NvdecDecoder::open(VideoCodec codec) {
   if (gpu_id_ >= 0) {
     av_opt_set_int(codec_ctx_->hw_device_ctx->data, "cuda_device", gpu_id_, 0);
   }
+#endif
 
   // 6. 设置输出格式为 NV12 (NVDEC 原生输出)
   codec_ctx_->get_format = [](AVCodecContext* ctx, const AVPixelFormat* pix_fmts) {
     for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+#ifdef _WIN32
+      if (*p == AV_PIX_FMT_NV12) {
+        return *p;
+      }
+#else
       if (*p == AV_PIX_FMT_CUDA) {
         return *p;
       }
+#endif
     }
     return AV_PIX_FMT_NONE;
   };
 
   // 7. 打开编解码器
+#ifdef _WIN32
+  int ret = avcodec_open2(codec_ctx_, av_codec, nullptr);
+#else
   ret = avcodec_open2(codec_ctx_, av_codec, nullptr);
+#endif
   checkAvStatus(ret, "Failed to open codec");
 
   // 8. 获取视频尺寸 (如果有)
