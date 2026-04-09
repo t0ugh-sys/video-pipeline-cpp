@@ -243,14 +243,25 @@ list(APPEND POSTPROC_SOURCES
     src/backends/postproc_factory.cpp
 )
 
-# 编码器 (NVENC)
+# 编码器 (NVENC + MPP)
 if(ENABLE_NVDEC_DECODER)
     list(APPEND ENCODER_SOURCES
         src/backends/nvenc_encoder.cpp
-        src/backends/encoder_factory.cpp
     )
     add_compile_definitions(ENABLE_NVENC_ENCODER)
 endif()
+
+# MPP 编码器
+if(ENABLE_MPP_DECODER)
+    list(APPEND ENCODER_SOURCES
+        src/backends/mpp_encoder.cpp
+    )
+    add_compile_definitions(ENABLE_MPP_ENCODER)
+endif()
+
+list(APPEND ENCODER_SOURCES
+    src/backends/encoder_factory.cpp
+)
 
 # 可视化 (OpenCV)
 if(OpenCV_FOUND)

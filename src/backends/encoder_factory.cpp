@@ -1,5 +1,6 @@
 #include "encoder_interface.hpp"
 #include "backends/nvenc_encoder.hpp"
+#include "backends/mpp_encoder.hpp"
 
 #include <stdexcept>
 
@@ -23,8 +24,7 @@ std::unique_ptr<IEncoderBackend> createEncoderBackend(EncoderBackendType type) {
       return std::make_unique<NvencEncoder>();
 
     case EncoderBackendType::kRockchipMpp:
-      // TODO: 实现 MPP 编码器
-      throw std::runtime_error("Rockchip MPP encoder not yet implemented");
+      return std::make_unique<MppEncoder>();
 
     case EncoderBackendType::kCpu:
       // TODO: 实现 CPU 软编码
