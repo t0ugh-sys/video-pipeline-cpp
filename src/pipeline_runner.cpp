@@ -8,10 +8,10 @@
 #include "preproc_interface.hpp"
 #include "visualizer.hpp"
 
+#include <fstream>
 #include <iostream>
 #include <optional>
 #include <stdexcept>
-#include <vector>
 
 namespace {
 
@@ -31,49 +31,41 @@ void requireCompiledIn(
       "' is not available in this build. Available: " + availableFn());
 }
 
+void maybeDumpFirstFrame(const AppConfig& config, const RgbImage& image, std::size_t frameCount) {
+  if (!config.dumpFirstFrame || frameCount != 1) {
+    return;
+  }
+
+  const std::string path = "dump_first_frame.ppm";
+  std::ofstream output(path, std::ios::binary);
+  if (!output.is_open()) {
+    throw std::runtime_error("Failed to open dump_first_frame.ppm for writing");
+  }
+
+  output << "P6\n" << image.width << " " << image.height << "\n255\n";
+  output.write(reinterpret_cast<const char*>(image.data.data()), static_cast<std::streamsize>(image.data.size()));
+}
+
 }  // namespace
 
 void validateAppConfig(const AppConfig& config) {
   if (config.source.uri.empty()) {
     throw std::runtime_error("Input source is required");
   }
-
   if (config.model.modelPath.empty()) {
     throw std::runtime_error("Model path is required");
   }
-
   if (config.model.inputWidth <= 0 || config.model.inputHeight <= 0) {
     throw std::runtime_error("Model input size must be positive");
   }
-
   if (config.maxFrames < 0) {
     throw std::runtime_error("maxFrames must be greater than or equal to 0");
   }
 
-  requireCompiledIn(
-      config.decoderBackend,
-      "decoder",
-      isCompiledIn,
-      availableDecoderBackends,
-      toString);
-  requireCompiledIn(
-      config.preprocBackend,
-      "preprocessor",
-      isCompiledIn,
-      availablePreprocBackends,
-      toString);
-  requireCompiledIn(
-      config.inferBackend,
-      "inference",
-      isCompiledIn,
-      availableInferBackends,
-      toString);
-  requireCompiledIn(
-      config.postprocBackend,
-      "postprocessor",
-      isCompiledIn,
-      availablePostprocBackends,
-      toString);
+  requireCompiledIn(config.decoderBackend, "decoder", isCompiledIn, availableDecoderBackends, toString);
+  requireCompiledIn(config.preprocBackend, "preprocessor", isCompiledIn, availablePreprocBackends, toString);
+  requireCompiledIn(config.inferBackend, "inference", isCompiledIn, availableInferBackends, toString);
+  requireCompiledIn(config.postprocBackend, "postprocessor", isCompiledIn, availablePostprocBackends, toString);
 
   const bool needsVisualization =
       config.visual.display ||
@@ -89,29 +81,21 @@ void validateAppConfig(const AppConfig& config) {
 }
 
 void runPipeline(const AppConfig& config) {
-  std::cout << "=== Video Inference Pipeline ===\n";
-  std::cout << "Source: " << config.source.uri << "\n";
-  std::cout << "Model: " << config.model.modelPath << "\n";
-  std::cout << "Input: " << config.model.inputWidth << "x" << config.model.inputHeight << "\n";
-  std::cout << "Max Frames: " << config.maxFrames << "\n";
-  std::cout << "===============================\n\n";
-
   auto decoder = createDecoderBackend(config.decoderBackend);
-  std::cout << "[1/6] Decoder: " << decoder->name() << "\n";
-
   auto preproc = createPreprocBackend(config.preprocBackend);
-  std::cout << "[2/6] Preprocessor: " << preproc->name() << "\n";
-
   auto infer = createInferBackend(config.inferBackend);
-  std::cout << "[3/6] Inference: " << infer->name() << "\n";
-  infer->open(config.model);
-  std::cout << "[4/6] Model loaded, input: " << infer->inputWidth() << "x" << infer->inputHeight() << "\n";
-
-  auto postproc = createPostprocBackend(config.postprocBackend);
-  std::cout << "[5/6] Postprocessor: " << postproc->name() << "\n";
-
+  auto postproc = createPostprocBackend(
+      config.postprocBackend,
+      PostprocessOptions{
+          config.confThreshold,
+          config.nmsThreshold,
+          config.labelsPath,
+          {},
+          config.modelOutputLayout,
+          config.verbose});
   auto visualizer = createVisualizer();
-  std::cout << "[6/6] Visualizer: " << visualizer->name() << "\n";
+
+  infer->open(config.model);
 
   FFmpegPacketSource packetSource;
   packetSource.open(config.source);
@@ -119,65 +103,72 @@ void runPipeline(const AppConfig& config) {
 
   bool visualizerInitialized = false;
   std::size_t frameCount = 0;
+  bool eosSubmitted = false;
 
   while (true) {
-    const EncodedPacket packet = packetSource.readPacket();
-    const std::optional<DecodedFrame> decodedFrame = decoder->decode(packet);
-
-    if (packet.endOfStream && !decodedFrame.has_value()) {
-      break;
+    if (!eosSubmitted) {
+      const EncodedPacket packet = packetSource.readPacket();
+      decoder->submitPacket(packet);
+      eosSubmitted = packet.endOfStream;
     }
 
-    if (!decodedFrame.has_value()) {
-      continue;
-    }
+    bool producedFrame = false;
+    while (true) {
+      const std::optional<DecodedFrame> decodedFrame = decoder->receiveFrame();
+      if (!decodedFrame.has_value()) {
+        break;
+      }
+      producedFrame = true;
 
-    const RgbImage image = preproc->convertAndResize(
-        decodedFrame.value(),
-        infer->inputWidth(),
-        infer->inputHeight());
+      const RgbImage inferenceImage = preproc->convertAndResize(
+          decodedFrame.value(),
+          infer->inputWidth(),
+          infer->inputHeight(),
+          PreprocessOptions{config.letterbox, 114});
+      const InferenceOutput output = infer->infer(inferenceImage);
+      const DetectionResult result = postproc->postprocess(
+          output,
+          inferenceImage,
+          decodedFrame->width,
+          decodedFrame->height,
+          decodedFrame->pts);
 
-    const std::vector<float> output = infer->infer(image);
-    const DetectionResult result = postproc->postprocess(
-        output,
-        infer->inputWidth(),
-        infer->inputHeight(),
-        decodedFrame->width,
-        decodedFrame->height,
-        decodedFrame->pts);
+      ++frameCount;
+      std::cout << "frame=" << frameCount
+                << " pts=" << decodedFrame->pts
+                << " detections=" << result.boxes.size() << "\n";
 
-    ++frameCount;
-    std::cout << "frame=" << frameCount
-              << " pts=" << decodedFrame->pts
-              << " detections=" << result.boxes.size() << "\n";
+      maybeDumpFirstFrame(config, inferenceImage, frameCount);
 
-    for (const auto& box : result.boxes) {
-      std::cout << "  [" << box.label << " conf=" << box.score
-                << " box=" << box.x1 << "," << box.y1
-                << "-" << box.x2 << "," << box.y2 << "]\n";
-    }
+      if (config.visual.display || !config.visual.outputVideo.empty() || !config.visual.outputRtsp.empty()) {
+        if (!visualizerInitialized && decodedFrame->width > 0 && decodedFrame->height > 0) {
+          visualizer->init(decodedFrame->width, decodedFrame->height, config.visual);
+          visualizerInitialized = true;
+        }
 
-    if (config.visual.display || !config.visual.outputVideo.empty() || !config.visual.outputRtsp.empty()) {
-      if (!visualizerInitialized && decodedFrame->width > 0 && decodedFrame->height > 0) {
-        visualizer->init(decodedFrame->width, decodedFrame->height, config.visual);
-        visualizerInitialized = true;
+        if (visualizerInitialized) {
+          const RgbImage originalImage = preproc->convertAndResize(
+              decodedFrame.value(),
+              decodedFrame->width,
+              decodedFrame->height,
+              PreprocessOptions{});
+          const RgbImage drawnImage = visualizer->draw(originalImage, result);
+          (void)drawnImage;
+          visualizer->show();
+        }
       }
 
-      if (visualizerInitialized) {
-        const RgbImage drawnImage = visualizer->draw(image, result);
-        (void)drawnImage;
-        visualizer->show();
+      if (config.maxFrames > 0 && frameCount >= static_cast<std::size_t>(config.maxFrames)) {
+        visualizer->close();
+        return;
       }
     }
 
-    if (config.maxFrames > 0 && frameCount >= static_cast<std::size_t>(config.maxFrames)) {
-      std::cout << "Reached max frames (" << config.maxFrames << "), stopping.\n";
+    if (eosSubmitted && !producedFrame) {
       break;
     }
   }
 
   visualizer->close();
-
-  std::cout << "\n=== Pipeline Complete ===\n";
-  std::cout << "Total frames processed: " << frameCount << "\n";
 }
+

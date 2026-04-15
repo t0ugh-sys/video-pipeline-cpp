@@ -4,7 +4,6 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/hwcontext_cuda.h>
-#include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
 }
@@ -48,26 +47,20 @@ void NvdecDecoder::open(VideoCodec codec) {
   close();
 
 #ifndef _WIN32
-  int ret = av_hwdevice_ctx_create(
-      &hw_device_ctx_,
-      AV_HWDEVICE_TYPE_CUDA,
-      nullptr,
-      nullptr,
-      0);
+  int ret = av_hwdevice_ctx_create(&hw_device_ctx_, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
   checkAvStatus(ret, "Failed to create CUDA hardware device context");
 #endif
 
 #ifdef _WIN32
-  const AVCodec* av_codec = avcodec_find_decoder_by_name(
-      codec == VideoCodec::kH265 ? "hevc_cuvid" : "h264_cuvid");
+  const AVCodec* avCodec = avcodec_find_decoder_by_name(codec == VideoCodec::kH265 ? "hevc_cuvid" : "h264_cuvid");
 #else
-  const AVCodec* av_codec = avcodec_find_decoder(toAVCodec(codec));
+  const AVCodec* avCodec = avcodec_find_decoder(toAVCodec(codec));
 #endif
-  if (!av_codec) {
+  if (!avCodec) {
     throw std::runtime_error("Codec not found");
   }
 
-  codec_ctx_ = avcodec_alloc_context3(av_codec);
+  codec_ctx_ = avcodec_alloc_context3(avCodec);
   if (!codec_ctx_) {
     throw std::runtime_error("Failed to allocate codec context");
   }
@@ -98,13 +91,8 @@ void NvdecDecoder::open(VideoCodec codec) {
     return AV_PIX_FMT_NONE;
   };
 
-  const int ret = avcodec_open2(codec_ctx_, av_codec, nullptr);
+  const int ret = avcodec_open2(codec_ctx_, avCodec, nullptr);
   checkAvStatus(ret, "Failed to open codec");
-}
-
-std::optional<DecodedFrame> NvdecDecoder::decode(const EncodedPacket& packet) {
-  submitPacket(packet);
-  return receiveFrame();
 }
 
 int NvdecDecoder::toAVCodec(VideoCodec codec) {
@@ -135,24 +123,24 @@ void NvdecDecoder::submitPacket(const EncodedPacket& packet) {
     throw std::runtime_error("Decoder not initialized");
   }
 
-  AVPacket* av_packet = av_packet_alloc();
-  if (!av_packet) {
+  AVPacket* avPacket = av_packet_alloc();
+  if (!avPacket) {
     throw std::runtime_error("Failed to allocate AVPacket");
   }
 
   if (!packet.endOfStream) {
-    av_packet->data = const_cast<std::uint8_t*>(packet.data.data());
-    av_packet->size = static_cast<int>(packet.data.size());
-    av_packet->pts = packet.pts;
-    av_packet->flags = packet.keyFrame ? AV_PKT_FLAG_KEY : 0;
+    avPacket->data = const_cast<std::uint8_t*>(packet.data.data());
+    avPacket->size = static_cast<int>(packet.data.size());
+    avPacket->pts = packet.pts;
+    avPacket->flags = packet.keyFrame ? AV_PKT_FLAG_KEY : 0;
   } else {
-    av_packet->data = nullptr;
-    av_packet->size = 0;
+    avPacket->data = nullptr;
+    avPacket->size = 0;
     eos_sent_ = true;
   }
 
-  const int ret = avcodec_send_packet(codec_ctx_, av_packet);
-  av_packet_free(&av_packet);
+  const int ret = avcodec_send_packet(codec_ctx_, avPacket);
+  av_packet_free(&avPacket);
   if (ret < 0 && ret != AVERROR(EAGAIN)) {
     checkAvStatus(ret, "Failed to send packet to decoder");
   }
@@ -184,23 +172,24 @@ std::optional<DecodedFrame> NvdecDecoder::receiveFrame() {
   output.horizontalStride = frame->linesize[0];
   output.verticalStride = frame->height;
   output.chromaStride = frame->linesize[1] > 0 ? frame->linesize[1] : frame->linesize[0];
+  output.format = PixelFormat::kNv12;
   output.pts = frame->pts;
   output.dmaFd = -1;
 
   if (frame->format == AV_PIX_FMT_CUDA) {
-    AVFrame* retained_frame = av_frame_clone(frame);
-    if (!retained_frame) {
+    AVFrame* retainedFrame = av_frame_clone(frame);
+    if (!retainedFrame) {
       av_frame_free(&frame);
       throw std::runtime_error("Failed to clone CUDA frame");
     }
     output.isOnDevice = true;
-    output.deviceY = reinterpret_cast<std::uintptr_t>(retained_frame->data[0]);
-    output.deviceUv = reinterpret_cast<std::uintptr_t>(retained_frame->data[1]);
+    output.deviceY = reinterpret_cast<std::uintptr_t>(retainedFrame->data[0]);
+    output.deviceUv = reinterpret_cast<std::uintptr_t>(retainedFrame->data[1]);
     output.nativeHandle = std::shared_ptr<void>(
-        retained_frame,
+        retainedFrame,
         [](void* handle) {
-          AVFrame* owned_frame = reinterpret_cast<AVFrame*>(handle);
-          av_frame_free(&owned_frame);
+          AVFrame* ownedFrame = reinterpret_cast<AVFrame*>(handle);
+          av_frame_free(&ownedFrame);
         });
   } else if (frame->format == AV_PIX_FMT_NV12) {
     copyNv12Plane(output.yData, frame->data[0], frame->linesize[0], frame->width, frame->height);

@@ -16,6 +16,13 @@ struct AppConfig {
   InferBackendType inferBackend = InferBackendType::kAuto;
   PostprocBackendType postprocBackend = PostprocBackendType::kAuto;
   VisualConfig visual;
+  float confThreshold = 0.25f;
+  float nmsThreshold = 0.45f;
+  std::string labelsPath;
+  bool letterbox = true;
+  bool verbose = false;
+  bool dumpFirstFrame = false;
+  ModelOutputLayout modelOutputLayout = ModelOutputLayout::kAuto;
   int gpuId = 0;
   int maxFrames = 30;
 };

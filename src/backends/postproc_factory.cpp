@@ -8,24 +8,21 @@ PostprocBackendType detectAvailablePostprocBackend() {
   return PostprocBackendType::kYoloV8;
 }
 
-std::unique_ptr<IPostprocessor> createPostprocBackend(PostprocBackendType type) {
+std::unique_ptr<IPostprocessor> createPostprocBackend(
+    PostprocBackendType type,
+    const PostprocessOptions& options) {
   if (type == PostprocBackendType::kAuto) {
     type = detectAvailablePostprocBackend();
   }
 
   switch (type) {
     case PostprocBackendType::kYoloV8:
-      return std::make_unique<YoloPostprocessor>(YoloVersion::kYolov8);
-
+      return std::make_unique<YoloPostprocessor>(YoloVersion::kYolov8, options);
     case PostprocBackendType::kYolo26:
-      return std::make_unique<YoloPostprocessor>(YoloVersion::kYolo26);
-
+      return std::make_unique<YoloPostprocessor>(YoloVersion::kYolo26, options);
     case PostprocBackendType::kYoloV5:
-      return std::make_unique<YoloPostprocessor>(YoloVersion::kYolov8);
-
+      return std::make_unique<YoloPostprocessor>(YoloVersion::kYolov8, options);
     default:
-      throw std::runtime_error(
-          "Postprocessor backend '" + toString(type) +
-          "' is not available in this build. Available: " + availablePostprocBackends());
+      throw std::runtime_error("Postprocessor backend '" + toString(type) + "' is not available in this build. Available: " + availablePostprocBackends());
   }
 }

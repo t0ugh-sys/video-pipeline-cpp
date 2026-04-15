@@ -3,16 +3,13 @@
 #include "decoder_interface.hpp"
 #include "pipeline_types.hpp"
 
+#include <deque>
 #include <optional>
 
-// MPP forward declarations
 typedef struct MppCtxImpl* MppCtx;
 typedef struct MppApi_t MppApi;
+typedef struct MppBufferGroupImpl* MppBufferGroup;
 
-/**
- * Rockchip MPP 硬件解码器
- * 适用于 RK3588/RK3568 等 Rockchip 平台
- */
 class MppDecoder : public IDecoderBackend {
  public:
   MppDecoder() = default;
@@ -22,15 +19,18 @@ class MppDecoder : public IDecoderBackend {
   MppDecoder& operator=(const MppDecoder&) = delete;
 
   void open(VideoCodec codec) override;
-  std::optional<DecodedFrame> decode(const EncodedPacket& packet) override;
+  void submitPacket(const EncodedPacket& packet) override;
+  std::optional<DecodedFrame> receiveFrame() override;
   std::string name() const override { return "Rockchip MPP"; }
 
  private:
   int toMppCodec(VideoCodec codec) const;
   void close();
-  void submitPacket(const EncodedPacket& packet);
-  std::optional<DecodedFrame> receiveFrame();
+  std::optional<DecodedFrame> popReadyFrame();
+  bool handleInfoChange(void* frame);
 
   MppCtx context_ = nullptr;
   MppApi* api_ = nullptr;
+  MppBufferGroup externalBufferGroup_ = nullptr;
+  std::deque<DecodedFrame> readyFrames_;
 };

@@ -13,10 +13,10 @@
 #endif
 
 InferBackendType detectAvailableInferBackend() {
-#if defined(ENABLE_TRT_INFER)
-  return InferBackendType::kNvidiaTrt;
-#elif defined(ENABLE_RKNN_INFER)
+#if defined(ENABLE_RKNN_INFER)
   return InferBackendType::kRockchipRknn;
+#elif defined(ENABLE_TRT_INFER)
+  return InferBackendType::kNvidiaTrt;
 #else
   return InferBackendType::kAuto;
 #endif
@@ -32,7 +32,6 @@ std::unique_ptr<IInferenceBackend> createInferBackend(InferBackendType type) {
     case InferBackendType::kRockchipRknn:
       return std::make_unique<RknnInfer>();
 #endif
-
 #if defined(ENABLE_TRT_INFER)
     case InferBackendType::kNvidiaTrt: {
       auto infer = std::make_unique<TrtInfer>();
@@ -42,11 +41,8 @@ std::unique_ptr<IInferenceBackend> createInferBackend(InferBackendType type) {
       return infer;
     }
 #endif
-
     case InferBackendType::kOnnxRuntime:
     default:
-      throw std::runtime_error(
-          "Inference backend '" + toString(type) +
-          "' is not available in this build. Available: " + availableInferBackends());
+      throw std::runtime_error("Inference backend '" + toString(type) + "' is not available in this build. Available: " + availableInferBackends());
   }
 }

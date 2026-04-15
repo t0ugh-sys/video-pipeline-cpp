@@ -51,21 +51,30 @@ std::size_t dimsElementCount(const nvinfer1::Dims& dims) {
   return count;
 }
 
+std::vector<std::int64_t> dimsToShape(const nvinfer1::Dims& dims) {
+  std::vector<std::int64_t> shape;
+  shape.reserve(dims.nbDims);
+  for (int i = 0; i < dims.nbDims; ++i) {
+    shape.push_back(dims.d[i]);
+  }
+  return shape;
+}
+
 void packRgbToNchw(
     const RgbImage& image,
     int channels,
     std::vector<std::uint8_t>& destination) {
-  const std::size_t plane_size = static_cast<std::size_t>(image.width * image.height);
-  destination.resize(plane_size * static_cast<std::size_t>(channels));
+  const std::size_t planeSize = static_cast<std::size_t>(image.width * image.height);
+  destination.resize(planeSize * static_cast<std::size_t>(channels));
 
-  for (std::size_t index = 0; index < plane_size; ++index) {
+  for (std::size_t index = 0; index < planeSize; ++index) {
     const std::size_t src = index * 3;
     destination[index] = image.data[src];
     if (channels > 1) {
-      destination[plane_size + index] = image.data[src + 1];
+      destination[planeSize + index] = image.data[src + 1];
     }
     if (channels > 2) {
-      destination[plane_size * 2 + index] = image.data[src + 2];
+      destination[planeSize * 2 + index] = image.data[src + 2];
     }
   }
 }
@@ -81,7 +90,7 @@ void TrtInfer::open(const ModelConfig& config) {
   loadEngine(config.modelPath);
 }
 
-std::vector<float> TrtInfer::infer(const RgbImage& image) {
+InferenceOutput TrtInfer::infer(const RgbImage& image) {
   if (!context_ || !engine_) {
     throw std::runtime_error("TensorRT backend is not initialized");
   }
@@ -92,14 +101,14 @@ std::vector<float> TrtInfer::infer(const RgbImage& image) {
     throw std::runtime_error("RGB image buffer size does not match TensorRT input buffer");
   }
 
-  const void* host_input = image.data.data();
+  const void* hostInput = image.data.data();
   if (input_is_nchw_) {
     packRgbToNchw(image, input_channels_, host_input_buffer_);
-    host_input = host_input_buffer_.data();
+    hostInput = host_input_buffer_.data();
   }
 
   checkCudaStatus(
-      cudaMemcpy(input_buffer_, host_input, input_bytes_, cudaMemcpyHostToDevice),
+      cudaMemcpy(input_buffer_, hostInput, input_bytes_, cudaMemcpyHostToDevice),
       "Failed to copy TensorRT input to device");
 
   std::vector<void*> bindings(engine_->getNbBindings(), nullptr);
@@ -108,16 +117,21 @@ std::vector<float> TrtInfer::infer(const RgbImage& image) {
 
   checkTrtStatus(context_->executeV2(bindings.data()), "TensorRT execute failed");
 
-  std::vector<float> result(output_elements_);
+  InferenceTensor tensor;
+  tensor.name = output_name_.empty() ? "output_0" : output_name_;
+  tensor.layout = "RAW";
+  tensor.shape = output_shape_;
+  tensor.dataType = TensorDataType::kFloat32;
+  tensor.data.resize(output_elements_);
   checkCudaStatus(
       cudaMemcpy(
-          result.data(),
+          tensor.data.data(),
           output_buffer_,
           output_elements_ * sizeof(float),
           cudaMemcpyDeviceToHost),
       "Failed to copy TensorRT output to host");
 
-  return result;
+  return {std::move(tensor)};
 }
 
 void TrtInfer::loadEngine(const std::string& path) {
@@ -160,19 +174,19 @@ void TrtInfer::loadEngine(const std::string& path) {
     }
   }
 
-  const nvinfer1::Dims input_dims = engine_->getBindingDimensions(static_cast<int>(input_binding_));
-  checkTrtStatus(input_dims.nbDims == 4, "TensorRT input must be a 4D tensor");
+  const nvinfer1::Dims inputDims = engine_->getBindingDimensions(static_cast<int>(input_binding_));
+  checkTrtStatus(inputDims.nbDims == 4, "TensorRT input must be a 4D tensor");
 
-  if (input_dims.d[1] > 0 && input_dims.d[1] <= 4) {
+  if (inputDims.d[1] > 0 && inputDims.d[1] <= 4) {
     input_is_nchw_ = true;
-    input_channels_ = input_dims.d[1];
-    input_height_ = input_dims.d[2];
-    input_width_ = input_dims.d[3];
-  } else if (input_dims.d[3] > 0 && input_dims.d[3] <= 4) {
+    input_channels_ = inputDims.d[1];
+    input_height_ = inputDims.d[2];
+    input_width_ = inputDims.d[3];
+  } else if (inputDims.d[3] > 0 && inputDims.d[3] <= 4) {
     input_is_nchw_ = false;
-    input_height_ = input_dims.d[1];
-    input_width_ = input_dims.d[2];
-    input_channels_ = input_dims.d[3];
+    input_height_ = inputDims.d[1];
+    input_width_ = inputDims.d[2];
+    input_channels_ = inputDims.d[3];
   } else {
     throw std::runtime_error("Unsupported TensorRT input layout");
   }
@@ -180,19 +194,17 @@ void TrtInfer::loadEngine(const std::string& path) {
   checkTrtStatus(
       input_channels_ == 3,
       "TensorRT input channel count must be 3 for the current RGB pipeline");
-  input_bytes_ = dimsElementCount(input_dims) * sizeof(std::uint8_t);
+  input_bytes_ = dimsElementCount(inputDims) * sizeof(std::uint8_t);
 
-  const nvinfer1::Dims output_dims = context_->getBindingDimensions(static_cast<int>(output_binding_));
-  output_elements_ = dimsElementCount(output_dims);
+  const nvinfer1::Dims outputDims = context_->getBindingDimensions(static_cast<int>(output_binding_));
+  output_elements_ = dimsElementCount(outputDims);
+  output_shape_ = dimsToShape(outputDims);
+  output_name_ = engine_->getBindingName(static_cast<int>(output_binding_));
 
   checkCudaStatus(cudaMalloc(&input_buffer_, input_bytes_), "Failed to allocate TensorRT input buffer");
   checkCudaStatus(
       cudaMalloc(&output_buffer_, output_elements_ * sizeof(float)),
       "Failed to allocate TensorRT output buffer");
-}
-
-std::size_t TrtInfer::getOutputElementCount() const {
-  return output_elements_;
 }
 
 void TrtInfer::releaseBuffers() {
@@ -218,5 +230,7 @@ void TrtInfer::close() {
   output_binding_ = 1;
   input_bytes_ = 0;
   output_elements_ = 0;
+  output_shape_.clear();
+  output_name_.clear();
   host_input_buffer_.clear();
 }

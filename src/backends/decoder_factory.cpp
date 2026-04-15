@@ -10,10 +10,10 @@
 #include <stdexcept>
 
 DecoderBackendType detectAvailableDecoderBackend() {
-#if defined(ENABLE_NVDEC_DECODER)
-  return DecoderBackendType::kNvidiaNvdec;
-#elif defined(ENABLE_MPP_DECODER)
+#if defined(ENABLE_MPP_DECODER)
   return DecoderBackendType::kRockchipMpp;
+#elif defined(ENABLE_NVDEC_DECODER)
+  return DecoderBackendType::kNvidiaNvdec;
 #else
   return DecoderBackendType::kAuto;
 #endif
@@ -25,6 +25,10 @@ std::unique_ptr<IDecoderBackend> createDecoderBackend(DecoderBackendType type) {
   }
 
   switch (type) {
+#if defined(ENABLE_MPP_DECODER)
+    case DecoderBackendType::kRockchipMpp:
+      return std::make_unique<MppDecoder>();
+#endif
 #if defined(ENABLE_NVDEC_DECODER)
     case DecoderBackendType::kNvidiaNvdec: {
       auto decoder = std::make_unique<NvdecDecoder>();
@@ -34,16 +38,8 @@ std::unique_ptr<IDecoderBackend> createDecoderBackend(DecoderBackendType type) {
       return decoder;
     }
 #endif
-
-#if defined(ENABLE_MPP_DECODER)
-    case DecoderBackendType::kRockchipMpp:
-      return std::make_unique<MppDecoder>();
-#endif
-
     case DecoderBackendType::kCpu:
     default:
-      throw std::runtime_error(
-          "Decoder backend '" + toString(type) +
-          "' is not available in this build. Available: " + availableDecoderBackends());
+      throw std::runtime_error("Decoder backend '" + toString(type) + "' is not available in this build. Available: " + availableDecoderBackends());
   }
 }

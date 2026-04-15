@@ -3,20 +3,15 @@
 #include "infer_interface.hpp"
 #include "pipeline_types.hpp"
 
-#include <vector>
 #include <memory>
 #include <string>
+#include <vector>
 
-// TensorRT forward declarations
 namespace nvinfer1 {
-  class ICudaEngine;
-  class IExecutionContext;
+class ICudaEngine;
+class IExecutionContext;
 }
 
-/**
- * NVIDIA TensorRT 推理后端
- * 适用于 NVIDIA GPU 平台的高性能推理
- */
 class TrtInfer : public IInferenceBackend {
  public:
   TrtInfer() = default;
@@ -26,17 +21,15 @@ class TrtInfer : public IInferenceBackend {
   TrtInfer& operator=(const TrtInfer&) = delete;
 
   void open(const ModelConfig& config) override;
-  std::vector<float> infer(const RgbImage& image) override;
+  InferenceOutput infer(const RgbImage& image) override;
   int inputWidth() const override { return input_width_; }
   int inputHeight() const override { return input_height_; }
   std::string name() const override { return "NVIDIA TensorRT"; }
 
-  /** 设置 GPU 设备 ID */
   void setGpuId(int gpu_id) { gpu_id_ = gpu_id; }
 
  private:
   void loadEngine(const std::string& path);
-  std::size_t getOutputElementCount() const;
   void releaseBuffers();
   void close();
 
@@ -51,6 +44,8 @@ class TrtInfer : public IInferenceBackend {
   size_t output_binding_ = 1;
   std::size_t input_bytes_ = 0;
   std::size_t output_elements_ = 0;
+  std::vector<std::int64_t> output_shape_;
+  std::string output_name_;
   void* input_buffer_ = nullptr;
   void* output_buffer_ = nullptr;
   std::vector<std::uint8_t> host_input_buffer_;

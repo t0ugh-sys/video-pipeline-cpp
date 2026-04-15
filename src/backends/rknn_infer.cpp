@@ -19,6 +19,41 @@ rknn_tensor_attr makeTensorAttr(std::uint32_t index) {
   return attr;
 }
 
+TensorDataType toTensorDataType(rknn_tensor_type type) {
+  switch (type) {
+    case RKNN_TENSOR_FLOAT32:
+      return TensorDataType::kFloat32;
+    case RKNN_TENSOR_UINT8:
+      return TensorDataType::kUint8;
+    case RKNN_TENSOR_INT8:
+      return TensorDataType::kInt8;
+    case RKNN_TENSOR_INT32:
+      return TensorDataType::kInt32;
+    default:
+      return TensorDataType::kUnknown;
+  }
+}
+
+std::string toTensorLayout(rknn_tensor_format fmt) {
+  switch (fmt) {
+    case RKNN_TENSOR_NCHW:
+      return "NCHW";
+    case RKNN_TENSOR_NHWC:
+      return "NHWC";
+    default:
+      return "UNSPECIFIED";
+  }
+}
+
+std::vector<std::int64_t> toShape(const rknn_tensor_attr& attr) {
+  std::vector<std::int64_t> shape;
+  shape.reserve(attr.n_dims);
+  for (std::uint32_t i = 0; i < attr.n_dims; ++i) {
+    shape.push_back(attr.dims[i]);
+  }
+  return shape;
+}
+
 }  // namespace
 
 RknnInfer::~RknnInfer() {
@@ -36,7 +71,7 @@ void RknnInfer::open(const ModelConfig& config) {
   queryTensorInfo();
 }
 
-std::vector<float> RknnInfer::infer(const RgbImage& image) {
+InferenceOutput RknnInfer::infer(const RgbImage& image) {
   if (context_ == 0) {
     throw std::runtime_error("RKNN backend is not initialized");
   }
@@ -47,39 +82,31 @@ std::vector<float> RknnInfer::infer(const RgbImage& image) {
     throw std::runtime_error("RGB image buffer size does not match RKNN input tensor");
   }
 
-  // 准备输入数据
-  std::vector<std::uint8_t> input_buffer;
+  std::vector<std::uint8_t> inputBuffer;
   if (is_nhwc_) {
-    input_buffer = image.data;  // HWC 直传
+    inputBuffer = image.data;
   } else {
-    // NCHW 格式转换
     const std::size_t planeSize = static_cast<std::size_t>(image.width * image.height);
-    input_buffer.resize(planeSize * 3);
+    inputBuffer.resize(planeSize * 3);
     for (std::size_t i = 0; i < planeSize; ++i) {
       const std::size_t src = i * 3;
-      input_buffer[i] = image.data[src];                         // R
-      input_buffer[planeSize + i] = image.data[src + 1];         // G
-      input_buffer[planeSize * 2 + i] = image.data[src + 2];     // B
+      inputBuffer[i] = image.data[src];
+      inputBuffer[planeSize + i] = image.data[src + 1];
+      inputBuffer[planeSize * 2 + i] = image.data[src + 2];
     }
   }
 
   rknn_input input = {};
   input.index = 0;
   input.type = RKNN_TENSOR_UINT8;
-  input.size = input_buffer.size();
+  input.size = inputBuffer.size();
   input.fmt = is_nhwc_ ? RKNN_TENSOR_NHWC : RKNN_TENSOR_NCHW;
-  input.buf = input_buffer.data();
+  input.buf = inputBuffer.data();
 
   checkRknnStatus(rknn_inputs_set(context_, 1, &input), "rknn_inputs_set failed");
   checkRknnStatus(rknn_run(context_, nullptr), "rknn_run failed");
 
-  // 获取输出
-  rknn_output_num output_num = {};
-  checkRknnStatus(
-      rknn_query(context_, RKNN_QUERY_IN_OUT_NUM, &output_num, sizeof(output_num)),
-      "RKNN_QUERY_IN_OUT_NUM failed");
-
-  std::vector<rknn_output> outputs(output_num.n_output);
+  std::vector<rknn_output> outputs(output_templates_.size());
   for (auto& output : outputs) {
     output.want_float = 1;
   }
@@ -88,12 +115,11 @@ std::vector<float> RknnInfer::infer(const RgbImage& image) {
       rknn_outputs_get(context_, outputs.size(), outputs.data(), nullptr),
       "rknn_outputs_get failed");
 
-  std::vector<float> result;
-  for (std::uint32_t i = 0; i < outputs.size(); ++i) {
-    const auto bytes = static_cast<std::uint32_t>(outputs[i].size);
-    const auto count = bytes / sizeof(float);
+  InferenceOutput result = output_templates_;
+  for (std::size_t i = 0; i < outputs.size(); ++i) {
+    const auto count = static_cast<std::size_t>(outputs[i].size / sizeof(float));
     const auto* data = static_cast<const float*>(outputs[i].buf);
-    result.insert(result.end(), data, data + count);
+    result[i].data.assign(data, data + count);
   }
 
   rknn_outputs_release(context_, outputs.size(), outputs.data());
@@ -118,28 +144,44 @@ std::vector<std::uint8_t> RknnInfer::readModelFile(const std::string& path) cons
 }
 
 void RknnInfer::queryTensorInfo() {
-  rknn_input_output_num io_num = {};
+  rknn_input_output_num ioNum = {};
   checkRknnStatus(
-      rknn_query(context_, RKNN_QUERY_IN_OUT_NUM, &io_num, sizeof(io_num)),
+      rknn_query(context_, RKNN_QUERY_IN_OUT_NUM, &ioNum, sizeof(ioNum)),
       "RKNN_QUERY_IN_OUT_NUM failed");
 
-  rknn_tensor_attr input_attr = makeTensorAttr(0);
+  rknn_tensor_attr inputAttr = makeTensorAttr(0);
   checkRknnStatus(
-      rknn_query(context_, RKNN_QUERY_INPUT_ATTR, &input_attr, sizeof(input_attr)),
+      rknn_query(context_, RKNN_QUERY_INPUT_ATTR, &inputAttr, sizeof(inputAttr)),
       "RKNN_QUERY_INPUT_ATTR failed");
 
-  if (input_attr.fmt == RKNN_TENSOR_NHWC) {
+  if (inputAttr.fmt == RKNN_TENSOR_NHWC) {
     is_nhwc_ = true;
-    input_height_ = input_attr.dims[1];
-    input_width_ = input_attr.dims[2];
-    input_channels_ = input_attr.dims[3];
-  } else if (input_attr.fmt == RKNN_TENSOR_NCHW) {
+    input_height_ = inputAttr.dims[1];
+    input_width_ = inputAttr.dims[2];
+    input_channels_ = inputAttr.dims[3];
+  } else if (inputAttr.fmt == RKNN_TENSOR_NCHW) {
     is_nhwc_ = false;
-    input_channels_ = input_attr.dims[1];
-    input_height_ = input_attr.dims[2];
-    input_width_ = input_attr.dims[3];
+    input_channels_ = inputAttr.dims[1];
+    input_height_ = inputAttr.dims[2];
+    input_width_ = inputAttr.dims[3];
   } else {
     throw std::runtime_error("Unsupported RKNN input tensor format");
+  }
+
+  output_templates_.clear();
+  output_templates_.reserve(ioNum.n_output);
+  for (std::uint32_t i = 0; i < ioNum.n_output; ++i) {
+    rknn_tensor_attr outputAttr = makeTensorAttr(i);
+    checkRknnStatus(
+        rknn_query(context_, RKNN_QUERY_OUTPUT_ATTR, &outputAttr, sizeof(outputAttr)),
+        "RKNN_QUERY_OUTPUT_ATTR failed");
+
+    InferenceTensor tensor;
+    tensor.name = outputAttr.name[0] != '\0' ? outputAttr.name : ("output_" + std::to_string(i));
+    tensor.layout = toTensorLayout(outputAttr.fmt);
+    tensor.shape = toShape(outputAttr);
+    tensor.dataType = toTensorDataType(outputAttr.type);
+    output_templates_.push_back(std::move(tensor));
   }
 }
 
@@ -153,4 +195,5 @@ void RknnInfer::close() {
   input_height_ = 0;
   input_channels_ = 0;
   is_nhwc_ = true;
+  output_templates_.clear();
 }

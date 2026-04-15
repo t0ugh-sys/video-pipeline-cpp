@@ -4,6 +4,7 @@
 
 #include <string>
 
+struct AVBSFContext;
 struct AVFormatContext;
 
 class FFmpegPacketSource {
@@ -21,8 +22,12 @@ class FFmpegPacketSource {
  private:
   static VideoCodec toVideoCodec(int codecId);
   void close();
+  bool needsAnnexBFilter() const;
+  EncodedPacket copyPacket(const void* packet) const;
 
   AVFormatContext* formatContext_ = nullptr;
+  AVBSFContext* bsfContext_ = nullptr;
   int videoStreamIndex_ = -1;
   VideoCodec codec_ = VideoCodec::kUnknown;
+  bool bsfFlushed_ = false;
 };

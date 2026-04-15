@@ -3,16 +3,11 @@
 #include "infer_interface.hpp"
 #include "pipeline_types.hpp"
 
-#include <vector>
 #include <cstdint>
+#include <vector>
 
-// RKNN forward declarations
 typedef void* rknn_context;
 
-/**
- * Rockchip RKNN NPU 推理后端
- * 适用于 RK3588/RK3568 等平台的 NPU 加速
- */
 class RknnInfer : public IInferenceBackend {
  public:
   RknnInfer() = default;
@@ -22,7 +17,7 @@ class RknnInfer : public IInferenceBackend {
   RknnInfer& operator=(const RknnInfer&) = delete;
 
   void open(const ModelConfig& config) override;
-  std::vector<float> infer(const RgbImage& image) override;
+  InferenceOutput infer(const RgbImage& image) override;
   int inputWidth() const override { return input_width_; }
   int inputHeight() const override { return input_height_; }
   std::string name() const override { return "Rockchip RKNN"; }
@@ -38,4 +33,5 @@ class RknnInfer : public IInferenceBackend {
   int input_height_ = 0;
   int input_channels_ = 0;
   bool is_nhwc_ = true;
+  InferenceOutput output_templates_;
 };

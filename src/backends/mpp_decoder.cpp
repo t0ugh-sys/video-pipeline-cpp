@@ -1,25 +1,37 @@
 #include "backends/mpp_decoder.hpp"
 
 extern "C" {
-#include <rk_mpi.h>
 #include <mpp_buffer.h>
 #include <mpp_err.h>
 #include <mpp_frame.h>
 #include <mpp_packet.h>
+#include <rk_mpi.h>
 }
 
+#include <memory>
 #include <stdexcept>
 
 namespace {
 
 constexpr MppCodingType kCodingAvc = MPP_VIDEO_CodingAVC;
 constexpr MppCodingType kCodingHevc = MPP_VIDEO_CodingHEVC;
+constexpr int kMaxPutAttempts = 32;
 
 void checkMppStatus(MPP_RET status, const char* message) {
   if (status != MPP_OK) {
     throw std::runtime_error(message);
   }
 }
+
+struct MppFrameHolder {
+  MppFrame frame = nullptr;
+
+  ~MppFrameHolder() {
+    if (frame != nullptr) {
+      mpp_frame_deinit(&frame);
+    }
+  }
+};
 
 }  // namespace
 
@@ -35,16 +47,10 @@ void MppDecoder::open(VideoCodec codec) {
       mpp_init(context_, MPP_CTX_DEC, static_cast<MppCodingType>(toMppCodec(codec))),
       "mpp_init failed");
 
-  // 让 MPP 按 Annex-B 方式切包，处理 H.264/H.265 码流时更稳一些。
   RK_U32 splitMode = 1;
   checkMppStatus(
       api_->control(context_, MPP_DEC_SET_PARSER_SPLIT_MODE, &splitMode),
       "MPP_DEC_SET_PARSER_SPLIT_MODE failed");
-}
-
-std::optional<DecodedFrame> MppDecoder::decode(const EncodedPacket& packet) {
-  submitPacket(packet);
-  return receiveFrame();
 }
 
 int MppDecoder::toMppCodec(VideoCodec codec) const {
@@ -59,6 +65,11 @@ int MppDecoder::toMppCodec(VideoCodec codec) const {
 }
 
 void MppDecoder::close() {
+  readyFrames_.clear();
+  if (externalBufferGroup_ != nullptr) {
+    mpp_buffer_group_put(externalBufferGroup_);
+    externalBufferGroup_ = nullptr;
+  }
   if (context_ != nullptr) {
     mpp_destroy(context_);
   }
@@ -69,51 +80,112 @@ void MppDecoder::close() {
 void MppDecoder::submitPacket(const EncodedPacket& packet) {
   MppPacket mppPacket = nullptr;
   checkMppStatus(
-      mpp_packet_init(&mppPacket,
-                      packet.endOfStream ? nullptr : const_cast<std::uint8_t*>(packet.data.data()),
-                      packet.endOfStream ? 0 : packet.data.size()),
+      mpp_packet_init(
+          &mppPacket,
+          packet.endOfStream ? nullptr : const_cast<std::uint8_t*>(packet.data.data()),
+          packet.endOfStream ? 0 : packet.data.size()),
       "mpp_packet_init failed");
 
   if (packet.endOfStream) {
     mpp_packet_set_eos(mppPacket);
   }
-
-  // 时间戳往后传，便于后续做日志和结果对齐。
   mpp_packet_set_pts(mppPacket, packet.pts);
-  const MPP_RET status = api_->decode_put_packet(context_, mppPacket);
+
+  bool submitted = false;
+  for (int attempt = 0; attempt < kMaxPutAttempts; ++attempt) {
+    const MPP_RET status = api_->decode_put_packet(context_, mppPacket);
+    if (status == MPP_OK) {
+      submitted = true;
+      break;
+    }
+    if (status != MPP_ERR_BUFFER_FULL) {
+      mpp_packet_deinit(&mppPacket);
+      checkMppStatus(status, "decode_put_packet failed");
+    }
+
+    if (auto frame = receiveFrame()) {
+      readyFrames_.push_back(std::move(*frame));
+    }
+  }
+
   mpp_packet_deinit(&mppPacket);
-  checkMppStatus(status, "decode_put_packet failed");
+  if (!submitted) {
+    throw std::runtime_error("decode_put_packet stayed buffer-full and could not make progress");
+  }
 }
 
 std::optional<DecodedFrame> MppDecoder::receiveFrame() {
-  MppFrame frame = nullptr;
-  const MPP_RET status = api_->decode_get_frame(context_, &frame);
-  checkMppStatus(status, "decode_get_frame failed");
+  if (auto frame = popReadyFrame()) {
+    return frame;
+  }
 
-  if (frame == nullptr) {
+  while (true) {
+    MppFrame frame = nullptr;
+    const MPP_RET status = api_->decode_get_frame(context_, &frame);
+    if (status != MPP_OK) {
+      checkMppStatus(status, "decode_get_frame failed");
+    }
+    if (frame == nullptr) {
+      return std::nullopt;
+    }
+
+    if (mpp_frame_get_info_change(frame) != 0) {
+      handleInfoChange(frame);
+      continue;
+    }
+
+    if (mpp_frame_get_errinfo(frame) != 0 || mpp_frame_get_discard(frame) != 0) {
+      mpp_frame_deinit(&frame);
+      return std::nullopt;
+    }
+
+    MppBuffer buffer = mpp_frame_get_buffer(frame);
+    if (buffer == nullptr) {
+      mpp_frame_deinit(&frame);
+      throw std::runtime_error("MPP frame buffer is null");
+    }
+
+    auto holder = std::make_shared<MppFrameHolder>();
+    holder->frame = frame;
+
+    DecodedFrame output;
+    output.width = mpp_frame_get_width(frame);
+    output.height = mpp_frame_get_height(frame);
+    output.horizontalStride = mpp_frame_get_hor_stride(frame);
+    output.verticalStride = mpp_frame_get_ver_stride(frame);
+    output.chromaStride = output.horizontalStride;
+    output.format = PixelFormat::kNv12;
+    output.pts = mpp_frame_get_pts(frame);
+    output.dmaFd = mpp_buffer_get_fd(buffer);
+    output.nativeHandle = holder;
+    return output;
+  }
+}
+
+std::optional<DecodedFrame> MppDecoder::popReadyFrame() {
+  if (readyFrames_.empty()) {
     return std::nullopt;
   }
 
-  if (mpp_frame_get_errinfo(frame) != 0) {
-    mpp_frame_deinit(&frame);
-    throw std::runtime_error("MPP decoder returned frame with error info");
+  DecodedFrame frame = std::move(readyFrames_.front());
+  readyFrames_.pop_front();
+  return frame;
+}
+
+bool MppDecoder::handleInfoChange(void* opaqueFrame) {
+  MppFrame frame = static_cast<MppFrame>(opaqueFrame);
+  if (externalBufferGroup_ == nullptr) {
+    checkMppStatus(
+        mpp_buffer_group_get_internal(&externalBufferGroup_, MPP_BUFFER_TYPE_DRM),
+        "mpp_buffer_group_get_internal failed");
+    checkMppStatus(
+        api_->control(context_, MPP_DEC_SET_EXT_BUF_GROUP, externalBufferGroup_),
+        "MPP_DEC_SET_EXT_BUF_GROUP failed");
   }
 
-  DecodedFrame output;
-  output.width = mpp_frame_get_width(frame);
-  output.height = mpp_frame_get_height(frame);
-  output.horizontalStride = mpp_frame_get_hor_stride(frame);
-  output.verticalStride = mpp_frame_get_ver_stride(frame);
-  output.pts = mpp_frame_get_pts(frame);
-
-  MppBuffer buffer = mpp_frame_get_buffer(frame);
-  if (buffer == nullptr) {
-    mpp_frame_deinit(&frame);
-    throw std::runtime_error("MPP frame buffer is null");
-  }
-
-  // RGA 后续直接消费 dma fd，避免先拷回 CPU 普通内存。
-  output.dmaFd = mpp_buffer_get_fd(buffer);
+  checkMppStatus(
+      api_->control(context_, MPP_DEC_SET_INFO_CHANGE_READY, nullptr),
+      "MPP_DEC_SET_INFO_CHANGE_READY failed");
   mpp_frame_deinit(&frame);
-  return output;
+  return true;
 }

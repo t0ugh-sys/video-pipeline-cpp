@@ -5,10 +5,6 @@
 
 #include <cstdint>
 
-/**
- * NVIDIA CUDA 预处理器
- * 使用 CUDA 进行 NV12 到 RGB 的转换和缩放
- */
 class CudaPreprocessor : public IPreprocessorBackend {
  public:
   CudaPreprocessor();
@@ -17,11 +13,11 @@ class CudaPreprocessor : public IPreprocessorBackend {
   RgbImage convertAndResize(
       const DecodedFrame& frame,
       int outputWidth,
-      int outputHeight) override;
+      int outputHeight,
+      const PreprocessOptions& options = {}) override;
 
   std::string name() const override { return "NVIDIA CUDA"; }
 
-  /** 设置 GPU 设备 ID */
   void setGpuId(int gpu_id);
 
  private:
