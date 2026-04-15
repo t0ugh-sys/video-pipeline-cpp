@@ -8,6 +8,7 @@ extern "C" {
 #include <rk_mpi.h>
 }
 
+#include <algorithm>
 #include <memory>
 #include <stdexcept>
 
@@ -51,6 +52,8 @@ void MppDecoder::open(VideoCodec codec) {
   checkMppStatus(
       api_->control(context_, MPP_DEC_SET_PARSER_SPLIT_MODE, &splitMode),
       "MPP_DEC_SET_PARSER_SPLIT_MODE failed");
+
+  eosSubmitted_ = false;
 }
 
 int MppDecoder::toMppCodec(VideoCodec codec) const {
@@ -66,6 +69,7 @@ int MppDecoder::toMppCodec(VideoCodec codec) const {
 
 void MppDecoder::close() {
   readyFrames_.clear();
+  eosSubmitted_ = false;
   if (externalBufferGroup_ != nullptr) {
     mpp_buffer_group_put(externalBufferGroup_);
     externalBufferGroup_ = nullptr;
@@ -86,8 +90,13 @@ void MppDecoder::submitPacket(const EncodedPacket& packet) {
           packet.endOfStream ? 0 : packet.data.size()),
       "mpp_packet_init failed");
 
+  if (!packet.endOfStream && !packet.data.empty()) {
+    mpp_packet_set_pos(mppPacket, packet.data.data());
+    mpp_packet_set_length(mppPacket, packet.data.size());
+  }
   if (packet.endOfStream) {
     mpp_packet_set_eos(mppPacket);
+    eosSubmitted_ = true;
   }
   mpp_packet_set_pts(mppPacket, packet.pts);
 
@@ -103,9 +112,7 @@ void MppDecoder::submitPacket(const EncodedPacket& packet) {
       checkMppStatus(status, "decode_put_packet failed");
     }
 
-    if (auto frame = receiveFrame()) {
-      readyFrames_.push_back(std::move(*frame));
-    }
+    drainFramesToReadyQueue();
   }
 
   mpp_packet_deinit(&mppPacket);
@@ -119,6 +126,20 @@ std::optional<DecodedFrame> MppDecoder::receiveFrame() {
     return frame;
   }
 
+  return decodeOneFrame();
+}
+
+std::optional<DecodedFrame> MppDecoder::popReadyFrame() {
+  if (readyFrames_.empty()) {
+    return std::nullopt;
+  }
+
+  DecodedFrame frame = std::move(readyFrames_.front());
+  readyFrames_.pop_front();
+  return frame;
+}
+
+std::optional<DecodedFrame> MppDecoder::decodeOneFrame() {
   while (true) {
     MppFrame frame = nullptr;
     const MPP_RET status = api_->decode_get_frame(context_, &frame);
@@ -136,7 +157,7 @@ std::optional<DecodedFrame> MppDecoder::receiveFrame() {
 
     if (mpp_frame_get_errinfo(frame) != 0 || mpp_frame_get_discard(frame) != 0) {
       mpp_frame_deinit(&frame);
-      return std::nullopt;
+      continue;
     }
 
     MppBuffer buffer = mpp_frame_get_buffer(frame);
@@ -162,30 +183,40 @@ std::optional<DecodedFrame> MppDecoder::receiveFrame() {
   }
 }
 
-std::optional<DecodedFrame> MppDecoder::popReadyFrame() {
-  if (readyFrames_.empty()) {
-    return std::nullopt;
+void MppDecoder::drainFramesToReadyQueue() {
+  while (true) {
+    auto frame = decodeOneFrame();
+    if (!frame.has_value()) {
+      break;
+    }
+    readyFrames_.push_back(std::move(*frame));
   }
-
-  DecodedFrame frame = std::move(readyFrames_.front());
-  readyFrames_.pop_front();
-  return frame;
 }
 
-bool MppDecoder::handleInfoChange(void* opaqueFrame) {
+void MppDecoder::handleInfoChange(void* opaqueFrame) {
   MppFrame frame = static_cast<MppFrame>(opaqueFrame);
-  if (externalBufferGroup_ == nullptr) {
-    checkMppStatus(
-        mpp_buffer_group_get_internal(&externalBufferGroup_, MPP_BUFFER_TYPE_DRM),
-        "mpp_buffer_group_get_internal failed");
-    checkMppStatus(
-        api_->control(context_, MPP_DEC_SET_EXT_BUF_GROUP, externalBufferGroup_),
-        "MPP_DEC_SET_EXT_BUF_GROUP failed");
+
+  if (externalBufferGroup_ != nullptr) {
+    mpp_buffer_group_put(externalBufferGroup_);
+    externalBufferGroup_ = nullptr;
   }
 
   checkMppStatus(
+      mpp_buffer_group_get_internal(&externalBufferGroup_, MPP_BUFFER_TYPE_DRM),
+      "mpp_buffer_group_get_internal failed");
+
+  const RK_U32 horStride = static_cast<RK_U32>(std::max(1, mpp_frame_get_hor_stride(frame)));
+  const RK_U32 verStride = static_cast<RK_U32>(std::max(1, mpp_frame_get_ver_stride(frame)));
+  const RK_U32 frameBytes = horStride * verStride * 3 / 2;
+  const RK_U32 frameCount = 12;
+  mpp_buffer_group_limit_config(externalBufferGroup_, frameBytes, frameCount);
+
+  checkMppStatus(
+      api_->control(context_, MPP_DEC_SET_EXT_BUF_GROUP, externalBufferGroup_),
+      "MPP_DEC_SET_EXT_BUF_GROUP failed");
+  checkMppStatus(
       api_->control(context_, MPP_DEC_SET_INFO_CHANGE_READY, nullptr),
       "MPP_DEC_SET_INFO_CHANGE_READY failed");
+
   mpp_frame_deinit(&frame);
-  return true;
 }

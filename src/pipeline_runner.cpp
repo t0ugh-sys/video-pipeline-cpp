@@ -8,12 +8,90 @@
 #include "preproc_interface.hpp"
 #include "visualizer.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <deque>
 #include <fstream>
 #include <iostream>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <thread>
+#include <utility>
+#include <vector>
 
 namespace {
+using Clock = std::chrono::steady_clock;
+using Ms = std::chrono::duration<double, std::milli>;
+
+struct PreparedFrame {
+  std::size_t index = 0;
+  int64_t pts = 0;
+  int originalWidth = 0;
+  int originalHeight = 0;
+  DecodedFrame decodedFrame;
+  RgbImage inferenceImage;
+  double decodeMs = 0.0;
+  double preprocMs = 0.0;
+};
+
+struct ProcessedFrame {
+  std::size_t index = 0;
+  int64_t pts = 0;
+  DecodedFrame decodedFrame;
+  DetectionResult result;
+  double decodeMs = 0.0;
+  double preprocMs = 0.0;
+  double inferMs = 0.0;
+  double postprocMs = 0.0;
+};
+
+template <typename T>
+class BoundedQueue {
+ public:
+  explicit BoundedQueue(std::size_t capacity) : capacity_(capacity) {}
+
+  void push(T value) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    notFull_.wait(lock, [&] { return closed_ || queue_.size() < capacity_; });
+    if (closed_) {
+      throw std::runtime_error("queue closed");
+    }
+    queue_.push_back(std::move(value));
+    notEmpty_.notify_one();
+  }
+
+  bool pop(T& value) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    notEmpty_.wait(lock, [&] { return closed_ || !queue_.empty(); });
+    if (queue_.empty()) {
+      return false;
+    }
+    value = std::move(queue_.front());
+    queue_.pop_front();
+    notFull_.notify_one();
+    return true;
+  }
+
+  void close() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    closed_ = true;
+    notEmpty_.notify_all();
+    notFull_.notify_all();
+  }
+
+ private:
+  std::size_t capacity_;
+  std::deque<T> queue_;
+  bool closed_ = false;
+  std::mutex mutex_;
+  std::condition_variable notEmpty_;
+  std::condition_variable notFull_;
+};
 
 template <typename BackendType>
 void requireCompiledIn(
@@ -46,6 +124,16 @@ void maybeDumpFirstFrame(const AppConfig& config, const RgbImage& image, std::si
   output.write(reinterpret_cast<const char*>(image.data.data()), static_cast<std::streamsize>(image.data.size()));
 }
 
+PostprocessOptions makePostprocessOptions(const AppConfig& config) {
+  return PostprocessOptions{
+      config.confThreshold,
+      config.nmsThreshold,
+      config.labelsPath,
+      {},
+      config.modelOutputLayout,
+      config.verbose};
+}
+
 }  // namespace
 
 void validateAppConfig(const AppConfig& config) {
@@ -60,6 +148,9 @@ void validateAppConfig(const AppConfig& config) {
   }
   if (config.maxFrames < 0) {
     throw std::runtime_error("maxFrames must be greater than or equal to 0");
+  }
+  if (config.inferWorkers <= 0) {
+    throw std::runtime_error("inferWorkers must be greater than 0");
   }
 
   requireCompiledIn(config.decoderBackend, "decoder", isCompiledIn, availableDecoderBackends, toString);
@@ -81,94 +172,210 @@ void validateAppConfig(const AppConfig& config) {
 }
 
 void runPipeline(const AppConfig& config) {
+  const bool needsVisualization =
+      config.visual.display ||
+      !config.visual.outputVideo.empty() ||
+      !config.visual.outputRtsp.empty();
+  const bool needsDisplayFrame = needsVisualization || config.dumpFirstFrame;
+
+  auto inferProbe = createInferBackend(config.inferBackend);
+  inferProbe->open(config.model);
+  const int inferInputWidth = inferProbe->inputWidth() > 0 ? inferProbe->inputWidth() : config.model.inputWidth;
+  const int inferInputHeight = inferProbe->inputHeight() > 0 ? inferProbe->inputHeight() : config.model.inputHeight;
+
   auto decoder = createDecoderBackend(config.decoderBackend);
   auto preproc = createPreprocBackend(config.preprocBackend);
-  auto infer = createInferBackend(config.inferBackend);
-  auto postproc = createPostprocBackend(
-      config.postprocBackend,
-      PostprocessOptions{
-          config.confThreshold,
-          config.nmsThreshold,
-          config.labelsPath,
-          {},
-          config.modelOutputLayout,
-          config.verbose});
-  auto visualizer = createVisualizer();
-
-  infer->open(config.model);
 
   FFmpegPacketSource packetSource;
   packetSource.open(config.source);
   decoder->open(packetSource.codec());
 
-  bool visualizerInitialized = false;
-  std::size_t frameCount = 0;
-  bool eosSubmitted = false;
+  BoundedQueue<PreparedFrame> preparedQueue(static_cast<std::size_t>(std::max(2, config.inferWorkers * 2)));
+  BoundedQueue<ProcessedFrame> processedQueue(static_cast<std::size_t>(std::max(2, config.inferWorkers * 2)));
 
-  while (true) {
-    if (!eosSubmitted) {
+  std::exception_ptr workerError;
+  std::mutex errorMutex;
+  auto storeError = [&](std::exception_ptr error) {
+    std::lock_guard<std::mutex> lock(errorMutex);
+    if (!workerError) {
+      workerError = error;
+    }
+  };
+
+  std::vector<std::thread> inferWorkers;
+  inferWorkers.reserve(static_cast<std::size_t>(config.inferWorkers));
+  for (int workerIndex = 0; workerIndex < config.inferWorkers; ++workerIndex) {
+    inferWorkers.emplace_back([&, workerIndex] {
+      try {
+        auto infer = createInferBackend(config.inferBackend);
+        infer->open(config.model);
+        auto postproc = createPostprocBackend(config.postprocBackend, makePostprocessOptions(config));
+
+        PreparedFrame prepared;
+        while (preparedQueue.pop(prepared)) {
+          const auto inferStart = Clock::now();
+          const InferenceOutput output = infer->infer(prepared.inferenceImage);
+          const auto inferEnd = Clock::now();
+          const auto postStart = inferEnd;
+          const DetectionResult result = postproc->postprocess(
+              output,
+              prepared.inferenceImage,
+              prepared.originalWidth,
+              prepared.originalHeight,
+              prepared.pts);
+          const auto postEnd = Clock::now();
+
+          ProcessedFrame processed;
+          processed.index = prepared.index;
+          processed.pts = prepared.pts;
+          processed.decodedFrame = std::move(prepared.decodedFrame);
+          processed.result = result;
+          processed.decodeMs = prepared.decodeMs;
+          processed.preprocMs = prepared.preprocMs;
+          processed.inferMs = Ms(inferEnd - inferStart).count();
+          processed.postprocMs = Ms(postEnd - postStart).count();
+          processedQueue.push(std::move(processed));
+        }
+      } catch (...) {
+        storeError(std::current_exception());
+        preparedQueue.close();
+        processedQueue.close();
+      }
+    });
+  }
+
+  std::thread outputThread([&] {
+    try {
+      std::unique_ptr<IVisualizer> visualizer;
+      std::unique_ptr<IPreprocessorBackend> displayPreproc;
+      bool visualizerInitialized = false;
+      if (needsVisualization) {
+        visualizer = createVisualizer();
+      }
+      if (needsDisplayFrame) {
+        displayPreproc = createPreprocBackend(config.preprocBackend);
+      }
+
+      std::map<std::size_t, ProcessedFrame> pending;
+      std::size_t nextIndex = 0;
+      std::size_t displayedCount = 0;
+      ProcessedFrame processed;
+      while (processedQueue.pop(processed)) {
+        pending.emplace(processed.index, std::move(processed));
+        while (true) {
+          auto it = pending.find(nextIndex);
+          if (it == pending.end()) {
+            break;
+          }
+
+          ProcessedFrame current = std::move(it->second);
+          pending.erase(it);
+          ++displayedCount;
+
+          double displayPreprocMs = 0.0;
+          std::optional<RgbImage> displayImage;
+          if (needsDisplayFrame) {
+            const auto displayPreprocStart = Clock::now();
+            displayImage = displayPreproc->convertAndResize(
+                current.decodedFrame,
+                current.decodedFrame.width,
+                current.decodedFrame.height,
+                PreprocessOptions{});
+            displayPreprocMs = Ms(Clock::now() - displayPreprocStart).count();
+          }
+
+          std::cout << "frame=" << displayedCount
+                    << " pts=" << current.pts
+                    << " detections=" << current.result.boxes.size();
+          if (config.verbose) {
+            std::cout << " decode_ms=" << current.decodeMs
+                      << " preproc_ms=" << current.preprocMs
+                      << " infer_ms=" << current.inferMs
+                      << " post_ms=" << current.postprocMs
+                      << " display_preproc_ms=" << displayPreprocMs;
+          }
+          std::cout << "\n";
+
+          if (displayImage.has_value()) {
+            maybeDumpFirstFrame(config, displayImage.value(), displayedCount);
+          }
+
+          if (needsVisualization && displayImage.has_value()) {
+            if (!visualizerInitialized) {
+              visualizer->init(displayImage->width, displayImage->height, config.visual);
+              visualizerInitialized = true;
+            }
+            const RgbImage drawnImage = visualizer->draw(displayImage.value(), current.result);
+            (void)drawnImage;
+            visualizer->show();
+          }
+
+          ++nextIndex;
+        }
+      }
+
+      if (visualizer) {
+        visualizer->close();
+      }
+    } catch (...) {
+      storeError(std::current_exception());
+      preparedQueue.close();
+      processedQueue.close();
+    }
+  });
+
+  try {
+    bool eosSubmitted = false;
+    std::size_t producedFrames = 0;
+    while (!eosSubmitted && (config.maxFrames == 0 || producedFrames < static_cast<std::size_t>(config.maxFrames))) {
       const EncodedPacket packet = packetSource.readPacket();
       decoder->submitPacket(packet);
       eosSubmitted = packet.endOfStream;
-    }
 
-    bool producedFrame = false;
-    while (true) {
-      const std::optional<DecodedFrame> decodedFrame = decoder->receiveFrame();
-      if (!decodedFrame.has_value()) {
-        break;
-      }
-      producedFrame = true;
-
-      const RgbImage inferenceImage = preproc->convertAndResize(
-          decodedFrame.value(),
-          infer->inputWidth(),
-          infer->inputHeight(),
-          PreprocessOptions{config.letterbox, 114});
-      const InferenceOutput output = infer->infer(inferenceImage);
-      const DetectionResult result = postproc->postprocess(
-          output,
-          inferenceImage,
-          decodedFrame->width,
-          decodedFrame->height,
-          decodedFrame->pts);
-
-      ++frameCount;
-      std::cout << "frame=" << frameCount
-                << " pts=" << decodedFrame->pts
-                << " detections=" << result.boxes.size() << "\n";
-
-      maybeDumpFirstFrame(config, inferenceImage, frameCount);
-
-      if (config.visual.display || !config.visual.outputVideo.empty() || !config.visual.outputRtsp.empty()) {
-        if (!visualizerInitialized && decodedFrame->width > 0 && decodedFrame->height > 0) {
-          visualizer->init(decodedFrame->width, decodedFrame->height, config.visual);
-          visualizerInitialized = true;
+      while (true) {
+        const auto decodeStart = Clock::now();
+        std::optional<DecodedFrame> decodedFrame = decoder->receiveFrame();
+        const auto decodeEnd = Clock::now();
+        if (!decodedFrame.has_value()) {
+          break;
         }
 
-        if (visualizerInitialized) {
-          const RgbImage originalImage = preproc->convertAndResize(
-              decodedFrame.value(),
-              decodedFrame->width,
-              decodedFrame->height,
-              PreprocessOptions{});
-          const RgbImage drawnImage = visualizer->draw(originalImage, result);
-          (void)drawnImage;
-          visualizer->show();
+        PreparedFrame prepared;
+        prepared.index = producedFrames;
+        prepared.pts = decodedFrame->pts;
+        prepared.originalWidth = decodedFrame->width;
+        prepared.originalHeight = decodedFrame->height;
+        prepared.decodeMs = Ms(decodeEnd - decodeStart).count();
+
+        const auto preprocStart = Clock::now();
+        prepared.inferenceImage = preproc->convertAndResize(
+            decodedFrame.value(),
+            inferInputWidth,
+            inferInputHeight,
+            PreprocessOptions{config.letterbox, 114});
+        prepared.decodedFrame = std::move(decodedFrame.value());
+        const auto preprocEnd = Clock::now();
+        prepared.preprocMs = Ms(preprocEnd - preprocStart).count();
+
+        preparedQueue.push(std::move(prepared));
+        ++producedFrames;
+        if (config.maxFrames > 0 && producedFrames >= static_cast<std::size_t>(config.maxFrames)) {
+          break;
         }
       }
-
-      if (config.maxFrames > 0 && frameCount >= static_cast<std::size_t>(config.maxFrames)) {
-        visualizer->close();
-        return;
-      }
     }
-
-    if (eosSubmitted && !producedFrame) {
-      break;
-    }
+  } catch (...) {
+    storeError(std::current_exception());
   }
 
-  visualizer->close();
-}
+  preparedQueue.close();
+  for (auto& worker : inferWorkers) {
+    worker.join();
+  }
+  processedQueue.close();
+  outputThread.join();
 
+  if (workerError) {
+    std::rethrow_exception(workerError);
+  }
+}

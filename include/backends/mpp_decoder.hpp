@@ -27,10 +27,13 @@ class MppDecoder : public IDecoderBackend {
   int toMppCodec(VideoCodec codec) const;
   void close();
   std::optional<DecodedFrame> popReadyFrame();
-  bool handleInfoChange(void* frame);
+  std::optional<DecodedFrame> decodeOneFrame();
+  void drainFramesToReadyQueue();
+  void handleInfoChange(void* frame);
 
   MppCtx context_ = nullptr;
   MppApi* api_ = nullptr;
   MppBufferGroup externalBufferGroup_ = nullptr;
   std::deque<DecodedFrame> readyFrames_;
+  bool eosSubmitted_ = false;
 };

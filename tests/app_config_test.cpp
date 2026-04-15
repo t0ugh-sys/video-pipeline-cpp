@@ -31,7 +31,7 @@ bool testHelpRequest() {
 
 bool testBackendAndPositionals() {
   std::vector<std::string> arguments = {
-      "video_pipeline", "--backend", "nvidia", "--gpu", "2", "--max-frames", "99",
+      "video_pipeline", "--backend", "nvidia", "--gpu", "2", "--infer-workers", "3", "--max-frames", "99",
       "--conf-threshold", "0.3", "--nms-threshold", "0.5", "--labels-path", "labels.txt",
       "--letterbox", "false", "--verbose", "--dump-first-frame", "--model-output-layout",
       "yolov8_rknn_branch_6", "--display", "stream.mp4", "model.engine", "1280", "720"};
@@ -42,6 +42,7 @@ bool testBackendAndPositionals() {
          expect(result.config.preprocBackend == PreprocBackendType::kNvidiaCuda, "expected nvidia preprocessor preset") &&
          expect(result.config.inferBackend == InferBackendType::kNvidiaTrt, "expected nvidia infer preset") &&
          expect(result.config.gpuId == 2, "expected gpu id to be parsed") &&
+         expect(result.config.inferWorkers == 3, "expected infer workers to be parsed") &&
          expect(result.config.maxFrames == 99, "expected max frames to be parsed") &&
          expect(result.config.confThreshold == 0.3f, "expected conf threshold to be parsed") &&
          expect(result.config.nmsThreshold == 0.5f, "expected nms threshold to be parsed") &&

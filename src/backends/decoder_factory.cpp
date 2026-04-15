@@ -1,7 +1,9 @@
 #include "backend_registry.hpp"
 #include "decoder_interface.hpp"
-#include "backends/nvdec_decoder.hpp"
 
+#if defined(ENABLE_NVDEC_DECODER)
+#include "backends/nvdec_decoder.hpp"
+#endif
 #if defined(ENABLE_MPP_DECODER)
 #include "backends/mpp_decoder.hpp"
 #endif

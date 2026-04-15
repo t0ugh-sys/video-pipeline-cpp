@@ -19,9 +19,9 @@ class RgaPreprocessor : public IPreprocessorBackend {
   std::string name() const override { return "Rockchip RGA"; }
 
  private:
-  void ensureWorkspace(std::size_t intermediateBytes, std::size_t resizedBytes, std::size_t outputBytes);
+  void ensureWorkspace(std::size_t resizedNv12Bytes, std::size_t resizedRgbBytes, std::size_t outputBytes);
 
-  std::vector<std::uint8_t> intermediateRgb_;
+  std::vector<std::uint8_t> resizedNv12_;
   std::vector<std::uint8_t> resizedRgb_;
   std::vector<std::uint8_t> outputRgb_;
 };

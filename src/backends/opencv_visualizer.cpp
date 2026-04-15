@@ -29,8 +29,6 @@ cv::Rect clampRect(const BoundingBox& box, int width, int height) {
   return cv::Rect(cv::Point(x1, y1), cv::Point(std::max(x1 + 1, x2), std::max(y1 + 1, y2)));
 }
 
-}  // namespace
-
 class OpenCVVisualizer : public IVisualizer {
  public:
   OpenCVVisualizer() = default;
@@ -43,11 +41,7 @@ class OpenCVVisualizer : public IVisualizer {
     config_ = config;
 
     if (!config_.outputVideo.empty()) {
-      writer_.open(
-          config_.outputVideo,
-          cv::VideoWriter::fourcc('m', 'p', '4', 'v'),
-          30.0,
-          cv::Size(width_, height_));
+      writer_.open(config_.outputVideo, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), 30.0, cv::Size(width_, height_));
       if (!writer_.isOpened()) {
         throw std::runtime_error("Failed to open video writer: " + config_.outputVideo);
       }
@@ -61,12 +55,10 @@ class OpenCVVisualizer : public IVisualizer {
 
   RgbImage draw(const RgbImage& frame, const DetectionResult& result) override {
     cv::Mat rgb = rgbImageToMat(frame);
-
     for (const auto& box : result.boxes) {
       const cv::Scalar color = getColor(box.classId);
       const cv::Rect rect = clampRect(box, rgb.cols, rgb.rows);
       cv::rectangle(rgb, rect, color, static_cast<int>(config_.bboxThickness));
-
       std::string label;
       if (config_.showLabel && !box.label.empty()) {
         label = box.label;
@@ -77,31 +69,12 @@ class OpenCVVisualizer : public IVisualizer {
         }
         label += std::to_string(static_cast<int>(box.score * 100.0f)) + "%";
       }
-
       if (!label.empty()) {
         int baseline = 0;
-        const cv::Size text_size = cv::getTextSize(
-            label,
-            cv::FONT_HERSHEY_SIMPLEX,
-            config_.fontScale,
-            1,
-            &baseline);
+        const cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, config_.fontScale, 1, &baseline);
         const int text_top = std::max(0, rect.y - text_size.height - 8);
-        cv::rectangle(
-            rgb,
-            cv::Point(rect.x, text_top),
-            cv::Point(std::min(rect.x + text_size.width + 8, rgb.cols - 1), rect.y),
-            color,
-            cv::FILLED);
-        cv::putText(
-            rgb,
-            label,
-            cv::Point(rect.x + 4, std::max(text_size.height, rect.y - 4)),
-            cv::FONT_HERSHEY_SIMPLEX,
-            config_.fontScale,
-            cv::Scalar(255, 255, 255),
-            1,
-            cv::LINE_AA);
+        cv::rectangle(rgb, cv::Point(rect.x, text_top), cv::Point(std::min(rect.x + text_size.width + 8, rgb.cols - 1), rect.y), color, cv::FILLED);
+        cv::putText(rgb, label, cv::Point(rect.x + 4, std::max(text_size.height, rect.y - 4)), cv::FONT_HERSHEY_SIMPLEX, config_.fontScale, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
       }
     }
 
@@ -138,27 +111,16 @@ class OpenCVVisualizer : public IVisualizer {
       window_name_.clear();
     }
     display_image_.release();
-    width_ = 0;
-    height_ = 0;
   }
 
   std::string name() const override { return "OpenCV"; }
-
   bool isAvailable() const override { return true; }
 
  private:
   cv::Scalar getColor(int classId) const {
     static const cv::Scalar colors[] = {
-        cv::Scalar(255, 0, 0),
-        cv::Scalar(0, 255, 0),
-        cv::Scalar(0, 0, 255),
-        cv::Scalar(255, 255, 0),
-        cv::Scalar(255, 0, 255),
-        cv::Scalar(0, 255, 255),
-        cv::Scalar(128, 0, 128),
-        cv::Scalar(255, 165, 0),
-        cv::Scalar(128, 128, 0),
-        cv::Scalar(0, 128, 128),
+        cv::Scalar(255, 0, 0), cv::Scalar(0, 255, 0), cv::Scalar(0, 0, 255), cv::Scalar(255, 255, 0), cv::Scalar(255, 0, 255),
+        cv::Scalar(0, 255, 255), cv::Scalar(128, 0, 128), cv::Scalar(255, 165, 0), cv::Scalar(128, 128, 0), cv::Scalar(0, 128, 128),
     };
     return colors[std::abs(classId) % 10];
   }
@@ -171,30 +133,8 @@ class OpenCVVisualizer : public IVisualizer {
   std::string window_name_;
 };
 
-class DummyVisualizer : public IVisualizer {
- public:
-  void init(int width, int height, const VisualConfig& config) override {
-    (void)width;
-    (void)height;
-    (void)config;
-  }
-
-  RgbImage draw(const RgbImage& frame, const DetectionResult& result) override {
-    (void)result;
-    return frame;
-  }
-
-  void show() override {}
-  void close() override {}
-
-  std::string name() const override { return "Dummy"; }
-  bool isAvailable() const override { return false; }
-};
+}  // namespace
 
 std::unique_ptr<IVisualizer> createVisualizer() {
-#ifdef OpenCV_FOUND
   return std::make_unique<OpenCVVisualizer>();
-#else
-  return std::make_unique<DummyVisualizer>();
-#endif
 }

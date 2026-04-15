@@ -37,6 +37,8 @@ class YoloPostprocessor : public IPostprocessor {
 
   const std::vector<std::string>& labelsForClassCount(int classCount) const;
   ModelOutputLayout inferLayout(const InferenceOutput& output) const;
+  std::vector<float> valuesAsFloat(const InferenceTensor& tensor) const;
+  int classChannelCount(const InferenceOutput& output) const;
 
   static float computeIoU(const BoundingBox& a, const BoundingBox& b);
   static std::vector<BoundingBox> nms(std::vector<BoundingBox>& boxes, float iouThreshold);

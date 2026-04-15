@@ -1,13 +1,15 @@
 #include "backend_registry.hpp"
 #include "preproc_interface.hpp"
+
+#if defined(ENABLE_CUDA_PREPROC)
 #include "backends/cuda_preprocessor.hpp"
-
-#include <cstdlib>
-#include <stdexcept>
-
+#endif
 #if defined(ENABLE_RGA_PREPROC)
 #include "backends/rga_preprocessor.hpp"
 #endif
+
+#include <cstdlib>
+#include <stdexcept>
 
 PreprocBackendType detectAvailablePreprocBackend() {
 #if defined(ENABLE_RGA_PREPROC)

@@ -23,6 +23,7 @@ struct AppConfig {
   bool verbose = false;
   bool dumpFirstFrame = false;
   ModelOutputLayout modelOutputLayout = ModelOutputLayout::kAuto;
+  int inferWorkers = 1;
   int gpuId = 0;
   int maxFrames = 30;
 };

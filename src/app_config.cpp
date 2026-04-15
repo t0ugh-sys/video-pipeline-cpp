@@ -92,6 +92,7 @@ ParseResult parseAppConfig(int argc, char* argv[]) {
       if (argument == "--help" || argument == "-h") return {ParseStatus::kHelp, config, buildUsageMessage(argv[0])};
       if (argument == "--backend") { applyBackendPreset(argv[++index], config); continue; }
       if (argument == "--gpu") { config.gpuId = parseIntValue(argv[++index], "--gpu"); continue; }
+      if (argument == "--infer-workers") { config.inferWorkers = parseIntValue(argv[++index], "--infer-workers"); continue; }
       if (argument == "--max-frames") { config.maxFrames = parseIntValue(argv[++index], "--max-frames"); continue; }
       if (argument == "--conf-threshold") { config.confThreshold = parseFloatValue(argv[++index], "--conf-threshold"); continue; }
       if (argument == "--nms-threshold") { config.nmsThreshold = parseFloatValue(argv[++index], "--nms-threshold"); continue; }
@@ -107,6 +108,9 @@ ParseResult parseAppConfig(int argc, char* argv[]) {
       positionals.push_back(argument);
     }
     assignPositionals(positionals, config);
+    if (config.inferWorkers <= 0) {
+      throw std::runtime_error("--infer-workers must be greater than 0");
+    }
   } catch (const std::exception& error) {
     return {ParseStatus::kError, AppConfig{}, std::string("Error: ") + error.what() + "\n\n" + buildUsageMessage(argv[0])};
   }
@@ -119,6 +123,7 @@ std::string buildUsageMessage(const std::string& programName) {
   message += "Options:\n";
   message += "  --backend <rockchip|mpp|nvidia|nvdec>  Select backend preset\n";
   message += "  --gpu <id>                              GPU device id\n";
+  message += "  --infer-workers <n>                     Number of parallel inference workers\n";
   message += "  --max-frames <n>                        Max frames to process\n";
   message += "  --conf-threshold <f>                    Detection confidence threshold\n";
   message += "  --nms-threshold <f>                     NMS IoU threshold\n";

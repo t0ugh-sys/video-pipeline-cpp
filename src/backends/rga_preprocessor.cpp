@@ -50,7 +50,7 @@ void blitIntoLetterboxedOutput(
     const LetterboxInfo& info,
     std::vector<std::uint8_t>& output,
     int outputWidth) {
-  output.assign(output.size(), paddingValue);
+  std::fill(output.begin(), output.end(), paddingValue);
   const std::size_t resizedStride = static_cast<std::size_t>(resizedWidth * 3);
   const std::size_t dstStride = static_cast<std::size_t>(outputWidth * 3);
   for (int y = 0; y < resizedHeight; ++y) {
@@ -62,21 +62,32 @@ void blitIntoLetterboxedOutput(
   }
 }
 
+int bufferBytesForNv12(int width, int height) {
+  return width * height * 3 / 2;
+}
+
 int bufferBytesForNv12(const DecodedFrame& frame) {
   return frame.horizontalStride * frame.verticalStride * 3 / 2;
+}
+
+void releaseHandle(rga_buffer_handle_t& handle) {
+  if (handle != 0) {
+    releasebuffer_handle(handle);
+    handle = 0;
+  }
 }
 
 }  // namespace
 
 void RgaPreprocessor::ensureWorkspace(
-    std::size_t intermediateBytes,
-    std::size_t resizedBytes,
+    std::size_t resizedNv12Bytes,
+    std::size_t resizedRgbBytes,
     std::size_t outputBytes) {
-  if (intermediateRgb_.size() < intermediateBytes) {
-    intermediateRgb_.resize(intermediateBytes);
+  if (resizedNv12_.size() < resizedNv12Bytes) {
+    resizedNv12_.resize(resizedNv12Bytes);
   }
-  if (resizedRgb_.size() < resizedBytes) {
-    resizedRgb_.resize(resizedBytes);
+  if (resizedRgb_.size() < resizedRgbBytes) {
+    resizedRgb_.resize(resizedRgbBytes);
   }
   if (outputRgb_.size() < outputBytes) {
     outputRgb_.resize(outputBytes);
@@ -103,61 +114,83 @@ RgbImage RgaPreprocessor::convertAndResize(
 
   const int resizedWidth = output.letterbox.enabled ? output.letterbox.resizedWidth : outputWidth;
   const int resizedHeight = output.letterbox.enabled ? output.letterbox.resizedHeight : outputHeight;
-  const std::size_t intermediateBytes = static_cast<std::size_t>(frame.width * frame.height * 3);
-  const std::size_t resizedBytes = static_cast<std::size_t>(resizedWidth * resizedHeight * 3);
+  const bool needsResize = frame.width != resizedWidth || frame.height != resizedHeight;
+  const std::size_t resizedNv12Bytes = needsResize ? static_cast<std::size_t>(bufferBytesForNv12(resizedWidth, resizedHeight)) : 0;
+  const std::size_t resizedRgbBytes = static_cast<std::size_t>(resizedWidth * resizedHeight * 3);
   const std::size_t outputBytes = static_cast<std::size_t>(outputWidth * outputHeight * 3);
-  ensureWorkspace(intermediateBytes, resizedBytes, outputBytes);
+  ensureWorkspace(resizedNv12Bytes, resizedRgbBytes, outputBytes);
 
-  rga_buffer_handle_t srcHandle = importbuffer_fd(frame.dmaFd, bufferBytesForNv12(frame));
-  rga_buffer_handle_t intermediateHandle = importbuffer_virtualaddr(intermediateRgb_.data(), intermediateBytes);
-  rga_buffer_handle_t resizedHandle = importbuffer_virtualaddr(resizedRgb_.data(), resizedBytes);
-  if (srcHandle == 0 || intermediateHandle == 0 || resizedHandle == 0) {
-    if (srcHandle != 0) {
-      releasebuffer_handle(srcHandle);
+  rga_buffer_handle_t srcHandle = 0;
+  rga_buffer_handle_t resizedNv12Handle = 0;
+  rga_buffer_handle_t rgbHandle = 0;
+
+  try {
+    srcHandle = importbuffer_fd(frame.dmaFd, bufferBytesForNv12(frame));
+    if (srcHandle == 0) {
+      throw std::runtime_error("Failed to import source RGA buffer");
     }
-    if (intermediateHandle != 0) {
-      releasebuffer_handle(intermediateHandle);
+
+    std::vector<std::uint8_t>* rgbBuffer = output.letterbox.enabled ? &resizedRgb_ : &outputRgb_;
+    rgbHandle = importbuffer_virtualaddr(rgbBuffer->data(), resizedRgbBytes);
+    if (rgbHandle == 0) {
+      throw std::runtime_error("Failed to import RGB RGA buffer");
     }
-    if (resizedHandle != 0) {
-      releasebuffer_handle(resizedHandle);
+
+    rga_buffer_t src = wrapbuffer_handle(
+        srcHandle,
+        frame.width,
+        frame.height,
+        RK_FORMAT_YCbCr_420_SP,
+        frame.horizontalStride,
+        frame.verticalStride);
+
+    if (needsResize) {
+      resizedNv12Handle = importbuffer_virtualaddr(resizedNv12_.data(), resizedNv12Bytes);
+      if (resizedNv12Handle == 0) {
+        throw std::runtime_error("Failed to import resized NV12 RGA buffer");
+      }
+
+      rga_buffer_t resizedNv12 = wrapbuffer_handle(
+          resizedNv12Handle,
+          resizedWidth,
+          resizedHeight,
+          RK_FORMAT_YCbCr_420_SP,
+          resizedWidth,
+          resizedHeight);
+      checkRgaStatus(imresize(src, resizedNv12), "RGA NV12 resize failed");
+
+      rga_buffer_t resizedRgb = wrapbuffer_handle(
+          rgbHandle,
+          resizedWidth,
+          resizedHeight,
+          RK_FORMAT_RGB_888,
+          resizedWidth,
+          resizedHeight);
+      checkRgaStatus(
+          imcvtcolor(resizedNv12, resizedRgb, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
+          "RGA color conversion failed");
+    } else {
+      rga_buffer_t outputRgb = wrapbuffer_handle(
+          rgbHandle,
+          resizedWidth,
+          resizedHeight,
+          RK_FORMAT_RGB_888,
+          resizedWidth,
+          resizedHeight);
+      checkRgaStatus(
+          imcvtcolor(src, outputRgb, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
+          "RGA color conversion failed");
     }
-    throw std::runtime_error("Failed to import RGA buffers");
+
+    releaseHandle(srcHandle);
+    releaseHandle(resizedNv12Handle);
+    releaseHandle(rgbHandle);
+  } catch (...) {
+    releaseHandle(srcHandle);
+    releaseHandle(resizedNv12Handle);
+    releaseHandle(rgbHandle);
+    throw;
   }
-
-  rga_buffer_t src = wrapbuffer_handle(
-      srcHandle,
-      frame.width,
-      frame.height,
-      RK_FORMAT_YCbCr_420_SP,
-      frame.horizontalStride,
-      frame.verticalStride);
-  rga_buffer_t intermediate = wrapbuffer_handle(
-      intermediateHandle,
-      frame.width,
-      frame.height,
-      RK_FORMAT_RGB_888,
-      frame.width,
-      frame.height);
-  rga_buffer_t resized = wrapbuffer_handle(
-      resizedHandle,
-      resizedWidth,
-      resizedHeight,
-      RK_FORMAT_RGB_888,
-      resizedWidth,
-      resizedHeight);
-
-  checkRgaStatus(
-      imcvtcolor(src, intermediate, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
-      "RGA color conversion failed");
-  if (resizedWidth != frame.width || resizedHeight != frame.height) {
-    checkRgaStatus(imresize(intermediate, resized), "RGA resize failed");
-  } else {
-    std::memcpy(resizedRgb_.data(), intermediateRgb_.data(), resizedBytes);
-  }
-
-  releasebuffer_handle(srcHandle);
-  releasebuffer_handle(intermediateHandle);
-  releasebuffer_handle(resizedHandle);
 
   if (output.letterbox.enabled) {
     blitIntoLetterboxedOutput(
@@ -168,8 +201,6 @@ RgbImage RgaPreprocessor::convertAndResize(
         output.letterbox,
         outputRgb_,
         outputWidth);
-  } else {
-    std::memcpy(outputRgb_.data(), resizedRgb_.data(), resizedBytes);
   }
 
   output.data.assign(outputRgb_.begin(), outputRgb_.begin() + static_cast<std::ptrdiff_t>(outputBytes));

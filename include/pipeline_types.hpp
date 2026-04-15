@@ -25,6 +25,12 @@ enum class TensorDataType {
   kInt32,
 };
 
+enum class TensorQuantizationType {
+  kNone,
+  kDfp,
+  kAffineAsymmetric,
+};
+
 struct EncodedPacket {
   std::vector<std::uint8_t> data;
   std::int64_t pts = 0;
@@ -55,8 +61,6 @@ struct DecodedFrame {
   bool isOnDevice = false;
   std::uintptr_t deviceY = 0;
   std::uintptr_t deviceUv = 0;
-  // Keeps the backend-native resource alive for the lifetime of this frame.
-  // For MPP this owns the underlying MppFrame/MppBuffer.
   std::shared_ptr<void> nativeHandle;
   std::vector<std::uint8_t> yData;
   std::vector<std::uint8_t> uvData;
@@ -75,7 +79,12 @@ struct InferenceTensor {
   std::string layout;
   std::vector<std::int64_t> shape;
   TensorDataType dataType = TensorDataType::kUnknown;
+  TensorQuantizationType quantization = TensorQuantizationType::kNone;
+  int zeroPoint = 0;
+  int fractionalLength = 0;
+  float scale = 1.0f;
   std::vector<float> data;
+  std::vector<std::uint8_t> rawData;
 };
 
 using InferenceOutput = std::vector<InferenceTensor>;

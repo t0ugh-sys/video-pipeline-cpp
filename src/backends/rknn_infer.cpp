@@ -2,6 +2,7 @@
 
 #include "third_party/rknn/include/rknn_api.h"
 
+#include <cstring>
 #include <fstream>
 #include <stdexcept>
 
@@ -21,27 +22,46 @@ rknn_tensor_attr makeTensorAttr(std::uint32_t index) {
 
 TensorDataType toTensorDataType(rknn_tensor_type type) {
   switch (type) {
-    case RKNN_TENSOR_FLOAT32:
-      return TensorDataType::kFloat32;
-    case RKNN_TENSOR_UINT8:
-      return TensorDataType::kUint8;
-    case RKNN_TENSOR_INT8:
-      return TensorDataType::kInt8;
-    case RKNN_TENSOR_INT32:
-      return TensorDataType::kInt32;
-    default:
-      return TensorDataType::kUnknown;
+    case RKNN_TENSOR_FLOAT32: return TensorDataType::kFloat32;
+    case RKNN_TENSOR_UINT8: return TensorDataType::kUint8;
+    case RKNN_TENSOR_INT8: return TensorDataType::kInt8;
+    case RKNN_TENSOR_INT32: return TensorDataType::kInt32;
+    default: return TensorDataType::kUnknown;
+  }
+}
+
+TensorQuantizationType toQuantizationType(rknn_tensor_qnt_type type) {
+  switch (type) {
+    case RKNN_TENSOR_QNT_DFP: return TensorQuantizationType::kDfp;
+    case RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC: return TensorQuantizationType::kAffineAsymmetric;
+    case RKNN_TENSOR_QNT_NONE:
+    default: return TensorQuantizationType::kNone;
+  }
+}
+
+std::size_t tensorElementCount(const rknn_tensor_attr& attr) {
+  std::size_t count = 1;
+  for (std::uint32_t i = 0; i < attr.n_dims; ++i) {
+    count *= static_cast<std::size_t>(attr.dims[i]);
+  }
+  return count;
+}
+
+std::size_t tensorTypeBytes(rknn_tensor_type type) {
+  switch (type) {
+    case RKNN_TENSOR_FLOAT32: return sizeof(float);
+    case RKNN_TENSOR_INT32: return sizeof(std::int32_t);
+    case RKNN_TENSOR_UINT8: return sizeof(std::uint8_t);
+    case RKNN_TENSOR_INT8: return sizeof(std::int8_t);
+    default: return sizeof(std::uint8_t);
   }
 }
 
 std::string toTensorLayout(rknn_tensor_format fmt) {
   switch (fmt) {
-    case RKNN_TENSOR_NCHW:
-      return "NCHW";
-    case RKNN_TENSOR_NHWC:
-      return "NHWC";
-    default:
-      return "UNSPECIFIED";
+    case RKNN_TENSOR_NCHW: return "NCHW";
+    case RKNN_TENSOR_NHWC: return "NHWC";
+    default: return "UNSPECIFIED";
   }
 }
 
@@ -63,11 +83,7 @@ RknnInfer::~RknnInfer() {
 void RknnInfer::open(const ModelConfig& config) {
   close();
   model_data_ = readModelFile(config.modelPath);
-
-  checkRknnStatus(
-      rknn_init(&context_, model_data_.data(), model_data_.size(), 0, nullptr),
-      "rknn_init failed");
-
+  checkRknnStatus(rknn_init(&context_, model_data_.data(), model_data_.size(), 0, nullptr), "rknn_init failed");
   queryTensorInfo();
 }
 
@@ -77,9 +93,6 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
   }
   if (image.width != input_width_ || image.height != input_height_) {
     throw std::runtime_error("RGB image size does not match RKNN input tensor");
-  }
-  if (image.data.size() != static_cast<std::size_t>(input_width_ * input_height_ * input_channels_)) {
-    throw std::runtime_error("RGB image buffer size does not match RKNN input tensor");
   }
 
   std::vector<std::uint8_t> inputBuffer;
@@ -107,19 +120,22 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
   checkRknnStatus(rknn_run(context_, nullptr), "rknn_run failed");
 
   std::vector<rknn_output> outputs(output_templates_.size());
-  for (auto& output : outputs) {
-    output.want_float = 1;
+  for (std::size_t i = 0; i < outputs.size(); ++i) {
+    outputs[i].want_float = output_templates_[i].dataType == TensorDataType::kFloat32 ? 1 : 0;
   }
 
-  checkRknnStatus(
-      rknn_outputs_get(context_, outputs.size(), outputs.data(), nullptr),
-      "rknn_outputs_get failed");
+  checkRknnStatus(rknn_outputs_get(context_, outputs.size(), outputs.data(), nullptr), "rknn_outputs_get failed");
 
   InferenceOutput result = output_templates_;
   for (std::size_t i = 0; i < outputs.size(); ++i) {
-    const auto count = static_cast<std::size_t>(outputs[i].size / sizeof(float));
-    const auto* data = static_cast<const float*>(outputs[i].buf);
-    result[i].data.assign(data, data + count);
+    result[i].data.clear();
+    result[i].rawData.resize(outputs[i].size);
+    std::memcpy(result[i].rawData.data(), outputs[i].buf, outputs[i].size);
+    if (outputs[i].want_float != 0) {
+      const auto count = outputs[i].size / sizeof(float);
+      const auto* data = static_cast<const float*>(outputs[i].buf);
+      result[i].data.assign(data, data + count);
+    }
   }
 
   rknn_outputs_release(context_, outputs.size(), outputs.data());
@@ -131,12 +147,10 @@ std::vector<std::uint8_t> RknnInfer::readModelFile(const std::string& path) cons
   if (!input.is_open()) {
     throw std::runtime_error("Failed to open RKNN model file: " + path);
   }
-
   const auto size = input.tellg();
   if (size <= 0) {
     throw std::runtime_error("RKNN model file is empty: " + path);
   }
-
   std::vector<std::uint8_t> data(static_cast<std::size_t>(size));
   input.seekg(0, std::ios::beg);
   input.read(reinterpret_cast<char*>(data.data()), size);
@@ -145,15 +159,10 @@ std::vector<std::uint8_t> RknnInfer::readModelFile(const std::string& path) cons
 
 void RknnInfer::queryTensorInfo() {
   rknn_input_output_num ioNum = {};
-  checkRknnStatus(
-      rknn_query(context_, RKNN_QUERY_IN_OUT_NUM, &ioNum, sizeof(ioNum)),
-      "RKNN_QUERY_IN_OUT_NUM failed");
+  checkRknnStatus(rknn_query(context_, RKNN_QUERY_IN_OUT_NUM, &ioNum, sizeof(ioNum)), "RKNN_QUERY_IN_OUT_NUM failed");
 
   rknn_tensor_attr inputAttr = makeTensorAttr(0);
-  checkRknnStatus(
-      rknn_query(context_, RKNN_QUERY_INPUT_ATTR, &inputAttr, sizeof(inputAttr)),
-      "RKNN_QUERY_INPUT_ATTR failed");
-
+  checkRknnStatus(rknn_query(context_, RKNN_QUERY_INPUT_ATTR, &inputAttr, sizeof(inputAttr)), "RKNN_QUERY_INPUT_ATTR failed");
   if (inputAttr.fmt == RKNN_TENSOR_NHWC) {
     is_nhwc_ = true;
     input_height_ = inputAttr.dims[1];
@@ -172,15 +181,18 @@ void RknnInfer::queryTensorInfo() {
   output_templates_.reserve(ioNum.n_output);
   for (std::uint32_t i = 0; i < ioNum.n_output; ++i) {
     rknn_tensor_attr outputAttr = makeTensorAttr(i);
-    checkRknnStatus(
-        rknn_query(context_, RKNN_QUERY_OUTPUT_ATTR, &outputAttr, sizeof(outputAttr)),
-        "RKNN_QUERY_OUTPUT_ATTR failed");
+    checkRknnStatus(rknn_query(context_, RKNN_QUERY_OUTPUT_ATTR, &outputAttr, sizeof(outputAttr)), "RKNN_QUERY_OUTPUT_ATTR failed");
 
     InferenceTensor tensor;
     tensor.name = outputAttr.name[0] != '\0' ? outputAttr.name : ("output_" + std::to_string(i));
     tensor.layout = toTensorLayout(outputAttr.fmt);
     tensor.shape = toShape(outputAttr);
     tensor.dataType = toTensorDataType(outputAttr.type);
+    tensor.quantization = toQuantizationType(outputAttr.qnt_type);
+    tensor.zeroPoint = outputAttr.zp;
+    tensor.fractionalLength = outputAttr.fl;
+    tensor.scale = outputAttr.scale;
+    tensor.rawData.reserve(tensorElementCount(outputAttr) * tensorTypeBytes(outputAttr.type));
     output_templates_.push_back(std::move(tensor));
   }
 }
