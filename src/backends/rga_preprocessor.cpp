@@ -2,12 +2,14 @@
 
 extern "C" {
 #include <mpp_buffer.h>
+#include <mpp_frame.h>
 }
 #include <im2d.hpp>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -17,8 +19,6 @@ namespace {
 // RGA hardware requires aligned stride for correct operation. 16 is a safe
 // universal choice covering RGA2/RGA3 and both NV12 (min 2) and RGB_888 (min 4).
 constexpr int kRgaStrideAlign = 16;
-constexpr size_t kRgaBufferGroupMaxBytes = 32 * 1024 * 1024;
-constexpr RK_S32 kRgaBufferGroupLimit = 4;
 
 inline int alignUp(int value, int alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
@@ -127,27 +127,179 @@ void fillPackedRgbData(
 }  // namespace
 
 RgaPreprocessor::~RgaPreprocessor() {
+  releasePersistentBuffers();
   if (bufferGroup_ != nullptr) {
     mpp_buffer_group_put(static_cast<MppBufferGroup>(bufferGroup_));
     bufferGroup_ = nullptr;
   }
 }
 
-void RgaPreprocessor::ensureBufferGroup() {
-  if (bufferGroup_ != nullptr) {
+void RgaPreprocessor::setMaxInflightFrames(std::size_t maxInflightFrames) {
+  maxInflightFrames_ = std::max<std::size_t>(1, maxInflightFrames);
+}
+
+void RgaPreprocessor::ensureBufferGroup(std::size_t maxBufferBytes) {
+  if (maxBufferBytes == 0) {
+    throw std::runtime_error("RGA buffer group requires a non-zero max buffer size");
+  }
+
+  const auto requestedLimit = static_cast<RK_S32>(std::min<std::size_t>(
+      maxInflightFrames_,
+      static_cast<std::size_t>(std::numeric_limits<RK_S32>::max())));
+
+  if (bufferGroup_ != nullptr &&
+      configuredMaxBufferBytes_ >= maxBufferBytes &&
+      configuredMaxInflightFrames_ == static_cast<std::size_t>(requestedLimit)) {
     return;
   }
+
   MppBufferGroup group = nullptr;
   if (mpp_buffer_group_get_internal(
           &group,
           static_cast<MppBufferType>(MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE)) != MPP_OK) {
     throw std::runtime_error("mpp_buffer_group_get_internal for RGA output failed");
   }
-  if (mpp_buffer_group_limit_config(group, kRgaBufferGroupMaxBytes, kRgaBufferGroupLimit) != MPP_OK) {
+
+  if (mpp_buffer_group_limit_config(group, maxBufferBytes, requestedLimit) != MPP_OK) {
     mpp_buffer_group_put(group);
     throw std::runtime_error("mpp_buffer_group_limit_config for RGA output failed");
   }
+
+  if (bufferGroup_ != nullptr) {
+    releasePersistentBuffers();
+    mpp_buffer_group_put(static_cast<MppBufferGroup>(bufferGroup_));
+  }
   bufferGroup_ = group;
+  configuredMaxBufferBytes_ = maxBufferBytes;
+  configuredMaxInflightFrames_ = static_cast<std::size_t>(requestedLimit);
+}
+
+void RgaPreprocessor::releasePersistentBuffers() {
+  releaseHandle(resizedNv12Handle_);
+  releaseHandle(resizedRgbHandle_);
+
+  if (resizedNv12Buffer_ != nullptr) {
+    mpp_buffer_put(static_cast<MppBuffer>(resizedNv12Buffer_));
+    resizedNv12Buffer_ = nullptr;
+  }
+  if (resizedRgbBuffer_ != nullptr) {
+    mpp_buffer_put(static_cast<MppBuffer>(resizedRgbBuffer_));
+    resizedRgbBuffer_ = nullptr;
+  }
+
+  resizedNv12Width_ = 0;
+  resizedNv12Height_ = 0;
+  resizedNv12Wstride_ = 0;
+  resizedNv12Hstride_ = 0;
+  resizedNv12Bytes_ = 0;
+  resizedNv12Fd_ = -1;
+
+  resizedRgbWidth_ = 0;
+  resizedRgbHeight_ = 0;
+  resizedRgbWstride_ = 0;
+  resizedRgbHstride_ = 0;
+  resizedRgbBytes_ = 0;
+  resizedRgbFd_ = -1;
+}
+
+void RgaPreprocessor::ensureResizedNv12Buffer(
+    int width,
+    int height,
+    int wstride,
+    int hstride,
+    std::size_t bytes) {
+  if (bufferGroup_ == nullptr) {
+    throw std::runtime_error("RGA resized NV12 buffer group is not initialized");
+  }
+
+  if (resizedNv12Buffer_ != nullptr &&
+      resizedNv12Width_ == width &&
+      resizedNv12Height_ == height &&
+      resizedNv12Wstride_ == wstride &&
+      resizedNv12Hstride_ == hstride &&
+      resizedNv12Bytes_ == bytes &&
+      resizedNv12Fd_ >= 0 &&
+      resizedNv12Handle_ != 0) {
+    return;
+  }
+
+  releaseHandle(resizedNv12Handle_);
+  if (resizedNv12Buffer_ != nullptr) {
+    mpp_buffer_put(static_cast<MppBuffer>(resizedNv12Buffer_));
+    resizedNv12Buffer_ = nullptr;
+  }
+
+  MppBuffer buffer = allocateBuffer(static_cast<MppBufferGroup>(bufferGroup_), bytes, "RGA resized NV12");
+  const int fd = mpp_buffer_get_fd(buffer);
+  if (fd < 0) {
+    mpp_buffer_put(buffer);
+    throw std::runtime_error("mpp_buffer_get_fd failed for resized NV12 buffer");
+  }
+
+  const rga_buffer_handle_t handle = importbuffer_fd(fd, static_cast<int>(bytes));
+  if (handle == 0) {
+    mpp_buffer_put(buffer);
+    throw std::runtime_error("Failed to import resized NV12 RGA buffer");
+  }
+
+  resizedNv12Buffer_ = buffer;
+  resizedNv12Width_ = width;
+  resizedNv12Height_ = height;
+  resizedNv12Wstride_ = wstride;
+  resizedNv12Hstride_ = hstride;
+  resizedNv12Bytes_ = bytes;
+  resizedNv12Fd_ = fd;
+  resizedNv12Handle_ = handle;
+}
+
+void RgaPreprocessor::ensureResizedRgbBuffer(
+    int width,
+    int height,
+    int wstride,
+    int hstride,
+    std::size_t bytes) {
+  if (bufferGroup_ == nullptr) {
+    throw std::runtime_error("RGA resized RGB buffer group is not initialized");
+  }
+
+  if (resizedRgbBuffer_ != nullptr &&
+      resizedRgbWidth_ == width &&
+      resizedRgbHeight_ == height &&
+      resizedRgbWstride_ == wstride &&
+      resizedRgbHstride_ == hstride &&
+      resizedRgbBytes_ == bytes &&
+      resizedRgbFd_ >= 0 &&
+      resizedRgbHandle_ != 0) {
+    return;
+  }
+
+  releaseHandle(resizedRgbHandle_);
+  if (resizedRgbBuffer_ != nullptr) {
+    mpp_buffer_put(static_cast<MppBuffer>(resizedRgbBuffer_));
+    resizedRgbBuffer_ = nullptr;
+  }
+
+  MppBuffer buffer = allocateBuffer(static_cast<MppBufferGroup>(bufferGroup_), bytes, "RGA resized RGB");
+  const int fd = mpp_buffer_get_fd(buffer);
+  if (fd < 0) {
+    mpp_buffer_put(buffer);
+    throw std::runtime_error("mpp_buffer_get_fd failed for resized RGB buffer");
+  }
+
+  const rga_buffer_handle_t handle = importbuffer_fd(fd, static_cast<int>(bytes));
+  if (handle == 0) {
+    mpp_buffer_put(buffer);
+    throw std::runtime_error("Failed to import resized RGB RGA buffer");
+  }
+
+  resizedRgbBuffer_ = buffer;
+  resizedRgbWidth_ = width;
+  resizedRgbHeight_ = height;
+  resizedRgbWstride_ = wstride;
+  resizedRgbHstride_ = hstride;
+  resizedRgbBytes_ = bytes;
+  resizedRgbFd_ = fd;
+  resizedRgbHandle_ = handle;
 }
 
 RgbImage RgaPreprocessor::convertAndResize(
@@ -161,147 +313,135 @@ RgbImage RgaPreprocessor::convertAndResize(
   if (frame.format != PixelFormat::kUnknown && frame.format != PixelFormat::kNv12) {
     throw std::runtime_error("RGA preprocessor currently expects NV12 decoded frames");
   }
+  if (frame.nativeFormat != 0 && frame.nativeFormat != MPP_FMT_YUV420SP) {
+    throw std::runtime_error(
+        "RGA preprocessor expects linear MPP_FMT_YUV420SP frames, got native format=" +
+        std::to_string(frame.nativeFormat));
+  }
 
   RgbImage output;
   output.width = outputWidth;
   output.height = outputHeight;
   output.format = PixelFormat::kRgb888;
+  output.wstride = outputWidth;
+  output.hstride = outputHeight;
+  output.dmaFd = -1;
+  output.dmaSize = 0;
   output.letterbox = buildLetterboxInfo(frame.width, frame.height, outputWidth, outputHeight, options.letterbox);
 
   const int resizedWidth = output.letterbox.enabled ? output.letterbox.resizedWidth : outputWidth;
   const int resizedHeight = output.letterbox.enabled ? output.letterbox.resizedHeight : outputHeight;
   const bool needsResize = frame.width != resizedWidth || frame.height != resizedHeight;
+  const std::size_t outputRgbBytes = static_cast<std::size_t>(outputWidth * outputHeight * 3);
 
-  // Aligned strides that RGA will see via wrapbuffer_handle.
-  const int resizedNv12Wstride = alignUp(resizedWidth, kRgaStrideAlign);
-  const int resizedNv12Hstride = alignUp(resizedHeight, 2);
-  const int resizedRgbWstride = alignUp(resizedWidth, kRgaStrideAlign);
-  const int resizedRgbHstride = resizedHeight;
-  const int outputRgbWstride = alignUp(outputWidth, kRgaStrideAlign);
-  const int outputRgbHstride = outputHeight;
+  if (!options.needsCpuData) {
+    rga_buffer_handle_t srcHandle = 0;
+    rga_buffer_handle_t outputHandle = 0;
+    MppBuffer outputBuffer = nullptr;
 
-  const std::size_t resizedNv12Bytes =
-      needsResize ? static_cast<std::size_t>(nv12BytesForStride(resizedNv12Wstride, resizedNv12Hstride)) : 0;
-  const bool letterboxEnabled = output.letterbox.enabled;
-  const std::size_t outputRgbBytes =
-      static_cast<std::size_t>(rgb888BytesForStride(outputRgbWstride, outputRgbHstride));
-  const std::size_t resizedRgbBytes =
-      static_cast<std::size_t>(rgb888BytesForStride(resizedRgbWstride, resizedRgbHstride));
-  ensureBufferGroup();
+    try {
+      const int resizedNv12Wstride = alignUp(resizedWidth, kRgaStrideAlign);
+      const int resizedNv12Hstride = alignUp(resizedHeight, 2);
+      const int resizedRgbWstride = alignUp(resizedWidth, kRgaStrideAlign);
+      const int resizedRgbHstride = resizedHeight;
+      const int outputRgbWstride = alignUp(outputWidth, kRgaStrideAlign);
+      const int outputRgbHstride = outputHeight;
+      const std::size_t resizedNv12Bytes =
+          needsResize ? static_cast<std::size_t>(nv12BytesForStride(resizedNv12Wstride, resizedNv12Hstride)) : 0;
+      const std::size_t resizedRgbBytes =
+          static_cast<std::size_t>(rgb888BytesForStride(resizedRgbWstride, resizedRgbHstride));
+      const std::size_t outputAlignedRgbBytes =
+          static_cast<std::size_t>(rgb888BytesForStride(outputRgbWstride, outputRgbHstride));
+      const std::size_t maxBufferBytes =
+          std::max(outputAlignedRgbBytes, std::max(resizedNv12Bytes, resizedRgbBytes));
+      ensureBufferGroup(maxBufferBytes);
 
-  rga_buffer_handle_t srcHandle = 0;
-  rga_buffer_handle_t resizedNv12Handle = 0;
-  rga_buffer_handle_t resizedRgbHandle = 0;
-  rga_buffer_handle_t outputHandle = 0;
-  MppBuffer resizedNv12Buffer = nullptr;
-  MppBuffer resizedRgbBuffer = nullptr;
-  MppBuffer outputBuffer = nullptr;
-
-  try {
-    const im_rect emptyRect = {};
-    const rga_buffer_t emptyPat = {};
-    const auto group = static_cast<MppBufferGroup>(bufferGroup_);
-
-    outputBuffer = allocateBuffer(group, outputRgbBytes, "RGA output");
-
-    output.dmaFd = mpp_buffer_get_fd(outputBuffer);
-    if (output.dmaFd < 0) {
-      throw std::runtime_error("mpp_buffer_get_fd failed for RGA output buffer");
-    }
-    output.wstride = outputRgbWstride;
-    output.hstride = outputRgbHstride;
-    output.dmaSize = outputRgbBytes;
-    output.nativeHandle = makeMppBufferHandle(outputBuffer);
-    outputBuffer = nullptr;
-
-    outputHandle = importbuffer_fd(output.dmaFd, static_cast<int>(outputRgbBytes));
-    if (outputHandle == 0) {
-      throw std::runtime_error("Failed to import RGA output DRM buffer");
-    }
-
-    rga_buffer_t outputRgb = wrapbuffer_handle(
-        outputHandle,
-        outputWidth,
-        outputHeight,
-        RK_FORMAT_RGB_888,
-        outputRgbWstride,
-        outputRgbHstride);
-
-    srcHandle = importbuffer_fd(
-        frame.dmaFd,
-        nv12BytesForStride(frame.horizontalStride, frame.verticalStride));
-    if (srcHandle == 0) {
-      throw std::runtime_error("Failed to import source RGA buffer (fd)");
-    }
-
-    rga_buffer_t src = wrapbuffer_handle(
-        srcHandle,
-        frame.width,
-        frame.height,
-        RK_FORMAT_YCbCr_420_SP,
-        frame.horizontalStride,
-        frame.verticalStride);
-
-    if (needsResize) {
-      resizedNv12Buffer = allocateBuffer(group, resizedNv12Bytes, "RGA resized NV12");
-      const int resizedNv12Fd = mpp_buffer_get_fd(resizedNv12Buffer);
-      if (resizedNv12Fd < 0) {
-        throw std::runtime_error("mpp_buffer_get_fd failed for resized NV12 buffer");
+      outputBuffer = allocateBuffer(static_cast<MppBufferGroup>(bufferGroup_), outputAlignedRgbBytes, "RGA output");
+      output.dmaFd = mpp_buffer_get_fd(outputBuffer);
+      if (output.dmaFd < 0) {
+        throw std::runtime_error("mpp_buffer_get_fd failed for RGA output buffer");
       }
-      resizedNv12Handle = importbuffer_fd(
-          resizedNv12Fd,
-          static_cast<int>(resizedNv12Bytes));
-      if (resizedNv12Handle == 0) {
-        throw std::runtime_error("Failed to import resized NV12 RGA buffer");
+      output.wstride = outputRgbWstride;
+      output.hstride = outputRgbHstride;
+      output.dmaSize = outputAlignedRgbBytes;
+      output.nativeHandle = makeMppBufferHandle(outputBuffer);
+      outputBuffer = nullptr;
+
+      outputHandle = importbuffer_fd(output.dmaFd, static_cast<int>(outputAlignedRgbBytes));
+      if (outputHandle == 0) {
+        throw std::runtime_error("Failed to import RGA output DRM buffer");
       }
 
-      rga_buffer_t resizedNv12 = wrapbuffer_handle(
-          resizedNv12Handle,
-          resizedWidth,
-          resizedHeight,
+      srcHandle = importbuffer_fd(
+          frame.dmaFd,
+          frame.horizontalStride,
+          frame.verticalStride,
+          RK_FORMAT_YCbCr_420_SP);
+      if (srcHandle == 0) {
+        throw std::runtime_error("RGA importbuffer_fd failed for decoded frame");
+      }
+
+      const im_rect emptyRect = {};
+      const rga_buffer_t emptyPat = {};
+      rga_buffer_t src = wrapbuffer_handle(
+          srcHandle,
+          frame.width,
+          frame.height,
           RK_FORMAT_YCbCr_420_SP,
-          resizedNv12Wstride,
-          resizedNv12Hstride);
+          frame.horizontalStride,
+          frame.verticalStride);
+      rga_buffer_t outputRgb = wrapbuffer_handle(
+          outputHandle,
+          outputWidth,
+          outputHeight,
+          RK_FORMAT_RGB_888,
+          outputRgbWstride,
+          outputRgbHstride);
 
-      checkRgaVerify(imcheck_t(src, resizedNv12, emptyPat, emptyRect, emptyRect, emptyRect, 0), "imresize(NV12)");
-      checkRgaOp(imresize(src, resizedNv12), "imresize(NV12)");
-
-      if (letterboxEnabled) {
-        resizedRgbBuffer = allocateBuffer(group, resizedRgbBytes, "RGA resized RGB");
-        const int resizedRgbFd = mpp_buffer_get_fd(resizedRgbBuffer);
-        if (resizedRgbFd < 0) {
-          throw std::runtime_error("mpp_buffer_get_fd failed for resized RGB buffer");
-        }
-        resizedRgbHandle = importbuffer_fd(
-            resizedRgbFd,
-            static_cast<int>(resizedRgbBytes));
-        if (resizedRgbHandle == 0) {
-          throw std::runtime_error("Failed to import resized RGB RGA buffer");
-        }
-
-        rga_buffer_t resizedRgb = wrapbuffer_handle(
-            resizedRgbHandle,
+      if (needsResize) {
+        ensureResizedNv12Buffer(
             resizedWidth,
             resizedHeight,
-            RK_FORMAT_RGB_888,
-            resizedRgbWstride,
-            resizedRgbHstride);
+            resizedNv12Wstride,
+            resizedNv12Hstride,
+            resizedNv12Bytes);
 
-        checkRgaVerify(
-            imcheck_t(resizedNv12, resizedRgb, emptyPat, emptyRect, emptyRect, emptyRect, 0),
-            "imcvtcolor(NV12->RGB)");
-        checkRgaOp(
-            imcvtcolor(resizedNv12, resizedRgb, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
-            "imcvtcolor(NV12->RGB)");
+        rga_buffer_t resizedNv12 = wrapbuffer_handle(
+            resizedNv12Handle_,
+            resizedWidth,
+            resizedHeight,
+            RK_FORMAT_YCbCr_420_SP,
+            resizedNv12Wstride,
+            resizedNv12Hstride);
 
-        const int top = output.letterbox.padTop;
-        const int bottom = output.letterbox.padBottom;
-        const int left = output.letterbox.padLeft;
-        const int right = output.letterbox.padRight;
+        checkRgaVerify(imcheck_t(src, resizedNv12, emptyPat, emptyRect, emptyRect, emptyRect, 0), "imresize(NV12)");
+        checkRgaOp(imresize(src, resizedNv12), "imresize(NV12)");
 
-        bool usedHardwareLetterbox = false;
-        const int borderCheck = imcheck_t(resizedRgb, outputRgb, emptyPat, emptyRect, emptyRect, emptyRect, 0);
-        if (borderCheck == IM_STATUS_NOERROR) {
+        if (output.letterbox.enabled) {
+          ensureResizedRgbBuffer(
+              resizedWidth,
+              resizedHeight,
+              resizedRgbWstride,
+              resizedRgbHstride,
+              resizedRgbBytes);
+
+          rga_buffer_t resizedRgb = wrapbuffer_handle(
+              resizedRgbHandle_,
+              resizedWidth,
+              resizedHeight,
+              RK_FORMAT_RGB_888,
+              resizedRgbWstride,
+              resizedRgbHstride);
+
+          checkRgaOp(
+              imcvtcolor(resizedNv12, resizedRgb, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
+              "imcvtcolor(NV12->RGB)");
+
+          const int top = output.letterbox.padTop;
+          const int bottom = output.letterbox.padBottom;
+          const int left = output.letterbox.padLeft;
+          const int right = output.letterbox.padRight;
+
           const IM_STATUS borderStatus = immakeBorder(
               resizedRgb,
               outputRgb,
@@ -314,79 +454,148 @@ RgbImage RgaPreprocessor::convertAndResize(
               1,
               -1,
               nullptr);
-          if (borderStatus == IM_STATUS_SUCCESS) {
-            usedHardwareLetterbox = true;
+          if (borderStatus != IM_STATUS_SUCCESS) {
+            throw std::runtime_error(
+                std::string("RGA immakeBorder failed: ") + imStrError_t(borderStatus));
           }
-        }
-
-        if (!usedHardwareLetterbox) {
-          void* outputPtr = mpp_buffer_get_ptr(static_cast<MppBuffer>(output.nativeHandle.get()));
-          if (outputPtr == nullptr) {
-            throw std::runtime_error("Failed to map RGA output DRM buffer for CPU letterbox fallback");
-          }
-          const auto* resizedBase =
-              static_cast<const std::uint8_t*>(mpp_buffer_get_ptr(resizedRgbBuffer));
-          if (resizedBase == nullptr) {
-            throw std::runtime_error("Failed to map resized RGB DRM buffer");
-          }
-          std::memset(outputPtr, options.paddingValue, outputRgbBytes);
-          auto* packedOutput = static_cast<std::uint8_t*>(outputPtr);
-          for (int y = 0; y < resizedHeight; ++y) {
-            std::memcpy(
-                packedOutput + static_cast<std::size_t>(y + top) * static_cast<std::size_t>(outputRgbWstride * 3) +
-                    static_cast<std::size_t>(left * 3),
-                resizedBase + static_cast<std::size_t>(y) * static_cast<std::size_t>(resizedRgbWstride * 3),
-                static_cast<std::size_t>(resizedWidth * 3));
-          }
+        } else {
+          checkRgaOp(
+              imcvtcolor(resizedNv12, outputRgb, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
+              "imcvtcolor(NV12->RGB resized direct)");
         }
       } else {
-        checkRgaVerify(
-            imcheck_t(resizedNv12, outputRgb, emptyPat, emptyRect, emptyRect, emptyRect, 0),
-            "imcvtcolor(NV12->RGB resized direct)");
         checkRgaOp(
-            imcvtcolor(resizedNv12, outputRgb, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
-            "imcvtcolor(NV12->RGB resized direct)");
+            imcvtcolor(src, outputRgb, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
+            "imcvtcolor(NV12->RGB direct)");
       }
-    } else {
-      checkRgaVerify(
-          imcheck_t(src, outputRgb, emptyPat, emptyRect, emptyRect, emptyRect, 0),
-          "imcvtcolor(NV12->RGB direct)");
-      checkRgaOp(
-          imcvtcolor(src, outputRgb, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
-          "imcvtcolor(NV12->RGB direct)");
+
+      releaseHandle(srcHandle);
+      releaseHandle(outputHandle);
+      return output;
+    } catch (const std::exception& error) {
+      static bool loggedZeroCopyFallback = false;
+      if (!loggedZeroCopyFallback) {
+        loggedZeroCopyFallback = true;
+        std::cerr << "[RGA] zero-copy preprocess fallback to host-copy: "
+                  << error.what() << "\n";
+      }
+      releaseHandle(srcHandle);
+      releaseHandle(outputHandle);
+      output.nativeHandle.reset();
+      output.dmaFd = -1;
+      output.dmaSize = 0;
+      output.wstride = outputWidth;
+      output.hstride = outputHeight;
+      if (outputBuffer != nullptr) {
+        mpp_buffer_put(outputBuffer);
+      }
+    }
+  }
+
+  output.data.resize(outputRgbBytes);
+
+  rga_buffer_handle_t srcHandle = 0;
+  rga_buffer_handle_t resizedNv12Handle = 0;
+  rga_buffer_handle_t resizedRgbHandle = 0;
+  rga_buffer_handle_t outputHandle = 0;
+
+  std::vector<std::uint8_t> resizedNv12;
+  std::vector<std::uint8_t> resizedRgb;
+
+  try {
+    srcHandle = importbuffer_fd(
+        frame.dmaFd,
+        frame.horizontalStride,
+        frame.verticalStride,
+        RK_FORMAT_YCbCr_420_SP);
+    if (srcHandle == 0) {
+      throw std::runtime_error("RGA importbuffer_fd failed for decoded frame");
     }
 
-    releaseHandle(srcHandle);
-    releaseHandle(resizedNv12Handle);
-    releaseHandle(resizedRgbHandle);
-    releaseHandle(outputHandle);
-    if (resizedNv12Buffer != nullptr) {
-      mpp_buffer_put(resizedNv12Buffer);
-      resizedNv12Buffer = nullptr;
-    }
-    if (resizedRgbBuffer != nullptr) {
-      mpp_buffer_put(resizedRgbBuffer);
-      resizedRgbBuffer = nullptr;
+    rga_buffer_t src = wrapbuffer_handle(
+        srcHandle,
+        frame.width,
+        frame.height,
+        RK_FORMAT_YCbCr_420_SP,
+        frame.horizontalStride,
+        frame.verticalStride);
+
+    if (!needsResize && !output.letterbox.enabled) {
+      outputHandle = importbuffer_virtualaddr(output.data.data(), static_cast<int>(outputRgbBytes));
+      if (outputHandle == 0) {
+        throw std::runtime_error("RGA importbuffer_virtualaddr failed for output RGB buffer");
+      }
+
+      rga_buffer_t dst = wrapbuffer_handle(
+          outputHandle,
+          outputWidth,
+          outputHeight,
+          RK_FORMAT_RGB_888);
+      checkRgaOp(
+          imcvtcolor(src, dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
+          "imcvtcolor(NV12->RGB direct host)");
+    } else {
+      const std::size_t resizedNv12Bytes =
+          static_cast<std::size_t>(resizedWidth * resizedHeight * 3 / 2);
+      const std::size_t resizedRgbBytes =
+          static_cast<std::size_t>(resizedWidth * resizedHeight * 3);
+
+      resizedRgb.resize(resizedRgbBytes);
+      resizedRgbHandle = importbuffer_virtualaddr(resizedRgb.data(), static_cast<int>(resizedRgbBytes));
+      if (resizedRgbHandle == 0) {
+        throw std::runtime_error("RGA importbuffer_virtualaddr failed for resized RGB buffer");
+      }
+
+      rga_buffer_t resizedRgbBuf = wrapbuffer_handle(
+          resizedRgbHandle,
+          resizedWidth,
+          resizedHeight,
+          RK_FORMAT_RGB_888);
+
+      if (needsResize) {
+        resizedNv12.resize(resizedNv12Bytes);
+        resizedNv12Handle = importbuffer_virtualaddr(resizedNv12.data(), static_cast<int>(resizedNv12Bytes));
+        if (resizedNv12Handle == 0) {
+          throw std::runtime_error("RGA importbuffer_virtualaddr failed for resized NV12 buffer");
+        }
+
+        rga_buffer_t resizedNv12Buf = wrapbuffer_handle(
+            resizedNv12Handle,
+            resizedWidth,
+            resizedHeight,
+            RK_FORMAT_YCbCr_420_SP);
+        checkRgaOp(imresize(src, resizedNv12Buf), "imresize(NV12 host)");
+        checkRgaOp(
+            imcvtcolor(resizedNv12Buf, resizedRgbBuf, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
+            "imcvtcolor(NV12->RGB resized host)");
+      } else {
+        checkRgaOp(
+            imcvtcolor(src, resizedRgbBuf, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
+            "imcvtcolor(NV12->RGB host)");
+      }
+
+      std::memset(output.data.data(), options.paddingValue, outputRgbBytes);
+      const int left = output.letterbox.enabled ? output.letterbox.padLeft : 0;
+      const int top = output.letterbox.enabled ? output.letterbox.padTop : 0;
+      for (int y = 0; y < resizedHeight; ++y) {
+        std::memcpy(
+            output.data.data() +
+                static_cast<std::size_t>(((y + top) * outputWidth + left) * 3),
+            resizedRgb.data() + static_cast<std::size_t>(y * resizedWidth * 3),
+            static_cast<std::size_t>(resizedWidth * 3));
+      }
     }
   } catch (...) {
-    releaseHandle(srcHandle);
-    releaseHandle(resizedNv12Handle);
-    releaseHandle(resizedRgbHandle);
     releaseHandle(outputHandle);
-    output.nativeHandle.reset();
-    output.dmaFd = -1;
-    output.wstride = 0;
-    output.hstride = 0;
-    output.dmaSize = 0;
-    if (outputBuffer != nullptr) mpp_buffer_put(outputBuffer);
-    if (resizedNv12Buffer != nullptr) mpp_buffer_put(resizedNv12Buffer);
-    if (resizedRgbBuffer != nullptr) mpp_buffer_put(resizedRgbBuffer);
+    releaseHandle(resizedRgbHandle);
+    releaseHandle(resizedNv12Handle);
+    releaseHandle(srcHandle);
     throw;
   }
 
-  if (options.needsCpuData) {
-    fillPackedRgbData(output.nativeHandle, outputRgbWstride, outputWidth, outputHeight, output.data);
-  }
-
+  releaseHandle(outputHandle);
+  releaseHandle(resizedRgbHandle);
+  releaseHandle(resizedNv12Handle);
+  releaseHandle(srcHandle);
   return output;
 }

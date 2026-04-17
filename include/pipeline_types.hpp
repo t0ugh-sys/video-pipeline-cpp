@@ -56,6 +56,7 @@ struct DecodedFrame {
   int verticalStride = 0;
   int chromaStride = 0;
   PixelFormat format = PixelFormat::kUnknown;
+  int nativeFormat = 0;
   int dmaFd = -1;
   std::int64_t pts = 0;
   bool isOnDevice = false;

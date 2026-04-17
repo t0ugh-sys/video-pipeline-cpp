@@ -40,6 +40,19 @@ bool parseBoolValue(const std::string& value, const char* optionName) {
   throw std::runtime_error("Invalid boolean for " + std::string(optionName) + ": " + value);
 }
 
+RknnCoreMaskMode parseRknnCoreMask(const std::string& value) {
+  if (value == "auto") return RknnCoreMaskMode::kAuto;
+  if (value == "0") return RknnCoreMaskMode::kCore0;
+  if (value == "1") return RknnCoreMaskMode::kCore1;
+  if (value == "2") return RknnCoreMaskMode::kCore2;
+  if (value == "0_1") return RknnCoreMaskMode::kCore0_1;
+  if (value == "0_2") return RknnCoreMaskMode::kCore0_2;
+  if (value == "1_2") return RknnCoreMaskMode::kCore1_2;
+  if (value == "0_1_2") return RknnCoreMaskMode::kCore0_1_2;
+  if (value == "all") return RknnCoreMaskMode::kAll;
+  throw std::runtime_error("Unsupported RKNN core mask: " + value);
+}
+
 ModelOutputLayout parseModelOutputLayout(const std::string& value) {
   if (value == "auto") return ModelOutputLayout::kAuto;
   if (value == "yolov8_flat_8400x84") return ModelOutputLayout::kYolov8Flat;
@@ -101,15 +114,20 @@ ParseResult parseAppConfig(int argc, char* argv[]) {
       if (argument == "--backend") { applyBackendPreset(requireNextArg(argc, argv, index, "--backend"), config); continue; }
       if (argument == "--gpu") { config.gpuId = parseIntValue(requireNextArg(argc, argv, index, "--gpu"), "--gpu"); continue; }
       if (argument == "--infer-workers") { config.inferWorkers = parseIntValue(requireNextArg(argc, argv, index, "--infer-workers"), "--infer-workers"); continue; }
+      if (argument == "--progress-every") { config.progressEvery = parseIntValue(requireNextArg(argc, argv, index, "--progress-every"), "--progress-every"); continue; }
+      if (argument == "--rknn-core-mask") { config.rknnCoreMask = parseRknnCoreMask(requireNextArg(argc, argv, index, "--rknn-core-mask")); continue; }
       if (argument == "--max-frames") { config.maxFrames = parseIntValue(requireNextArg(argc, argv, index, "--max-frames"), "--max-frames"); continue; }
       if (argument == "--conf-threshold") { config.confThreshold = parseFloatValue(requireNextArg(argc, argv, index, "--conf-threshold"), "--conf-threshold"); continue; }
       if (argument == "--nms-threshold") { config.nmsThreshold = parseFloatValue(requireNextArg(argc, argv, index, "--nms-threshold"), "--nms-threshold"); continue; }
       if (argument == "--labels-path") { config.labelsPath = requireNextArg(argc, argv, index, "--labels-path"); continue; }
       if (argument == "--letterbox") { config.letterbox = parseBoolValue(requireNextArg(argc, argv, index, "--letterbox"), "--letterbox"); continue; }
+      if (argument == "--rknn-zero-copy") { config.rknnZeroCopy = parseBoolValue(requireNextArg(argc, argv, index, "--rknn-zero-copy"), "--rknn-zero-copy"); continue; }
       if (argument == "--verbose") { config.verbose = true; continue; }
       if (argument == "--dump-first-frame") { config.dumpFirstFrame = true; continue; }
       if (argument == "--model-output-layout") { config.modelOutputLayout = parseModelOutputLayout(requireNextArg(argc, argv, index, "--model-output-layout")); continue; }
       if (argument == "--display") { config.visual.display = true; continue; }
+      if (argument == "--display-max-width") { config.visual.displayMaxWidth = parseIntValue(requireNextArg(argc, argv, index, "--display-max-width"), "--display-max-width"); continue; }
+      if (argument == "--display-max-height") { config.visual.displayMaxHeight = parseIntValue(requireNextArg(argc, argv, index, "--display-max-height"), "--display-max-height"); continue; }
       if (argument == "--output-video") { config.visual.outputVideo = requireNextArg(argc, argv, index, "--output-video"); continue; }
       if (argument == "--output-rtsp") { config.visual.outputRtsp = requireNextArg(argc, argv, index, "--output-rtsp"); continue; }
       if (argument == "--encoder-output") { config.encoderOutput = requireNextArg(argc, argv, index, "--encoder-output"); continue; }
@@ -122,6 +140,9 @@ ParseResult parseAppConfig(int argc, char* argv[]) {
     assignPositionals(positionals, config);
     if (config.inferWorkers <= 0) {
       throw std::runtime_error("--infer-workers must be greater than 0");
+    }
+    if (config.progressEvery <= 0) {
+      throw std::runtime_error("--progress-every must be greater than 0");
     }
   } catch (const std::exception& error) {
     return {ParseStatus::kError, AppConfig{}, std::string("Error: ") + error.what() + "\n\n" + buildUsageMessage(argv[0])};
@@ -136,16 +157,21 @@ std::string buildUsageMessage(const std::string& programName) {
   message += "  --backend <rockchip|mpp|nvidia|nvdec>  Select backend preset\n";
   message += "  --gpu <id>                              GPU device id\n";
   message += "  --infer-workers <n>                     Number of parallel inference workers\n";
-  message += "  --max-frames <n>                        Max frames to process\n";
+  message += "  --progress-every <n>                    Print one progress log every n frames (default: 30)\n";
+  message += "  --rknn-core-mask <mask>                 auto|0|1|2|0_1|0_2|1_2|0_1_2|all\n";
+  message += "  --max-frames <n>                        Max frames to process (default: 0 = unlimited)\n";
   message += "  --conf-threshold <f>                    Detection confidence threshold\n";
   message += "  --nms-threshold <f>                     NMS IoU threshold\n";
   message += "  --labels-path <path>                    Optional labels file path\n";
   message += "  --letterbox <true|false>                Enable letterbox preprocessing\n";
+  message += "  --rknn-zero-copy <true|false>           Prefer DMA RGB input for RKNN, fallback to host-copy on failure\n";
   message += "  --model-output-layout <name>            auto|yolov8_flat_8400x84|yolov8_rknn_branch_6|yolov8_rknn_branch_9|yolo26_e2e\n";
   message += "  --verbose                               Enable verbose logs\n";
   message += "  --dump-first-frame                      Dump first inference input frame\n";
   message += "  --display                               Enable display window\n";
-  message += "  --output-video <path>                   Write annotated video to a file\n";
+  message += "  --display-max-width <n>                 Max display-path width, 0 keeps source width\n";
+  message += "  --display-max-height <n>                Max display-path height, 0 keeps source height\n";
+  message += "  --output-video <path>                   Write annotated video to a file (.h264/.264/.h265/.hevc on Rockchip)\n";
   message += "  --output-rtsp <url>                     Stream annotated video to RTSP\n";
   message += "  --encoder-output <path>                 Write raw decode stream (MPP h264/h265)\n";
   message += "  --encoder-codec <h264|h265>             Encoder codec (default: h264)\n";

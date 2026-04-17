@@ -11,6 +11,8 @@
 namespace {
 struct DenseLayout { int proposals = 0; int attributes = 0; bool transposed = false; };
 struct TensorView { const InferenceTensor* tensor = nullptr; int channels = 0; int height = 0; int width = 0; bool nchw = true; };
+constexpr std::size_t kMaxCandidatesBeforeNms = 200;
+constexpr std::size_t kMaxDetectionsAfterNms = 50;
 
 std::vector<std::string> loadLabels(const std::string& path) {
   std::vector<std::string> labels;
@@ -58,6 +60,47 @@ bool buildTensorView(const InferenceTensor& tensor, TensorView& view) {
 }
 
 float sigmoid(float value) { return 1.0f / (1.0f + std::exp(-value)); }
+
+float tensorValueAt(const InferenceTensor& tensor, const TensorView& view, int c, int y, int x) {
+  const std::size_t index = view.nchw
+      ? (static_cast<std::size_t>(c) * view.height + y) * view.width + x
+      : (static_cast<std::size_t>(y) * view.width + x) * view.channels + c;
+
+  if (!tensor.data.empty()) {
+    return tensor.data[index];
+  }
+
+  switch (tensor.dataType) {
+    case TensorDataType::kInt8: {
+      const auto* raw = reinterpret_cast<const std::int8_t*>(tensor.rawData.data());
+      const float rawValue = static_cast<float>(raw[index]);
+      if (tensor.quantization == TensorQuantizationType::kAffineAsymmetric) {
+        return (rawValue - static_cast<float>(tensor.zeroPoint)) * tensor.scale;
+      }
+      if (tensor.quantization == TensorQuantizationType::kDfp) {
+        return std::ldexp(rawValue, -tensor.zeroPoint);
+      }
+      return rawValue;
+    }
+    case TensorDataType::kUint8: {
+      const float rawValue = static_cast<float>(tensor.rawData[index]);
+      if (tensor.quantization == TensorQuantizationType::kAffineAsymmetric) {
+        return (rawValue - static_cast<float>(tensor.zeroPoint)) * tensor.scale;
+      }
+      if (tensor.quantization == TensorQuantizationType::kDfp) {
+        return std::ldexp(rawValue, -tensor.zeroPoint);
+      }
+      return rawValue;
+    }
+    case TensorDataType::kInt32: {
+      const auto* raw = reinterpret_cast<const std::int32_t*>(tensor.rawData.data());
+      return static_cast<float>(raw[index]);
+    }
+    case TensorDataType::kFloat32:
+    default:
+      return 0.0f;
+  }
+}
 
 void clampBoxes(std::vector<BoundingBox>& boxes, int originalWidth, int originalHeight) {
   for (auto& box : boxes) {
@@ -262,28 +305,21 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
     if (!buildTensorView(branch.box, boxView) || !buildTensorView(branch.cls, clsView)) continue;
     if (branch.hasScore && !buildTensorView(branch.score, scoreView)) continue;
 
-    const std::vector<float> boxData = valuesAsFloat(branch.box);
-    const std::vector<float> clsData = valuesAsFloat(branch.cls);
-    const std::vector<float> scoreData = branch.hasScore ? valuesAsFloat(branch.score) : std::vector<float>{};
     const auto& labels = labelsForClassCount(clsView.channels);
     const float strideX = static_cast<float>(modelInput.width) / static_cast<float>(boxView.width);
     const float strideY = static_cast<float>(modelInput.height) / static_cast<float>(boxView.height);
-
-    auto tensorValueFrom = [](const std::vector<float>& data, const TensorView& view, int c, int y, int x) -> float {
-      return view.nchw ? data[static_cast<std::size_t>(((c * view.height) + y) * view.width + x)] : data[static_cast<std::size_t>(((y * view.width) + x) * view.channels + c)];
-    };
 
     for (int y = 0; y < boxView.height; ++y) {
       for (int x = 0; x < boxView.width; ++x) {
         float objectness = 1.0f;
         if (branch.hasScore) {
-          objectness = tensorValueFrom(scoreData, scoreView, 0, y, x);
+          objectness = tensorValueAt(branch.score, scoreView, 0, y, x);
           if (objectness > 1.0f || objectness < 0.0f) objectness = sigmoid(objectness);
         }
         float bestScore = 0.0f;
         int bestClass = 0;
         for (int c = 0; c < clsView.channels; ++c) {
-          float cls = tensorValueFrom(clsData, clsView, c, y, x);
+          float cls = tensorValueAt(branch.cls, clsView, c, y, x);
           if (cls > 1.0f || cls < 0.0f) cls = sigmoid(cls);
           if (cls > bestScore) { bestScore = cls; bestClass = c; }
         }
@@ -291,16 +327,21 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
         if (score < options_.confThreshold) continue;
         float left = 0.0f, top = 0.0f, right = 0.0f, bottom = 0.0f;
         if (boxView.channels == 4) {
-          left = tensorValueFrom(boxData, boxView, 0, y, x); top = tensorValueFrom(boxData, boxView, 1, y, x); right = tensorValueFrom(boxData, boxView, 2, y, x); bottom = tensorValueFrom(boxData, boxView, 3, y, x);
+          left = tensorValueAt(branch.box, boxView, 0, y, x);
+          top = tensorValueAt(branch.box, boxView, 1, y, x);
+          right = tensorValueAt(branch.box, boxView, 2, y, x);
+          bottom = tensorValueAt(branch.box, boxView, 3, y, x);
         } else {
           const int bins = boxView.channels / 4;
           auto decode = [&](int base) {
             float maxLogit = -std::numeric_limits<float>::infinity();
-            for (int i = 0; i < bins; ++i) maxLogit = std::max(maxLogit, tensorValueFrom(boxData, boxView, base + i, y, x));
+            for (int i = 0; i < bins; ++i) {
+              maxLogit = std::max(maxLogit, tensorValueAt(branch.box, boxView, base + i, y, x));
+            }
             float denominator = 0.0f;
             float numerator = 0.0f;
             for (int i = 0; i < bins; ++i) {
-              const float prob = std::exp(tensorValueFrom(boxData, boxView, base + i, y, x) - maxLogit);
+              const float prob = std::exp(tensorValueAt(branch.box, boxView, base + i, y, x) - maxLogit);
               denominator += prob;
               numerator += prob * static_cast<float>(i);
             }
@@ -319,7 +360,19 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
     }
   }
 
+  if (boxes.size() > kMaxCandidatesBeforeNms) {
+    std::partial_sort(
+        boxes.begin(),
+        boxes.begin() + static_cast<std::ptrdiff_t>(kMaxCandidatesBeforeNms),
+        boxes.end(),
+        [](const BoundingBox& a, const BoundingBox& b) { return a.score > b.score; });
+    boxes.resize(kMaxCandidatesBeforeNms);
+  }
+
   boxes = nms(boxes, options_.nmsThreshold);
+  if (boxes.size() > kMaxDetectionsAfterNms) {
+    boxes.resize(kMaxDetectionsAfterNms);
+  }
   mapBoxesToOriginal(boxes, modelInput, originalWidth, originalHeight);
   return DetectionResult{pts, std::move(boxes), originalWidth, originalHeight};
 }

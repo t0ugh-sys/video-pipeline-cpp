@@ -9,31 +9,25 @@ extern "C" {
 }
 
 #include <cstdint>
-#include <memory>
+#include <chrono>
 #include <stdexcept>
+#include <thread>
 
 namespace {
 
 constexpr MppCodingType kCodingAvc = MPP_VIDEO_CodingAVC;
 constexpr MppCodingType kCodingHevc = MPP_VIDEO_CodingHEVC;
-constexpr int kMaxPutAttempts = 32;
-constexpr RK_S32 kFrameGroupCount = 12;
+constexpr RK_S32 kFrameGroupCount = 24;
+constexpr auto kPutPacketRetrySleep = std::chrono::milliseconds(3);
+constexpr auto kPutPacketRetryTimeout = std::chrono::milliseconds(500);
+constexpr int kGetFrameTimeoutRetries = 30;
+constexpr auto kGetFrameRetrySleep = std::chrono::milliseconds(1);
 
 void checkMppStatus(MPP_RET status, const char* message) {
   if (status != MPP_OK) {
     throw std::runtime_error(message);
   }
 }
-
-struct MppFrameHolder {
-  MppFrame frame = nullptr;
-
-  ~MppFrameHolder() {
-    if (frame != nullptr) {
-      mpp_frame_deinit(&frame);
-    }
-  }
-};
 
 }  // namespace
 
@@ -48,6 +42,11 @@ void MppDecoder::open(VideoCodec codec) {
   checkMppStatus(
       mpp_init(context_, MPP_CTX_DEC, static_cast<MppCodingType>(toMppCodec(codec))),
       "mpp_init failed");
+
+  RK_U32 outputFormat = MPP_FMT_YUV420SP;
+  checkMppStatus(
+      api_->control(context_, MPP_DEC_SET_OUTPUT_FORMAT, &outputFormat),
+      "MPP_DEC_SET_OUTPUT_FORMAT failed");
 
   RK_U32 splitMode = 1;
   checkMppStatus(
@@ -102,7 +101,8 @@ void MppDecoder::submitPacket(const EncodedPacket& packet) {
   mpp_packet_set_pts(mppPacket, packet.pts);
 
   bool submitted = false;
-  for (int attempt = 0; attempt < kMaxPutAttempts; ++attempt) {
+  const auto deadline = std::chrono::steady_clock::now() + kPutPacketRetryTimeout;
+  while (std::chrono::steady_clock::now() < deadline) {
     const MPP_RET status = api_->decode_put_packet(context_, mppPacket);
     if (status == MPP_OK) {
       submitted = true;
@@ -114,12 +114,23 @@ void MppDecoder::submitPacket(const EncodedPacket& packet) {
     }
 
     drainFramesToReadyQueue();
+    std::this_thread::sleep_for(kPutPacketRetrySleep);
   }
 
   mpp_packet_deinit(&mppPacket);
   if (!submitted) {
-    throw std::runtime_error("decode_put_packet stayed buffer-full and could not make progress");
+    throw std::runtime_error(
+        "decode_put_packet stayed buffer-full for " +
+        std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(kPutPacketRetryTimeout).count()) +
+        " ms (pts=" + std::to_string(packet.pts) +
+        ", size=" + std::to_string(packet.data.size()) +
+        ", eos=" + std::string(packet.endOfStream ? "true" : "false") + ")");
   }
+
+  // Follow the official simple decode flow more closely: once a packet is
+  // accepted, immediately drain any pending info-change/frame output before
+  // allowing the caller to push more packets.
+  drainFramesToReadyQueue();
 }
 
 std::optional<DecodedFrame> MppDecoder::receiveFrame() {
@@ -141,9 +152,18 @@ std::optional<DecodedFrame> MppDecoder::popReadyFrame() {
 }
 
 std::optional<DecodedFrame> MppDecoder::decodeOneFrame() {
+  int timeoutRetries = 0;
   while (true) {
     MppFrame frame = nullptr;
     const MPP_RET status = api_->decode_get_frame(context_, &frame);
+    if (status == MPP_ERR_TIMEOUT) {
+      if (timeoutRetries++ < kGetFrameTimeoutRetries) {
+        std::this_thread::sleep_for(kGetFrameRetrySleep);
+        continue;
+      }
+      return std::nullopt;
+    }
+    timeoutRetries = 0;
     if (status != MPP_OK) {
       checkMppStatus(status, "decode_get_frame failed");
     }
@@ -167,8 +187,7 @@ std::optional<DecodedFrame> MppDecoder::decodeOneFrame() {
       throw std::runtime_error("MPP frame buffer is null");
     }
 
-    auto holder = std::make_shared<MppFrameHolder>();
-    holder->frame = frame;
+    checkMppStatus(mpp_buffer_inc_ref(buffer), "mpp_buffer_inc_ref failed");
 
     DecodedFrame output;
     output.width = mpp_frame_get_width(frame);
@@ -177,9 +196,15 @@ std::optional<DecodedFrame> MppDecoder::decodeOneFrame() {
     output.verticalStride = mpp_frame_get_ver_stride(frame);
     output.chromaStride = output.horizontalStride;
     output.format = PixelFormat::kNv12;
+    output.nativeFormat = mpp_frame_get_fmt(frame);
     output.pts = mpp_frame_get_pts(frame);
     output.dmaFd = mpp_buffer_get_fd(buffer);
-    output.nativeHandle = holder;
+    output.nativeHandle = std::shared_ptr<void>(buffer, [](void* opaque) {
+      if (opaque != nullptr) {
+        mpp_buffer_put(reinterpret_cast<MppBuffer>(opaque));
+      }
+    });
+    mpp_frame_deinit(&frame);
     return output;
   }
 }
@@ -197,15 +222,6 @@ void MppDecoder::drainFramesToReadyQueue() {
 void MppDecoder::handleInfoChange(void* opaqueFrame) {
   MppFrame frame = static_cast<MppFrame>(opaqueFrame);
 
-  if (externalBufferGroup_ != nullptr) {
-    mpp_buffer_group_put(externalBufferGroup_);
-    externalBufferGroup_ = nullptr;
-  }
-
-  checkMppStatus(
-      mpp_buffer_group_get_external(&externalBufferGroup_, MPP_BUFFER_TYPE_DRM),
-      "mpp_buffer_group_get_external failed");
-
   size_t frameBytes = mpp_frame_get_buf_size(frame);
   if (frameBytes == 0) {
     const RK_U32 horStride = static_cast<RK_U32>(mpp_frame_get_hor_stride(frame));
@@ -215,12 +231,20 @@ void MppDecoder::handleInfoChange(void* opaqueFrame) {
     frameBytes = static_cast<size_t>(safeHorStride) * static_cast<size_t>(safeVerStride) * 3 / 2;
   }
 
+  if (externalBufferGroup_ == nullptr) {
+    checkMppStatus(
+        mpp_buffer_group_get_internal(&externalBufferGroup_, MPP_BUFFER_TYPE_DRM),
+        "mpp_buffer_group_get_internal failed");
+    checkMppStatus(
+        api_->control(context_, MPP_DEC_SET_EXT_BUF_GROUP, externalBufferGroup_),
+        "MPP_DEC_SET_EXT_BUF_GROUP failed");
+  } else {
+    checkMppStatus(mpp_buffer_group_clear(externalBufferGroup_), "mpp_buffer_group_clear failed");
+  }
+
   checkMppStatus(
       mpp_buffer_group_limit_config(externalBufferGroup_, frameBytes, kFrameGroupCount),
       "mpp_buffer_group_limit_config failed");
-  checkMppStatus(
-      api_->control(context_, MPP_DEC_SET_EXT_BUF_GROUP, externalBufferGroup_),
-      "MPP_DEC_SET_EXT_BUF_GROUP failed");
   checkMppStatus(
       api_->control(context_, MPP_DEC_SET_INFO_CHANGE_READY, nullptr),
       "MPP_DEC_SET_INFO_CHANGE_READY failed");

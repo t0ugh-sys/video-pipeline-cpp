@@ -42,7 +42,9 @@ int main(int argc, char* argv[]) {
     validateAppConfig(parseResult.config);
     setGpuEnvironment(parseResult.config.gpuId);
     runPipeline(parseResult.config);
-    return 0;
+    std::cout.flush();
+    std::cerr.flush();
+    std::_Exit(0);
   } catch (const std::exception& error) {
     std::cerr << "\n[ERROR] Pipeline failed: " << error.what() << '\n';
     return 1;

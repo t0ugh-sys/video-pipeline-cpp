@@ -21,6 +21,10 @@ class IPreprocessorBackend {
       int outputHeight,
       const PreprocessOptions& options = {}) = 0;
 
+  virtual void setMaxInflightFrames(std::size_t maxInflightFrames) {
+    (void)maxInflightFrames;
+  }
+
   virtual std::string name() const = 0;
 };
 

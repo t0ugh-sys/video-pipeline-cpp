@@ -15,7 +15,7 @@ class RknnInfer : public IInferenceBackend {
   RknnInfer(const RknnInfer&) = delete;
   RknnInfer& operator=(const RknnInfer&) = delete;
 
-  void open(const ModelConfig& config) override;
+  void open(const ModelConfig& config, const InferRuntimeConfig& runtime = {}) override;
   InferenceOutput infer(const RgbImage& image) override;
   int inputWidth() const override { return input_width_; }
   int inputHeight() const override { return input_height_; }
@@ -32,7 +32,11 @@ class RknnInfer : public IInferenceBackend {
   int input_height_ = 0;
   int input_channels_ = 0;
   bool is_nhwc_ = true;
+  bool verbose_ = false;
+  bool has_last_fd_decision_ = false;
+  bool last_can_use_fd_input_ = false;
   bool has_native_input_attr_ = false;
+  InferRuntimeConfig runtime_config_ = {};
   rknn_tensor_attr input_attr_ = {};
   rknn_tensor_attr native_input_attr_ = {};
   InferenceOutput output_templates_;

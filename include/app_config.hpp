@@ -24,8 +24,11 @@ struct AppConfig {
   bool dumpFirstFrame = false;
   ModelOutputLayout modelOutputLayout = ModelOutputLayout::kAuto;
   int inferWorkers = 1;
+  int progressEvery = 30;
+  bool rknnZeroCopy = true;
+  RknnCoreMaskMode rknnCoreMask = RknnCoreMaskMode::kAuto;
   int gpuId = 0;
-  int maxFrames = 30;
+  int maxFrames = 0;
   std::string encoderOutput;
   std::string encoderCodec = "h264";
   int encoderBitrate = 4000000;

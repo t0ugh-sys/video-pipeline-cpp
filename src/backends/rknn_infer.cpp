@@ -4,6 +4,8 @@
 
 #include <cstring>
 #include <fstream>
+#include <iostream>
+#include <sstream>
 #include <stdexcept>
 
 namespace {
@@ -12,6 +14,108 @@ void checkRknnStatus(int status, const char* message) {
   if (status != RKNN_SUCC) {
     throw std::runtime_error(message);
   }
+}
+
+void logRknnWarning(const char* message, int status) {
+  std::cerr << "[RKNN] " << message << " (status=" << status << ")\n";
+}
+
+int alignUp(int value, int alignment) {
+  return (value + alignment - 1) & ~(alignment - 1);
+}
+
+const char* toCoreMaskName(RknnCoreMaskMode mode) {
+  switch (mode) {
+    case RknnCoreMaskMode::kAuto: return "auto";
+    case RknnCoreMaskMode::kCore0: return "0";
+    case RknnCoreMaskMode::kCore1: return "1";
+    case RknnCoreMaskMode::kCore2: return "2";
+    case RknnCoreMaskMode::kCore0_1: return "0_1";
+    case RknnCoreMaskMode::kCore0_2: return "0_2";
+    case RknnCoreMaskMode::kCore1_2: return "1_2";
+    case RknnCoreMaskMode::kCore0_1_2: return "0_1_2";
+    case RknnCoreMaskMode::kAll: return "all";
+    default: return "unknown";
+  }
+}
+
+rknn_core_mask toRknnCoreMask(RknnCoreMaskMode mode) {
+  switch (mode) {
+    case RknnCoreMaskMode::kCore0: return RKNN_NPU_CORE_0;
+    case RknnCoreMaskMode::kCore1: return RKNN_NPU_CORE_1;
+    case RknnCoreMaskMode::kCore2: return RKNN_NPU_CORE_2;
+    case RknnCoreMaskMode::kCore0_1: return RKNN_NPU_CORE_0_1;
+    case RknnCoreMaskMode::kCore0_2: return static_cast<rknn_core_mask>(RKNN_NPU_CORE_0 | RKNN_NPU_CORE_2);
+    case RknnCoreMaskMode::kCore1_2: return static_cast<rknn_core_mask>(RKNN_NPU_CORE_1 | RKNN_NPU_CORE_2);
+    case RknnCoreMaskMode::kCore0_1_2: return RKNN_NPU_CORE_0_1_2;
+    case RknnCoreMaskMode::kAll: return RKNN_NPU_CORE_ALL;
+    case RknnCoreMaskMode::kAuto:
+    default: return RKNN_NPU_CORE_AUTO;
+  }
+}
+
+std::string joinReasons(const std::vector<std::string>& reasons) {
+  if (reasons.empty()) {
+    return "ok";
+  }
+
+  std::ostringstream stream;
+  for (std::size_t index = 0; index < reasons.size(); ++index) {
+    if (index != 0) {
+      stream << ", ";
+    }
+    stream << reasons[index];
+  }
+  return stream.str();
+}
+
+std::string describeTensorAttr(const rknn_tensor_attr& attr) {
+  std::ostringstream stream;
+  stream << "idx=" << attr.index << " dims=[";
+  for (uint32_t i = 0; i < attr.n_dims; ++i) {
+    if (i != 0) {
+      stream << "x";
+    }
+    stream << attr.dims[i];
+  }
+  stream << "] fmt=" << static_cast<int>(attr.fmt)
+         << " type=" << static_cast<int>(attr.type)
+         << " w_stride=" << attr.w_stride
+         << " size=" << attr.size
+         << " size_with_stride=" << attr.size_with_stride;
+  return stream.str();
+}
+
+std::vector<std::string> buildStaticFdInputReasons(
+    bool isNhwc,
+    bool hasNativeInputAttr,
+    int inputWidth,
+    int inputHeight,
+    const rknn_tensor_attr& nativeInputAttr) {
+  std::vector<std::string> reasons;
+  if (!isNhwc) {
+    reasons.emplace_back("input layout is not NHWC");
+  }
+  if (!hasNativeInputAttr) {
+    reasons.emplace_back("RKNN native input attr unavailable");
+    return reasons;
+  }
+
+  const int expectedWstride = alignUp(inputWidth, 16);
+  const uint32_t expectedBytes = static_cast<uint32_t>(expectedWstride * inputHeight * 3);
+  const uint32_t nativeInputBytes =
+      nativeInputAttr.size_with_stride != 0 ? nativeInputAttr.size_with_stride : nativeInputAttr.size;
+  if (nativeInputAttr.w_stride != 0 && nativeInputAttr.w_stride != static_cast<uint32_t>(expectedWstride)) {
+    reasons.emplace_back(
+        "expected RGA RGB stride " + std::to_string(expectedWstride) +
+        " but RKNN native stride is " + std::to_string(nativeInputAttr.w_stride));
+  }
+  if (expectedBytes < nativeInputBytes) {
+    reasons.emplace_back(
+        "expected RGA RGB bytes " + std::to_string(expectedBytes) +
+        " smaller than RKNN native size " + std::to_string(nativeInputBytes));
+  }
+  return reasons;
 }
 
 rknn_tensor_attr makeTensorAttr(std::uint32_t index) {
@@ -120,11 +224,41 @@ RknnInfer::~RknnInfer() {
   close();
 }
 
-void RknnInfer::open(const ModelConfig& config) {
+void RknnInfer::open(const ModelConfig& config, const InferRuntimeConfig& runtime) {
   close();
+  runtime_config_ = runtime;
+  verbose_ = runtime.verbose;
   model_data_ = readModelFile(config.modelPath);
-  checkRknnStatus(rknn_init(&context_, model_data_.data(), model_data_.size(), 0, nullptr), "rknn_init failed");
+  constexpr uint32_t kRknnInitFlags = RKNN_FLAG_ASYNC_MASK;
+  checkRknnStatus(
+      rknn_init(&context_, model_data_.data(), model_data_.size(), kRknnInitFlags, nullptr),
+      "rknn_init failed");
+
+  const int coreMaskStatus = rknn_set_core_mask(context_, toRknnCoreMask(runtime_config_.rknnCoreMask));
+  if (coreMaskStatus != RKNN_SUCC) {
+    logRknnWarning("rknn_set_core_mask failed, continuing with default core selection", coreMaskStatus);
+  }
+
   queryTensorInfo();
+
+  if (verbose_) {
+    const auto staticReasons =
+        buildStaticFdInputReasons(is_nhwc_, has_native_input_attr_, input_width_, input_height_, native_input_attr_);
+    std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
+              << "/" << runtime_config_.workerCount
+              << " init_flags=async"
+              << " core_mask=" << toCoreMaskName(runtime_config_.rknnCoreMask)
+              << " input_attr={" << describeTensorAttr(input_attr_) << "}";
+    if (has_native_input_attr_) {
+      std::cerr << " native_input_attr={" << describeTensorAttr(native_input_attr_) << "}";
+    } else {
+      std::cerr << " native_input_attr={unavailable}";
+    }
+    std::cerr << " static_fd_input="
+              << (staticReasons.empty() ? "possible" : "fallback")
+              << " reason=" << joinReasons(staticReasons)
+              << "\n";
+  }
 }
 
 InferenceOutput RknnInfer::infer(const RgbImage& image) {
@@ -143,6 +277,43 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
       image.wstride == static_cast<int>(native_input_attr_.w_stride) &&
       image.dmaSize >= static_cast<std::size_t>(
           native_input_attr_.size_with_stride != 0 ? native_input_attr_.size_with_stride : native_input_attr_.size);
+
+  std::vector<std::string> fdInputReasons;
+  if (!is_nhwc_) {
+    fdInputReasons.emplace_back("input layout is not NHWC");
+  }
+  if (!has_native_input_attr_) {
+    fdInputReasons.emplace_back("RKNN native input attr unavailable");
+  }
+  if (image.format != PixelFormat::kRgb888) {
+    fdInputReasons.emplace_back("image format is not RGB888");
+  }
+  if (image.dmaFd < 0) {
+    fdInputReasons.emplace_back("image dmaFd is invalid");
+  }
+  if (has_native_input_attr_ && image.wstride != static_cast<int>(native_input_attr_.w_stride)) {
+    fdInputReasons.emplace_back(
+        "image wstride=" + std::to_string(image.wstride) +
+        " expected=" + std::to_string(native_input_attr_.w_stride));
+  }
+  if (has_native_input_attr_) {
+    const std::size_t nativeInputBytes =
+        native_input_attr_.size_with_stride != 0 ? native_input_attr_.size_with_stride : native_input_attr_.size;
+    if (image.dmaSize < nativeInputBytes) {
+      fdInputReasons.emplace_back(
+          "image dmaSize=" + std::to_string(image.dmaSize) +
+          " smaller than native input bytes=" + std::to_string(nativeInputBytes));
+    }
+  }
+
+  if (verbose_ && (!has_last_fd_decision_ || last_can_use_fd_input_ != canUseFdInput)) {
+    std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
+              << " input_path=" << (canUseFdInput ? "dma-fd" : "host-copy")
+              << " reason=" << (canUseFdInput ? "all zero-copy conditions satisfied" : joinReasons(fdInputReasons))
+              << "\n";
+  }
+  has_last_fd_decision_ = true;
+  last_can_use_fd_input_ = canUseFdInput;
 
   std::vector<std::uint8_t> inputBuffer;
   RknnTensorMemGuard tensorMemGuard(context_);
@@ -277,7 +448,11 @@ void RknnInfer::close() {
   input_height_ = 0;
   input_channels_ = 0;
   is_nhwc_ = true;
+  verbose_ = false;
+  has_last_fd_decision_ = false;
+  last_can_use_fd_input_ = false;
   has_native_input_attr_ = false;
+  runtime_config_ = {};
   input_attr_ = {};
   native_input_attr_ = {};
   output_templates_.clear();

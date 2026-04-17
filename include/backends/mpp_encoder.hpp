@@ -8,6 +8,7 @@ extern "C" {
 }
 
 #include <fstream>
+#include <mutex>
 
 struct MppApi_t;
 typedef struct MppApi_t MppApi;
@@ -30,17 +31,20 @@ class MppEncoder : public IEncoderBackend {
   void writePacket(void* packet);
   void drainPackets(bool untilEos);
 
-  MppCtx context_ = nullptr;
+ MppCtx context_ = nullptr;
   MppApi* api_ = nullptr;
   MppEncCfg config_ = nullptr;
   MppBufferGroup bufferGroup_ = nullptr;
+  MppBuffer inputBuffer_ = nullptr;
   MppBuffer packetBuffer_ = nullptr;
   std::ofstream outputFile_;
+  std::mutex rgaMutex_;
   bool initialized_ = false;
   bool flushSubmitted_ = false;
   int width_ = 0;
   int height_ = 0;
   int horStride_ = 0;
   int verStride_ = 0;
+  int64_t frameIndex_ = 0;
   PixelFormat inputFormat_ = PixelFormat::kUnknown;
 };

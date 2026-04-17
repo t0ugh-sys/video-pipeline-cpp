@@ -20,7 +20,7 @@ class TrtInfer : public IInferenceBackend {
   TrtInfer(const TrtInfer&) = delete;
   TrtInfer& operator=(const TrtInfer&) = delete;
 
-  void open(const ModelConfig& config) override;
+  void open(const ModelConfig& config, const InferRuntimeConfig& runtime = {}) override;
   InferenceOutput infer(const RgbImage& image) override;
   int inputWidth() const override { return input_width_; }
   int inputHeight() const override { return input_height_; }

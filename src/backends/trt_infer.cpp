@@ -85,7 +85,8 @@ TrtInfer::~TrtInfer() {
   close();
 }
 
-void TrtInfer::open(const ModelConfig& config) {
+void TrtInfer::open(const ModelConfig& config, const InferRuntimeConfig& runtime) {
+  (void)runtime;
   close();
   loadEngine(config.modelPath);
 }

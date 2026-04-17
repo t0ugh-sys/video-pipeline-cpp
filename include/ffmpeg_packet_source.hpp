@@ -23,7 +23,9 @@ class FFmpegPacketSource {
   static VideoCodec toVideoCodec(int codecId);
   void close();
   bool needsAnnexBFilter() const;
+  void initBitstreamFilter();
   EncodedPacket copyPacket(const void* packet) const;
+  bool tryReceiveFilteredPacket(EncodedPacket& output);
 
   AVFormatContext* formatContext_ = nullptr;
   AVBSFContext* bsfContext_ = nullptr;
