@@ -36,7 +36,9 @@ void CudaPreprocessor::setGpuId(int gpu_id) {
 RgbImage CudaPreprocessor::convertAndResize(
     const DecodedFrame& frame,
     int outputWidth,
-    int outputHeight) {
+    int outputHeight,
+    const PreprocessOptions& options) {
+  (void)options;
   checkCudaStatus(cudaSetDevice(gpu_id_), "Failed to set CUDA device");
 
   if (frame.width <= 0 || frame.height <= 0) {

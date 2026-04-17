@@ -3,12 +3,14 @@
 #include "preproc_interface.hpp"
 #include "pipeline_types.hpp"
 
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
 class RgaPreprocessor : public IPreprocessorBackend {
  public:
   RgaPreprocessor() = default;
-  ~RgaPreprocessor() override = default;
+  ~RgaPreprocessor() override;
 
   RgbImage convertAndResize(
       const DecodedFrame& frame,
@@ -19,9 +21,6 @@ class RgaPreprocessor : public IPreprocessorBackend {
   std::string name() const override { return "Rockchip RGA"; }
 
  private:
-  void ensureWorkspace(std::size_t resizedNv12Bytes, std::size_t resizedRgbBytes, std::size_t outputBytes);
-
-  std::vector<std::uint8_t> resizedNv12_;
-  std::vector<std::uint8_t> resizedRgb_;
-  std::vector<std::uint8_t> outputRgb_;
+  void ensureBufferGroup();
+  void* bufferGroup_ = nullptr;
 };

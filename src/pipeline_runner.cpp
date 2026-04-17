@@ -277,7 +277,11 @@ void runPipeline(const AppConfig& config) {
           pending.erase(it);
           ++displayedCount;
 
-          if (encoder && !encoderInitialized && current.decodedFrame.dmaFd >= 0) {
+          if (encoder && current.decodedFrame.dmaFd < 0) {
+            throw std::runtime_error(
+                "encoder-output requested, but decoded frame does not provide a valid dma fd");
+          }
+          if (encoder && !encoderInitialized) {
             EncoderConfig encCfg;
             encCfg.outputPath = config.encoderOutput;
             encCfg.codec = config.encoderCodec;
@@ -295,7 +299,7 @@ void runPipeline(const AppConfig& config) {
             encoder->init(encCfg);
             encoderInitialized = true;
           }
-          if (encoder && encoderInitialized && current.decodedFrame.dmaFd >= 0) {
+          if (encoder && encoderInitialized) {
             encoder->encodeDecodedFrame(current.decodedFrame, current.pts);
           }
 
@@ -307,7 +311,7 @@ void runPipeline(const AppConfig& config) {
                 current.decodedFrame,
                 current.decodedFrame.width,
                 current.decodedFrame.height,
-                PreprocessOptions{});
+                PreprocessOptions{false, 114, true});
             displayPreprocMs = Ms(Clock::now() - displayPreprocStart).count();
           }
 
@@ -343,7 +347,11 @@ void runPipeline(const AppConfig& config) {
         }
       }
 
-      if (encoder && encoderInitialized) {
+      if (encoder) {
+        if (!encoderInitialized) {
+          throw std::runtime_error(
+              "encoder-output requested, but no decodable frame with a valid dma fd reached the output stage");
+        }
         encoder->flush();
       }
       if (visualizer) {
@@ -384,7 +392,7 @@ void runPipeline(const AppConfig& config) {
             decodedFrame.value(),
             inferInputWidth,
             inferInputHeight,
-            PreprocessOptions{config.letterbox, 114});
+            PreprocessOptions{config.letterbox, 114, false});
         prepared.decodedFrame = std::move(decodedFrame.value());
         const auto preprocEnd = Clock::now();
         prepared.preprocMs = Ms(preprocEnd - preprocStart).count();

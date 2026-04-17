@@ -2,11 +2,10 @@
 
 #include "infer_interface.hpp"
 #include "pipeline_types.hpp"
+#include "third_party/rknn/include/rknn_api.h"
 
 #include <cstdint>
 #include <vector>
-
-typedef void* rknn_context;
 
 class RknnInfer : public IInferenceBackend {
  public:
@@ -33,5 +32,8 @@ class RknnInfer : public IInferenceBackend {
   int input_height_ = 0;
   int input_channels_ = 0;
   bool is_nhwc_ = true;
+  bool has_native_input_attr_ = false;
+  rknn_tensor_attr input_attr_ = {};
+  rknn_tensor_attr native_input_attr_ = {};
   InferenceOutput output_templates_;
 };

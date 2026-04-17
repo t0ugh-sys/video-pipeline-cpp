@@ -8,6 +8,7 @@
 struct PreprocessOptions {
   bool letterbox = false;
   std::uint8_t paddingValue = 114;
+  bool needsCpuData = false;
 };
 
 class IPreprocessorBackend {

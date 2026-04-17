@@ -69,8 +69,13 @@ struct DecodedFrame {
 struct RgbImage {
   int width = 0;
   int height = 0;
+  int wstride = 0;
+  int hstride = 0;
+  int dmaFd = -1;
+  std::size_t dmaSize = 0;
   PixelFormat format = PixelFormat::kRgb888;
   LetterboxInfo letterbox;
+  std::shared_ptr<void> nativeHandle;
   std::vector<std::uint8_t> data;
 };
 
