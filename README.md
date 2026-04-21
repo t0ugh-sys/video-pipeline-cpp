@@ -21,11 +21,42 @@
 ### Rockchip 平台
 
 ```bash
-cmake -S . -B build -DPLATFORM=rockchip
-cmake --build build -j4
+cmake -S . -B build-rockchip -DPLATFORM=rockchip
+cmake --build build-rockchip -j4
 
-# 运行
-./build/video_pipeline --backend rockchip test.mp4 yolov5s.rknn 640 640
+# 最小运行
+./build-rockchip/video_pipeline --backend rockchip test.mp4 yolov5s.rknn 640 640
+```
+
+### Rockchip 稳定参数
+
+当前在 RK3588 上验证过的一组稳定参数：
+
+```bash
+/edge/workspace/vision-inference-pipeline/build-rockchip/video_pipeline \
+  --backend rockchip \
+  --infer-workers 2 \
+  --rknn-zero-copy false \
+  --progress-every 300 \
+  --encoder-fps 30 \
+  --encoder-bitrate 20000000 \
+  --output-video /edge/workspace/vis_modelzoo_full.h264 \
+  /edge/workspace/2_h264_clean.mp4 \
+  /edge/workspace/rk-video-pipeline-cpp/models/stall_int8.rknn \
+  640 640
+```
+
+说明：
+
+- `--infer-workers 2` 是当前比较稳的吞吐/稳定性折中
+- `--rknn-zero-copy false` 是当前带框输出路径的稳态选项
+- `--encoder-fps 30` 用来避免把异常高输入帧率原样写进输出导致慢放/卡顿
+- `--output-video` 在 Rockchip 路径下输出的是裸码流，建议使用 `.h264`
+
+封装成 mp4 时只做封装，不重编码：
+
+```bash
+ffmpeg -y -framerate 30 -i /edge/workspace/vis_modelzoo_full.h264 -c copy /edge/workspace/vis_modelzoo_full.mp4
 ```
 
 ### NVIDIA 平台
@@ -55,10 +86,30 @@ cmake --build build -j4
 Usage: video_pipeline [options] <video_or_rtsp> <model_file> [width] [height]
 
 Options:
-  --backend <rockchip|nvidia>  选择后端平台
-  --gpu <id>                   GPU 设备 ID (默认：0)
-  --max-frames <n>             最大处理帧数 (默认：30)
-  -h, --help                   显示帮助
+  --backend <rockchip|mpp|nvidia|nvdec>  选择后端平台
+  --gpu <id>                              GPU 设备 ID
+  --infer-workers <n>                     推理 worker 数量
+  --progress-every <n>                    每 n 帧打印一次进度日志 (默认：30)
+  --rknn-core-mask <mask>                 auto|0|1|2|0_1|0_2|1_2|0_1_2|all
+  --max-frames <n>                        最大处理帧数 (默认：0，表示不限)
+  --conf-threshold <f>                    置信度阈值
+  --nms-threshold <f>                     NMS 阈值
+  --labels-path <path>                    标签文件
+  --letterbox <true|false>                是否启用 letterbox
+  --rknn-zero-copy <true|false>           RKNN 优先使用 DMA RGB 输入
+  --model-output-layout <name>            auto|yolov8_flat_8400x84|yolov8_rknn_branch_6|yolov8_rknn_branch_9|yolo26_e2e
+  --verbose                               打开详细日志
+  --dump-first-frame                      导出第一帧推理输入
+  --display                               打开显示窗口
+  --display-max-width <n>                 显示路径最大宽度
+  --display-max-height <n>                显示路径最大高度
+  --output-video <path>                   输出带框视频
+  --output-rtsp <url>                     输出 RTSP
+  --encoder-output <path>                 输出原始解码视频流
+  --encoder-codec <h264|h265>             编码格式
+  --encoder-bitrate <bps>                 编码码率
+  --encoder-fps <n>                       编码帧率 (默认：0 = 跟随输入，异常高帧率时内部会回落)
+  -h, --help                              显示帮助
 ```
 
 ## 环境变量
@@ -161,7 +212,35 @@ vision-inference-pipeline/
 
 - 这是"最小可改造工程骨架"，不是完整生产工程
 - CUDA 预处理需要完整实现零拷贝路径
-- 当前未实现显示和推流
+- Rockchip `--output-video` 当前输出的是裸 `.h264/.h265` 码流，不是 mp4 容器
+- 输入视频帧率异常高时，Rockchip 输出路径会按目标编码帧率做丢帧，避免输出慢放
+- Rockchip 带框输出当前优先保证稳定性，不追求端到端零拷贝
+- RTSP 长时间断流重连尚未实现
+
+## Rockchip 当前状态
+
+当前主链路已经验证可跑通：
+
+```text
+FFmpeg demux
+  -> MPP decode
+  -> RGA preprocess
+  -> RKNN inference
+  -> CPU postprocess
+  -> CPU draw
+  -> RGA RGB->YUV420SP
+  -> MPP H.264 encode
+```
+
+当前 Rockchip 路径已处理的问题：
+
+- `maxFrames` 默认值修正为 `0`
+- FFmpeg bitstream filter drain / EOF 处理
+- RKNN core mask 自动分配
+- RGA buffer group limit
+- MPP 输出首帧强制 IDR
+- MPP 初始化切换到官方推荐的 `MPP_ENC_GET_CFG / MPP_ENC_SET_CFG`
+- 带框输出的卡顿、黑边、黑线问题已收敛到可稳定运行
 
 ## License
 
