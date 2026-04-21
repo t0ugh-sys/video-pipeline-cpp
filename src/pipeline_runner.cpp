@@ -315,6 +315,9 @@ bool shouldKeepEncodedFrame(
     return true;
   }
 
+  // Map the input frame index onto the target output timeline using integer
+  // accumulation. We keep only frames that advance the output frame count, so
+  // high-fps sources can be encoded at a sane output fps without slow-motion.
   const long long prevCount =
       (static_cast<long long>(zeroBasedFrameIndex) * targetNum) / sourceNum;
   const long long currCount =
@@ -339,6 +342,8 @@ DecodedFrame makeAnnotatedEncodeFrame(
     return frame;
   }
 
+  // Keep these groups alive across frames so the hardware overlay path does not
+  // churn DRM buffers on every annotated output frame.
   static MppBufferGroup overlayGroup = nullptr;
   static MppBufferGroup outputGroup = nullptr;
   if (overlayGroup == nullptr) {

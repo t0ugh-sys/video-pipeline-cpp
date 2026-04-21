@@ -540,6 +540,9 @@ RgbImage RgaPreprocessor::convertAndResize(
           RK_FORMAT_RGB_888,
           outputRgbWstride,
           outputRgbHstride);
+      // This path intentionally converts into a DRM-backed RGB buffer first and
+      // only then copies out row-by-row. Direct RGA writes into host RGB memory
+      // looked simpler, but produced visible line artifacts on the target board.
       checkRgaOp(
           imcvtcolor(src, dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
           "imcvtcolor(NV12->RGB direct drm)");

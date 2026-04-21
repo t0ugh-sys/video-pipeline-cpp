@@ -178,6 +178,9 @@ void MppEncoder::init(const EncoderConfig& config) {
                  "MPP_ENC_GET_CFG failed");
   logMppRgbEncodeStep("init_cfg_get_done");
 
+  // Use the official MPP_ENC_SET_CFG path instead of the deprecated
+  // SET_PREP_CFG / SET_RC_CFG / SET_CODEC_CFG controls. This matches the
+  // supported init flow in mpi_enc_test and avoids board-specific drift.
   mpp_enc_cfg_set_s32(config_, "codec:type", MPP_VIDEO_CodingAVC);
   mpp_enc_cfg_set_s32(config_, "prep:width", width_);
   mpp_enc_cfg_set_s32(config_, "prep:height", height_);
@@ -227,6 +230,8 @@ void MppEncoder::init(const EncoderConfig& config) {
   checkMppStatus(mpp_packet_init_with_buffer(&headerPacket, packetBuffer_), "mpp_packet_init_with_buffer failed");
   logMppRgbEncodeStep("init_header_packet_done");
   mpp_packet_set_length(headerPacket, 0);
+  // Write SPS/PPS once during init so the raw .h264 output can be remuxed
+  // later without depending on an out-of-band header source.
   checkMppStatus(api_->control(context_, MPP_ENC_GET_HDR_SYNC, headerPacket), "MPP_ENC_GET_HDR_SYNC failed");
   logMppRgbEncodeStep("init_get_hdr_done");
   writePacket(headerPacket);
@@ -258,6 +263,8 @@ void MppEncoder::encode(const RgbImage& frame, int64_t pts) {
   logMppRgbEncodeStep("got_input_buffer");
   {
     std::lock_guard<std::mutex> lock(rgaMutex_);
+    // Let RGA write directly into the MPP-owned dma-buf. Earlier host memset /
+    // virtual-address staging paths were a source of visible line artifacts.
     rga_buffer_handle_t srcHandle =
         importbuffer_virtualaddr(const_cast<std::uint8_t*>(frame.data.data()), frame.data.size());
     if (srcHandle == 0) {
@@ -299,6 +306,8 @@ void MppEncoder::encode(const RgbImage& frame, int64_t pts) {
   MppFrame inputFrame = nullptr;
   try {
     if (frameIndex_ == 0) {
+      // Force the first encoded frame to be an IDR. Without this, the raw stream
+      // can start with an unusable P-frame and downstream remux/decode becomes fragile.
       checkMppStatus(api_->control(context_, MPP_ENC_SET_IDR_FRAME, nullptr),
                      "MPP_ENC_SET_IDR_FRAME failed");
     }
@@ -323,6 +332,9 @@ void MppEncoder::encode(const RgbImage& frame, int64_t pts) {
       MppPacket encodedPacket = nullptr;
       checkMppStatus(api_->encode_get_packet(context_, &encodedPacket), "encode_get_packet failed");
       if (encodedPacket == nullptr) {
+        // MPP can accept a frame before its output packet is immediately ready.
+        // Give the encoder a short bounded retry window instead of treating
+        // the first null packet as hard failure / truncated frame.
         if (!gotPacket && retries++ < kDrainRetryCount) {
           std::this_thread::sleep_for(kDrainRetrySleep);
           continue;

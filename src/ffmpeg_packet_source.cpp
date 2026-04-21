@@ -89,6 +89,9 @@ EncodedPacket FFmpegPacketSource::readPacket() {
     const int result = av_read_frame(formatContext_, &packet);
     if (result == AVERROR_EOF) {
       if (bsfContext_ != nullptr && !bsfFlushed_) {
+        // MP4/MOV inputs may still have converted Annex-B packets buffered
+        // inside the bitstream filter when demux reaches EOF. Flush once and
+        // keep draining before emitting pipeline EOS.
         const int flushResult = av_bsf_send_packet(bsfContext_, nullptr);
         if (flushResult < 0) {
           throwFfmpegError("Failed to flush bitstream filter", flushResult);
@@ -175,6 +178,9 @@ bool FFmpegPacketSource::needsAnnexBFilter() const {
   if (codec_ != VideoCodec::kH264 && codec_ != VideoCodec::kH265) {
     return false;
   }
+  // Rockchip / MPP decoder input expects Annex-B elementary stream layout for
+  // H.264/H.265. MP4 / MOV typically carry avcC/hvcC format instead, so insert
+  // FFmpeg's mp4-to-annexb BSF on those containers.
   return containerNameContains(formatContext_->iformat, "mp4") ||
          containerNameContains(formatContext_->iformat, "mov");
 }
