@@ -31,8 +31,8 @@ struct AppConfig {
   int maxFrames = 0;
   std::string encoderOutput;
   std::string encoderCodec = "h264";
-  int encoderBitrate = 4000000;
-  int encoderFps = 30;
+  int encoderBitrate = 0;
+  int encoderFps = 0;
 };
 
 enum class ParseStatus {

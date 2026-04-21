@@ -35,6 +35,14 @@ void checkMppStatus(MPP_RET status, const char* message) {
   }
 }
 
+#if defined(ENABLE_RGA_PREPROC) && !defined(WIN32)
+void checkRgaStatus(IM_STATUS status, const char* message) {
+  if (status != IM_STATUS_SUCCESS) {
+    throw std::runtime_error(message);
+  }
+}
+#endif
+
 MppCodingType toCodingType(const std::string& codec) {
   if (codec == "hevc" || codec == "h265") {
     return MPP_VIDEO_CodingHEVC;
@@ -52,8 +60,22 @@ int alignUp(int value, int alignment) {
   return ((value + alignment - 1) / alignment) * alignment;
 }
 
+size_t alignedFrameBytes(int horStride, int verStride, PixelFormat format) {
+  const size_t alignedHor = static_cast<size_t>(alignUp(horStride, 64));
+  const size_t alignedVer = static_cast<size_t>(alignUp(verStride, 64));
+  if (format == PixelFormat::kRgb888) {
+    return alignedHor * alignedVer;
+  }
+  return alignedHor * alignedVer * 3 / 2;
+}
+
 bool verboseMppRgbEncodeLogsEnabled() {
   const char* value = std::getenv("MPP_RGB_ENCODER_VERBOSE_LOG");
+  return value != nullptr && value[0] != '\0' && std::string(value) != "0";
+}
+
+bool useNv21ForRgbEncode() {
+  const char* value = std::getenv("MPP_ENCODER_USE_NV21");
   return value != nullptr && value[0] != '\0' && std::string(value) != "0";
 }
 
@@ -87,9 +109,15 @@ void MppEncoder::init(const EncoderConfig& config) {
 
   width_ = config.width;
   height_ = config.height;
-  horStride_ = config.horStride > 0 ? config.horStride : alignUp(config.width, 16);
-  verStride_ = config.verStride > 0 ? config.verStride : alignUp(config.height, 16);
+  horStride_ = config.horStride > 0 ? config.horStride : alignUp(config.width, 8);
+  verStride_ = config.verStride > 0 ? config.verStride : alignUp(config.height, 2);
   inputFormat_ = config.inputFormat;
+  frameFormat_ = MPP_FMT_YUV420SP;
+  rgaYuvFormat_ = RK_FORMAT_YCbCr_420_SP;
+  if (inputFormat_ == PixelFormat::kRgb888 && useNv21ForRgbEncode()) {
+    frameFormat_ = MPP_FMT_YUV420SP_VU;
+    rgaYuvFormat_ = RK_FORMAT_YCrCb_420_SP;
+  }
   flushSubmitted_ = false;
   frameIndex_ = 0;
 
@@ -105,8 +133,7 @@ void MppEncoder::init(const EncoderConfig& config) {
                        static_cast<MppBufferType>(MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE)),
                    "mpp_buffer_group_get_internal failed");
     logMppRgbEncodeStep("init_buffer_group_done");
-    const size_t frameBytes =
-        static_cast<size_t>(horStride_) * static_cast<size_t>(verStride_) * 3 / 2;
+    const size_t frameBytes = alignedFrameBytes(horStride_, verStride_, PixelFormat::kNv12);
     checkMppStatus(mpp_buffer_group_limit_config(bufferGroup_, frameBytes, 2),
                    "mpp_buffer_group_limit_config failed");
     logMppRgbEncodeStep("init_buffer_limit_done");
@@ -121,7 +148,10 @@ void MppEncoder::init(const EncoderConfig& config) {
     logMppRgbEncodeStep("init_buffer_group_done");
   }
 
-  checkMppStatus(mpp_buffer_get(bufferGroup_, &packetBuffer_, packetBufferSize(config)),
+  const size_t packetBytes = std::max(
+      alignedFrameBytes(horStride_, verStride_, PixelFormat::kNv12),
+      packetBufferSize(config));
+  checkMppStatus(mpp_buffer_get(bufferGroup_, &packetBuffer_, packetBytes),
                  "mpp_buffer_get for output packet failed");
   logMppRgbEncodeStep("init_packet_buffer_done");
 
@@ -134,59 +164,64 @@ void MppEncoder::init(const EncoderConfig& config) {
   checkMppStatus(api_->control(context_, MPP_SET_OUTPUT_TIMEOUT, &timeout),
                  "MPP_SET_OUTPUT_TIMEOUT failed");
   logMppRgbEncodeStep("init_set_timeout_done");
-
-  MppEncPrepCfg prepCfg = {};
-  prepCfg.change = MPP_ENC_PREP_CFG_CHANGE_INPUT | MPP_ENC_PREP_CFG_CHANGE_FORMAT;
-  prepCfg.width = width_;
-  prepCfg.height = height_;
-  prepCfg.hor_stride = horStride_;
-  prepCfg.ver_stride = verStride_;
-  prepCfg.format = MPP_FMT_YUV420SP;
-  checkMppStatus(api_->control(context_, MPP_ENC_SET_PREP_CFG, &prepCfg), "MPP_ENC_SET_PREP_CFG failed");
-  logMppRgbEncodeStep("init_set_prep_cfg_done");
-
-  MppEncRcCfg rcCfg = {};
-  rcCfg.change = MPP_ENC_RC_CFG_CHANGE_RC_MODE |
-                 MPP_ENC_RC_CFG_CHANGE_BPS |
-                 MPP_ENC_RC_CFG_CHANGE_FPS_IN |
-                 MPP_ENC_RC_CFG_CHANGE_FPS_OUT |
-                 MPP_ENC_RC_CFG_CHANGE_GOP;
-  rcCfg.rc_mode = MPP_ENC_RC_MODE_CBR;
-  rcCfg.bps_target = config.bitrate;
-  rcCfg.bps_max = config.bitrate * 17 / 16;
-  rcCfg.bps_min = std::max(1, config.bitrate * 9 / 10);
-  rcCfg.fps_in_flex = 0;
-  rcCfg.fps_in_num = config.fps;
-  rcCfg.fps_in_denorm = 1;
-  rcCfg.fps_out_flex = 0;
-  rcCfg.fps_out_num = config.fps;
-  rcCfg.fps_out_denorm = 1;
-  rcCfg.gop = std::max(1, config.fps * 2);
-  checkMppStatus(api_->control(context_, MPP_ENC_SET_RC_CFG, &rcCfg), "MPP_ENC_SET_RC_CFG failed");
-  logMppRgbEncodeStep("init_set_rc_cfg_done");
+  const int fpsNum = config.fpsNum > 0 ? config.fpsNum : (config.fps > 0 ? config.fps : 30);
+  const int fpsDen = config.fpsDen > 0 ? config.fpsDen : 1;
+  const int targetBitrate = config.bitrate > 0 ? config.bitrate : 4000000;
 
   if (config.codec == "hevc" || config.codec == "h265") {
     throw std::runtime_error("Struct-based Rockchip encoder init currently supports h264 output only");
   }
 
-  MppEncCodecCfg codecCfg = {};
-  codecCfg.coding = MPP_VIDEO_CodingAVC;
-  codecCfg.h264.change =
-      MPP_ENC_H264_CFG_STREAM_TYPE |
-      MPP_ENC_H264_CFG_CHANGE_PROFILE |
-      MPP_ENC_H264_CFG_CHANGE_ENTROPY;
-  codecCfg.h264.stream_type = 0;
-  codecCfg.h264.profile = 100;
-  codecCfg.h264.level = (width_ >= 1920 || height_ >= 1080) ? 40 : 31;
-  codecCfg.h264.entropy_coding_mode = 1;
-  codecCfg.h264.cabac_init_idc = 0;
-  checkMppStatus(api_->control(context_, MPP_ENC_SET_CODEC_CFG, &codecCfg), "MPP_ENC_SET_CODEC_CFG failed");
-  logMppRgbEncodeStep("init_set_codec_cfg_done");
+  checkMppStatus(mpp_enc_cfg_init(&config_), "mpp_enc_cfg_init failed");
+  logMppRgbEncodeStep("init_cfg_alloc_done");
+  checkMppStatus(api_->control(context_, MPP_ENC_GET_CFG, config_),
+                 "MPP_ENC_GET_CFG failed");
+  logMppRgbEncodeStep("init_cfg_get_done");
 
-  MppEncHeaderMode headerMode = MPP_ENC_HEADER_MODE_EACH_IDR;
-  checkMppStatus(api_->control(context_, MPP_ENC_SET_HEADER_MODE, &headerMode),
-                 "MPP_ENC_SET_HEADER_MODE failed");
-  logMppRgbEncodeStep("init_set_header_mode_done");
+  mpp_enc_cfg_set_s32(config_, "codec:type", MPP_VIDEO_CodingAVC);
+  mpp_enc_cfg_set_s32(config_, "prep:width", width_);
+  mpp_enc_cfg_set_s32(config_, "prep:height", height_);
+  mpp_enc_cfg_set_s32(config_, "prep:hor_stride", horStride_);
+  mpp_enc_cfg_set_s32(config_, "prep:ver_stride", verStride_);
+  mpp_enc_cfg_set_s32(config_, "prep:format", frameFormat_);
+  mpp_enc_cfg_set_s32(config_, "prep:range", MPP_FRAME_RANGE_JPEG);
+
+  mpp_enc_cfg_set_s32(config_, "rc:mode", MPP_ENC_RC_MODE_CBR);
+  mpp_enc_cfg_set_u32(config_, "rc:max_reenc_times", 0);
+  mpp_enc_cfg_set_u32(config_, "rc:super_mode", 0);
+  mpp_enc_cfg_set_u32(config_, "rc:drop_mode", MPP_ENC_RC_DROP_FRM_DISABLED);
+  mpp_enc_cfg_set_u32(config_, "rc:drop_thd", 20);
+  mpp_enc_cfg_set_u32(config_, "rc:drop_gap", 1);
+  mpp_enc_cfg_set_s32(config_, "rc:fps_in_flex", 0);
+  mpp_enc_cfg_set_s32(config_, "rc:fps_in_num", fpsNum);
+  mpp_enc_cfg_set_s32(config_, "rc:fps_in_denom", fpsDen);
+  mpp_enc_cfg_set_s32(config_, "rc:fps_out_flex", 0);
+  mpp_enc_cfg_set_s32(config_, "rc:fps_out_num", fpsNum);
+  mpp_enc_cfg_set_s32(config_, "rc:fps_out_denom", fpsDen);
+  mpp_enc_cfg_set_s32(config_, "rc:gop", std::max(1, (fpsNum + fpsDen - 1) / fpsDen));
+  mpp_enc_cfg_set_s32(config_, "rc:bps_target", targetBitrate);
+  mpp_enc_cfg_set_s32(config_, "rc:bps_max", targetBitrate * 17 / 16);
+  mpp_enc_cfg_set_s32(config_, "rc:bps_min", std::max(1, targetBitrate * 15 / 16));
+  mpp_enc_cfg_set_s32(config_, "rc:qp_init", -1);
+  mpp_enc_cfg_set_s32(config_, "rc:qp_max", 51);
+  mpp_enc_cfg_set_s32(config_, "rc:qp_min", 10);
+  mpp_enc_cfg_set_s32(config_, "rc:qp_max_i", 51);
+  mpp_enc_cfg_set_s32(config_, "rc:qp_min_i", 10);
+  mpp_enc_cfg_set_s32(config_, "rc:qp_ip", 2);
+  mpp_enc_cfg_set_s32(config_, "rc:fqp_min_i", 10);
+  mpp_enc_cfg_set_s32(config_, "rc:fqp_max_i", 45);
+  mpp_enc_cfg_set_s32(config_, "rc:fqp_min_p", 10);
+  mpp_enc_cfg_set_s32(config_, "rc:fqp_max_p", 45);
+
+  mpp_enc_cfg_set_s32(config_, "h264:profile", 100);
+  mpp_enc_cfg_set_s32(config_, "h264:level", (width_ >= 1920 || height_ >= 1080) ? 40 : 31);
+  mpp_enc_cfg_set_s32(config_, "h264:cabac_en", 1);
+  mpp_enc_cfg_set_s32(config_, "h264:cabac_idc", 0);
+  mpp_enc_cfg_set_s32(config_, "h264:trans8x8", 1);
+
+  checkMppStatus(api_->control(context_, MPP_ENC_SET_CFG, config_),
+                 "MPP_ENC_SET_CFG failed");
+  logMppRgbEncodeStep("init_cfg_set_done");
 
   MppPacket headerPacket = nullptr;
   checkMppStatus(mpp_packet_init_with_buffer(&headerPacket, packetBuffer_), "mpp_packet_init_with_buffer failed");
@@ -220,87 +255,93 @@ void MppEncoder::encode(const RgbImage& frame, int64_t pts) {
     throw std::runtime_error("MPP encoder RGB input buffer is not allocated");
   }
 
-  void* framePtr = mpp_buffer_get_ptr(inputBuffer_);
-  logMppRgbEncodeStep("got_input_ptr");
-  if (framePtr == nullptr) {
-    throw std::runtime_error("mpp_buffer_get_ptr for encoder input failed");
-  }
-
+  logMppRgbEncodeStep("got_input_buffer");
   {
-    logMppRgbEncodeStep("rga_begin");
     std::lock_guard<std::mutex> lock(rgaMutex_);
-    const size_t rgbBytes = frame.data.size();
-    const size_t nv12Bytes = static_cast<size_t>(horStride_) * static_cast<size_t>(verStride_) * 3 / 2;
     rga_buffer_handle_t srcHandle =
-        importbuffer_virtualaddr(const_cast<std::uint8_t*>(frame.data.data()), rgbBytes);
+        importbuffer_virtualaddr(const_cast<std::uint8_t*>(frame.data.data()), frame.data.size());
     if (srcHandle == 0) {
-      throw std::runtime_error("RGA importbuffer_virtualaddr failed for RGB source");
+      throw std::runtime_error("RGA importbuffer_virtualaddr failed for RGB encoder source");
     }
-    rga_buffer_handle_t dstHandle = importbuffer_virtualaddr(framePtr, nv12Bytes);
+    const int inputFd = mpp_buffer_get_fd(inputBuffer_);
+    if (inputFd < 0) {
+      releasebuffer_handle(srcHandle);
+      throw std::runtime_error("mpp_buffer_get_fd failed for encoder NV12 destination");
+    }
+    rga_buffer_handle_t dstHandle = importbuffer_fd(inputFd, horStride_, verStride_, rgaYuvFormat_);
     if (dstHandle == 0) {
       releasebuffer_handle(srcHandle);
-      throw std::runtime_error("RGA importbuffer_virtualaddr failed for NV12 destination");
+      throw std::runtime_error("RGA importbuffer_fd failed for NV12 encoder destination");
     }
 
-    rga_buffer_t src = wrapbuffer_handle(srcHandle, width_, height_, RK_FORMAT_RGB_888);
-    rga_buffer_t dst =
-        wrapbuffer_handle(dstHandle, width_, height_, RK_FORMAT_YCbCr_420_SP, horStride_, verStride_);
-    const IM_STATUS status = imcvtcolor(src, dst, RK_FORMAT_RGB_888, RK_FORMAT_YCbCr_420_SP);
-    releasebuffer_handle(dstHandle);
-    releasebuffer_handle(srcHandle);
-    if (status != IM_STATUS_SUCCESS) {
-      throw std::runtime_error("RGA RGB to NV12 conversion failed");
+    try {
+      rga_buffer_t src = wrapbuffer_handle(srcHandle, width_, height_, RK_FORMAT_RGB_888);
+      rga_buffer_t dst = wrapbuffer_handle(
+          dstHandle,
+          width_,
+          height_,
+          rgaYuvFormat_,
+          horStride_,
+          verStride_);
+      checkRgaStatus(
+          imcvtcolor(src, dst, RK_FORMAT_RGB_888, rgaYuvFormat_),
+          "RGA RGB to YUV420 conversion failed");
+      releasebuffer_handle(dstHandle);
+      releasebuffer_handle(srcHandle);
+    } catch (...) {
+      releasebuffer_handle(dstHandle);
+      releasebuffer_handle(srcHandle);
+      throw;
     }
   }
-  logMppRgbEncodeStep("rga_done");
+  logMppRgbEncodeStep("rgb_to_yuv_done");
 
   MppFrame inputFrame = nullptr;
-  MppPacket packet = nullptr;
   try {
+    if (frameIndex_ == 0) {
+      checkMppStatus(api_->control(context_, MPP_ENC_SET_IDR_FRAME, nullptr),
+                     "MPP_ENC_SET_IDR_FRAME failed");
+    }
     checkMppStatus(mpp_frame_init(&inputFrame), "mpp_frame_init failed");
     logMppRgbEncodeStep("frame_init_done");
     mpp_frame_set_width(inputFrame, width_);
     mpp_frame_set_height(inputFrame, height_);
     mpp_frame_set_hor_stride(inputFrame, horStride_);
     mpp_frame_set_ver_stride(inputFrame, verStride_);
-    mpp_frame_set_fmt(inputFrame, MPP_FMT_YUV420SP);
-    mpp_frame_set_pts(inputFrame, pts >= 0 ? pts : frameIndex_++);
+    mpp_frame_set_fmt(inputFrame, frameFormat_);
+    (void)pts;
+    mpp_frame_set_pts(inputFrame, frameIndex_++);
     mpp_frame_set_buffer(inputFrame, inputBuffer_);
-
-    checkMppStatus(mpp_packet_init_with_buffer(&packet, packetBuffer_),
-                   "mpp_packet_init_with_buffer failed");
-    logMppRgbEncodeStep("packet_init_done");
-    mpp_packet_set_length(packet, 0);
-
-    MppMeta meta = mpp_frame_get_meta(inputFrame);
-    checkMppStatus(mpp_meta_set_packet(meta, KEY_OUTPUT_PACKET, packet), "mpp_meta_set_packet failed");
-    logMppRgbEncodeStep("meta_set_packet_done");
 
     checkMppStatus(api_->encode_put_frame(context_, inputFrame), "encode_put_frame failed");
     logMppRgbEncodeStep("encode_put_frame_done");
     mpp_frame_deinit(&inputFrame);
-    MppPacket encodedPacket = nullptr;
-    checkMppStatus(api_->encode_get_packet(context_, &encodedPacket), "encode_get_packet failed");
-    logMppRgbEncodeStep("encode_get_packet_done");
-    if (encodedPacket != nullptr) {
-      void* data = mpp_packet_get_data(encodedPacket);
+    bool gotPacket = false;
+    bool eoi = true;
+    int retries = 0;
+    do {
+      MppPacket encodedPacket = nullptr;
+      checkMppStatus(api_->encode_get_packet(context_, &encodedPacket), "encode_get_packet failed");
+      if (encodedPacket == nullptr) {
+        if (!gotPacket && retries++ < kDrainRetryCount) {
+          std::this_thread::sleep_for(kDrainRetrySleep);
+          continue;
+        }
+        break;
+      }
+      gotPacket = true;
+      retries = 0;
+      logMppRgbEncodeStep("encode_get_packet_done");
+      void* data = mpp_packet_get_pos(encodedPacket);
       const size_t length = mpp_packet_get_length(encodedPacket);
       if (data != nullptr && length > 0) {
         outputFile_.write(static_cast<const char*>(data), static_cast<std::streamsize>(length));
       }
-      if (encodedPacket == packet) {
-        packet = nullptr;
-      }
+      eoi = mpp_packet_is_partition(encodedPacket) ? mpp_packet_is_eoi(encodedPacket) != 0 : true;
       mpp_packet_deinit(&encodedPacket);
-    }
-    if (packet != nullptr) {
-      mpp_packet_deinit(&packet);
-    }
+    } while (!eoi);
     logMppRgbEncodeStep("encode_done");
   } catch (...) {
-    if (packet != nullptr) {
-      mpp_packet_deinit(&packet);
-    }
     if (inputFrame != nullptr) {
       mpp_frame_deinit(&inputFrame);
     }
@@ -329,7 +370,6 @@ void MppEncoder::encodeDecodedFrame(const DecodedFrame& frame, int64_t pts) {
 
   MppBuffer inputBuffer = nullptr;
   MppFrame inputFrame = nullptr;
-  MppPacket outputPacket = nullptr;
 
   try {
     MppBufferInfo bufferInfo;
@@ -339,6 +379,10 @@ void MppEncoder::encodeDecodedFrame(const DecodedFrame& frame, int64_t pts) {
     bufferInfo.size = static_cast<size_t>(frame.horizontalStride) * static_cast<size_t>(frame.verticalStride) * 3 / 2;
     checkMppStatus(mpp_buffer_import(&inputBuffer, &bufferInfo), "mpp_buffer_import failed");
 
+    if (frameIndex_ == 0) {
+      checkMppStatus(api_->control(context_, MPP_ENC_SET_IDR_FRAME, nullptr),
+                     "MPP_ENC_SET_IDR_FRAME failed");
+    }
     checkMppStatus(mpp_frame_init(&inputFrame), "mpp_frame_init failed");
     mpp_frame_set_width(inputFrame, frame.width);
     mpp_frame_set_height(inputFrame, frame.height);
@@ -348,22 +392,31 @@ void MppEncoder::encodeDecodedFrame(const DecodedFrame& frame, int64_t pts) {
     mpp_frame_set_pts(inputFrame, pts);
     mpp_frame_set_buffer(inputFrame, inputBuffer);
 
-    checkMppStatus(mpp_packet_init_with_buffer(&outputPacket, packetBuffer_), "mpp_packet_init_with_buffer failed");
-    mpp_packet_set_length(outputPacket, 0);
-
-    MppMeta meta = mpp_frame_get_meta(inputFrame);
-    mpp_meta_set_packet(meta, KEY_OUTPUT_PACKET, outputPacket);
-
     checkMppStatus(api_->encode_put_frame(context_, inputFrame), "encode_put_frame failed");
+    ++frameIndex_;
     mpp_frame_deinit(&inputFrame);
     mpp_buffer_put(inputBuffer);
     inputBuffer = nullptr;
-
-    drainPackets(false);
+    bool gotPacket = false;
+    bool eoi = true;
+    int retries = 0;
+    do {
+      MppPacket packet = nullptr;
+      checkMppStatus(api_->encode_get_packet(context_, &packet), "encode_get_packet failed");
+      if (packet == nullptr) {
+        if (!gotPacket && retries++ < kDrainRetryCount) {
+          std::this_thread::sleep_for(kDrainRetrySleep);
+          continue;
+        }
+        break;
+      }
+      gotPacket = true;
+      retries = 0;
+      writePacket(packet);
+      eoi = mpp_packet_is_partition(packet) ? mpp_packet_is_eoi(packet) != 0 : true;
+      mpp_packet_deinit(&packet);
+    } while (!eoi);
   } catch (...) {
-    if (outputPacket != nullptr) {
-      mpp_packet_deinit(&outputPacket);
-    }
     if (inputFrame != nullptr) {
       mpp_frame_deinit(&inputFrame);
     }

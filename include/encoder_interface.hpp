@@ -15,8 +15,10 @@ struct EncoderConfig {
   int horStride = 0;
   int verStride = 0;
   PixelFormat inputFormat = PixelFormat::kUnknown;
-  int fps = 30;
-  int bitrate = 2000000;
+  int fps = 0;
+  int fpsNum = 0;
+  int fpsDen = 1;
+  int bitrate = 0;
   std::string codec = "h264";
 };
 

@@ -3,6 +3,7 @@
 #include "../encoder_interface.hpp"
 
 extern "C" {
+#include <mpp_frame.h>
 #include <rk_type.h>
 #include <rk_venc_cfg.h>
 }
@@ -46,5 +47,7 @@ class MppEncoder : public IEncoderBackend {
   int horStride_ = 0;
   int verStride_ = 0;
   int64_t frameIndex_ = 0;
+  MppFrameFormat frameFormat_ = MPP_FMT_YUV420SP;
+  int rgaYuvFormat_ = 0;
   PixelFormat inputFormat_ = PixelFormat::kUnknown;
 };

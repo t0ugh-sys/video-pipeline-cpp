@@ -175,8 +175,8 @@ std::string buildUsageMessage(const std::string& programName) {
   message += "  --output-rtsp <url>                     Stream annotated video to RTSP\n";
   message += "  --encoder-output <path>                 Write raw decode stream (MPP h264/h265)\n";
   message += "  --encoder-codec <h264|h265>             Encoder codec (default: h264)\n";
-  message += "  --encoder-bitrate <bps>                 Encoder bitrate (default: 4000000)\n";
-  message += "  --encoder-fps <n>                       Encoder fps (default: 30)\n";
+  message += "  --encoder-bitrate <bps>                 Encoder bitrate (default: 0 = auto)\n";
+  message += "  --encoder-fps <n>                       Encoder fps (default: 0 = source fps)\n";
   message += "  -h, --help                              Show this help message\n";
   return message;
 }

@@ -238,6 +238,90 @@ bool wantsHardwareEncodedAnnotatedOutput(const AppConfig& config) {
          hasSuffixIgnoreCase(config.visual.outputVideo, ".hevc");
 }
 
+int resolveEncoderFps(const AppConfig& config, const SourceVideoInfo& sourceVideoInfo) {
+  if (config.encoderFps > 0) {
+    return config.encoderFps;
+  }
+  if (sourceVideoInfo.fpsNum > 0 && sourceVideoInfo.fpsDen > 0) {
+    const int fps = std::max(1, (sourceVideoInfo.fpsNum + sourceVideoInfo.fpsDen / 2) / sourceVideoInfo.fpsDen);
+    if (fps > 60) {
+      return 30;
+    }
+    return fps;
+  }
+  return 30;
+}
+
+int resolveEncoderFpsNum(const AppConfig& config, const SourceVideoInfo& sourceVideoInfo) {
+  if (config.encoderFps > 0) {
+    return config.encoderFps;
+  }
+  if (sourceVideoInfo.fpsNum > 0 && sourceVideoInfo.fpsDen > 0) {
+    const int fps = std::max(1, (sourceVideoInfo.fpsNum + sourceVideoInfo.fpsDen / 2) / sourceVideoInfo.fpsDen);
+    if (fps > 60) {
+      return 30;
+    }
+    return sourceVideoInfo.fpsNum;
+  }
+  return 30;
+}
+
+int resolveEncoderFpsDen(const AppConfig& config, const SourceVideoInfo& sourceVideoInfo) {
+  if (config.encoderFps > 0) {
+    return 1;
+  }
+  if (sourceVideoInfo.fpsNum > 0 && sourceVideoInfo.fpsDen > 0) {
+    const int fps = std::max(1, (sourceVideoInfo.fpsNum + sourceVideoInfo.fpsDen / 2) / sourceVideoInfo.fpsDen);
+    if (fps > 60) {
+      return 1;
+    }
+    return sourceVideoInfo.fpsDen;
+  }
+  return 1;
+}
+
+int computeAutoEncoderBitrate(int width, int height, int fps) {
+  const long long pixelsPerSecond =
+      static_cast<long long>(std::max(1, width)) *
+      static_cast<long long>(std::max(1, height)) *
+      static_cast<long long>(std::max(1, fps));
+  const long long estimated = pixelsPerSecond / 10;
+  const long long clamped = std::clamp<long long>(estimated, 4'000'000LL, 40'000'000LL);
+  return static_cast<int>(clamped);
+}
+
+int resolveEncoderBitrate(const AppConfig& config, int width, int height, int fps) {
+  if (config.encoderBitrate > 0) {
+    return config.encoderBitrate;
+  }
+  return computeAutoEncoderBitrate(width, height, fps);
+}
+
+bool shouldKeepEncodedFrame(
+    std::size_t zeroBasedFrameIndex,
+    const SourceVideoInfo& sourceVideoInfo,
+    int targetFps) {
+  if (zeroBasedFrameIndex == 0) {
+    return true;
+  }
+  if (targetFps <= 0 || sourceVideoInfo.fpsNum <= 0 || sourceVideoInfo.fpsDen <= 0) {
+    return true;
+  }
+
+  const long long sourceNum = static_cast<long long>(sourceVideoInfo.fpsNum);
+  const long long sourceDen = static_cast<long long>(sourceVideoInfo.fpsDen);
+  const long long targetNum = static_cast<long long>(targetFps) * sourceDen;
+  if (targetNum >= sourceNum) {
+    return true;
+  }
+
+  const long long prevCount =
+      (static_cast<long long>(zeroBasedFrameIndex) * targetNum) / sourceNum;
+  const long long currCount =
+      (static_cast<long long>(zeroBasedFrameIndex + 1) * targetNum) / sourceNum;
+  return currCount != prevCount;
+}
+
 #if defined(ENABLE_RGA_PREPROC) && !defined(WIN32)
 std::shared_ptr<void> makeMppBufferOwner(MppBuffer buffer) {
   return std::shared_ptr<void>(buffer, [](void* opaque) {
@@ -467,6 +551,7 @@ void runPipeline(const AppConfig& config) {
 
   FFmpegPacketSource packetSource;
   packetSource.open(config.source);
+  const SourceVideoInfo sourceVideoInfo = packetSource.videoInfo();
   decoder->open(packetSource.codec());
 
   BoundedQueue<PreparedFrame> preparedQueue(inferenceQueueCapacity);
@@ -532,6 +617,7 @@ void runPipeline(const AppConfig& config) {
       bool visualizerInitialized = false;
       bool encoderInitialized = false;
       bool annotatedVideoEncoderInitialized = false;
+      const int outputEncoderFps = resolveEncoderFps(config, sourceVideoInfo);
       if (needsVisualization) {
         visualizer = createVisualizer();
       }
@@ -571,8 +657,9 @@ void runPipeline(const AppConfig& config) {
             EncoderConfig encCfg;
             encCfg.outputPath = config.encoderOutput;
             encCfg.codec = config.encoderCodec;
-            encCfg.bitrate = config.encoderBitrate;
-            encCfg.fps = config.encoderFps;
+            encCfg.fps = outputEncoderFps;
+            encCfg.fpsNum = resolveEncoderFpsNum(config, sourceVideoInfo);
+            encCfg.fpsDen = resolveEncoderFpsDen(config, sourceVideoInfo);
             encCfg.width = current.decodedFrame.width;
             encCfg.height = current.decodedFrame.height;
             encCfg.horStride = current.decodedFrame.horizontalStride > 0
@@ -581,11 +668,14 @@ void runPipeline(const AppConfig& config) {
             encCfg.verStride = current.decodedFrame.verticalStride > 0
                 ? current.decodedFrame.verticalStride
                 : current.decodedFrame.height;
+            encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
             encCfg.inputFormat = PixelFormat::kNv12;
             encoder->init(encCfg);
             encoderInitialized = true;
           }
-          if (encoder && encoderInitialized) {
+          const bool keepEncodedFrame =
+              shouldKeepEncodedFrame(displayedCount - 1, sourceVideoInfo, outputEncoderFps);
+          if (encoder && encoderInitialized && keepEncodedFrame) {
             encoder->encodeDecodedFrame(current.decodedFrame, current.pts);
           }
 
@@ -649,15 +739,19 @@ void runPipeline(const AppConfig& config) {
                 EncoderConfig encCfg;
                 encCfg.outputPath = config.visual.outputVideo;
                 encCfg.codec = config.encoderCodec;
-                encCfg.bitrate = config.encoderBitrate;
-                encCfg.fps = config.encoderFps;
+                encCfg.fps = outputEncoderFps;
+                encCfg.fpsNum = resolveEncoderFpsNum(config, sourceVideoInfo);
+                encCfg.fpsDen = resolveEncoderFpsDen(config, sourceVideoInfo);
                 encCfg.width = drawnImage.width;
                 encCfg.height = drawnImage.height;
+                encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
                 encCfg.inputFormat = PixelFormat::kRgb888;
                 annotatedVideoEncoder->init(encCfg);
                 annotatedVideoEncoderInitialized = true;
               }
-              annotatedVideoEncoder->encode(drawnImage, current.pts);
+              if (keepEncodedFrame) {
+                annotatedVideoEncoder->encode(drawnImage, current.pts);
+              }
             }
             (void)drawnImage;
             visualizer->show();

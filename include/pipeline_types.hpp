@@ -99,6 +99,14 @@ struct InputSourceConfig {
   std::string uri;
 };
 
+struct SourceVideoInfo {
+  int width = 0;
+  int height = 0;
+  int fpsNum = 0;
+  int fpsDen = 1;
+  double durationSeconds = 0.0;
+};
+
 struct ModelConfig {
   std::string modelPath;
   int inputWidth = 640;

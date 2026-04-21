@@ -111,13 +111,13 @@ MppBuffer allocateBuffer(MppBufferGroup group, std::size_t size, const char* sta
 }
 
 void fillPackedRgbData(
-    const std::shared_ptr<void>& nativeHandle,
+    MppBuffer buffer,
     int srcWstride,
     int width,
     int height,
     std::vector<std::uint8_t>& output) {
   output.resize(static_cast<std::size_t>(width * height * 3));
-  const auto* src = static_cast<const std::uint8_t*>(mpp_buffer_get_ptr(static_cast<MppBuffer>(nativeHandle.get())));
+  const auto* src = static_cast<const std::uint8_t*>(mpp_buffer_get_ptr(buffer));
   if (src == nullptr) {
     throw std::runtime_error("Failed to map RGA output DRM buffer");
   }
@@ -521,19 +521,34 @@ RgbImage RgaPreprocessor::convertAndResize(
         frame.verticalStride);
 
     if (!needsResize && !output.letterbox.enabled) {
-      outputHandle = importbuffer_virtualaddr(output.data.data(), static_cast<int>(outputRgbBytes));
-      if (outputHandle == 0) {
-        throw std::runtime_error("RGA importbuffer_virtualaddr failed for output RGB buffer");
-      }
-
-      rga_buffer_t dst = wrapbuffer_handle(
-          outputHandle,
+      const int outputRgbWstride = alignUp(outputWidth, kRgaStrideAlign);
+      const int outputRgbHstride = outputHeight;
+      const std::size_t outputAlignedRgbBytes =
+          static_cast<std::size_t>(rgb888BytesForStride(outputRgbWstride, outputRgbHstride));
+      ensureBufferGroup(outputAlignedRgbBytes);
+      ensureResizedRgbBuffer(
           outputWidth,
           outputHeight,
-          RK_FORMAT_RGB_888);
+          outputRgbWstride,
+          outputRgbHstride,
+          outputAlignedRgbBytes);
+
+      rga_buffer_t dst = wrapbuffer_handle(
+          resizedRgbHandle_,
+          outputWidth,
+          outputHeight,
+          RK_FORMAT_RGB_888,
+          outputRgbWstride,
+          outputRgbHstride);
       checkRgaOp(
           imcvtcolor(src, dst, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
-          "imcvtcolor(NV12->RGB direct host)");
+          "imcvtcolor(NV12->RGB direct drm)");
+      fillPackedRgbData(
+          static_cast<MppBuffer>(resizedRgbBuffer_),
+          outputRgbWstride,
+          outputWidth,
+          outputHeight,
+          output.data);
     } else {
       const std::size_t resizedNv12Bytes =
           static_cast<std::size_t>(resizedWidth * resizedHeight * 3 / 2);

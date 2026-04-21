@@ -6,6 +6,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 }
 
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 
@@ -50,6 +51,27 @@ void FFmpegPacketSource::open(const InputSourceConfig& config) {
   codec_ = toVideoCodec(videoStream->codecpar->codec_id);
   if (codec_ == VideoCodec::kUnknown) {
     throw std::runtime_error("Unsupported video codec for hardware decoder");
+  }
+
+  videoInfo_.width = videoStream->codecpar->width;
+  videoInfo_.height = videoStream->codecpar->height;
+  AVRational frameRate = av_guess_frame_rate(formatContext_, const_cast<AVStream*>(videoStream), nullptr);
+  if (frameRate.num <= 0 || frameRate.den <= 0) {
+    frameRate = videoStream->avg_frame_rate;
+  }
+  if (frameRate.num <= 0 || frameRate.den <= 0) {
+    frameRate = videoStream->r_frame_rate;
+  }
+  if (frameRate.num > 0 && frameRate.den > 0) {
+    videoInfo_.fpsNum = frameRate.num;
+    videoInfo_.fpsDen = frameRate.den;
+  }
+  if (videoStream->duration > 0 && videoStream->time_base.num > 0 && videoStream->time_base.den > 0) {
+    videoInfo_.durationSeconds =
+        static_cast<double>(videoStream->duration) * av_q2d(videoStream->time_base);
+  } else if (formatContext_->duration > 0) {
+    videoInfo_.durationSeconds =
+        static_cast<double>(formatContext_->duration) / static_cast<double>(AV_TIME_BASE);
   }
 
   initBitstreamFilter();
@@ -118,6 +140,10 @@ VideoCodec FFmpegPacketSource::codec() const {
   return codec_;
 }
 
+SourceVideoInfo FFmpegPacketSource::videoInfo() const {
+  return videoInfo_;
+}
+
 VideoCodec FFmpegPacketSource::toVideoCodec(int codecId) {
   switch (codecId) {
     case AV_CODEC_ID_H264:
@@ -139,6 +165,7 @@ void FFmpegPacketSource::close() {
   videoStreamIndex_ = -1;
   codec_ = VideoCodec::kUnknown;
   bsfFlushed_ = false;
+  videoInfo_ = {};
 }
 
 bool FFmpegPacketSource::needsAnnexBFilter() const {
