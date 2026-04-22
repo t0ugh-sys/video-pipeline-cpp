@@ -52,11 +52,28 @@ cmake --build build-rockchip -j4
 - `--rknn-zero-copy false` 是当前带框输出路径的稳态选项
 - `--encoder-fps 30` 用来避免把异常高输入帧率原样写进输出导致慢放/卡顿
 - `--output-video` 在 Rockchip 路径下输出的是裸码流，建议使用 `.h264`
+- 默认 `--output-overlay cpu` 走现有稳定的 CPU 画框 + RGA 颜色转换 + MPP 编码链路
+- `--output-overlay rga` 走可选的硬件叠加路径：
+  `NV12 -> RGA RGBA scratch -> RGA blend -> RGA NV12 -> MPP encode`
+- 当前 `rga` 模式已经在板端跑通，但如果后续更换 `librga` / driver 组合，优先重新做一遍板端回归
 
 封装成 mp4 时只做封装，不重编码：
 
 ```bash
 ffmpeg -y -framerate 30 -i /edge/workspace/vis_modelzoo_full.h264 -c copy /edge/workspace/vis_modelzoo_full.mp4
+```
+
+如果要在板端重复做回归，直接执行：
+
+```bash
+/edge/workspace/vision-inference-pipeline/scripts/rockchip_output_regression.sh
+```
+
+如需切换到硬件叠加回归：
+
+```bash
+OUTPUT_OVERLAY_MODE=rga \
+  /edge/workspace/vision-inference-pipeline/scripts/rockchip_output_regression.sh
 ```
 
 ### NVIDIA 平台
@@ -103,6 +120,7 @@ Options:
   --display                               打开显示窗口
   --display-max-width <n>                 显示路径最大宽度
   --display-max-height <n>                显示路径最大高度
+  --output-overlay <cpu|rga>              输出视频叠加方式
   --output-video <path>                   输出带框视频
   --output-rtsp <url>                     输出 RTSP
   --encoder-output <path>                 输出原始解码视频流
@@ -241,6 +259,7 @@ FFmpeg demux
 - MPP 输出首帧强制 IDR
 - MPP 初始化切换到官方推荐的 `MPP_ENC_GET_CFG / MPP_ENC_SET_CFG`
 - 带框输出的卡顿、黑边、黑线问题已收敛到可稳定运行
+- `--output-overlay rga` 已切换到 `imcvtcolor + imblend + imcvtcolor` 路径，避开了直接 YUV alpha composite 的黑屏问题
 
 ## License
 

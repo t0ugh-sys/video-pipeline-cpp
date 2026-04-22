@@ -6,6 +6,11 @@
 #include <memory>
 #include <string>
 
+enum class OutputOverlayMode {
+  kCpu,
+  kRga,
+};
+
 /**
  * 可视化输出配置
  */
@@ -13,6 +18,7 @@ struct VisualConfig {
   bool display = false;          // 显示窗口
   std::string outputVideo;       // 输出视频文件路径
   std::string outputRtsp;        // 输出 RTSP 流地址
+  OutputOverlayMode outputOverlayMode = OutputOverlayMode::kCpu;  // 输出视频叠加方式
   int displayMaxWidth = 0;       // 显示路径最大宽度，0 表示不限制
   int displayMaxHeight = 0;      // 显示路径最大高度，0 表示不限制
   bool showLabel = true;         // 显示类别标签

@@ -1,6 +1,9 @@
 #include "backends/mpp_encoder.hpp"
 
 extern "C" {
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/avutil.h>
 #include <mpp_buffer.h>
 #include <mpp_err.h>
 #include <mpp_frame.h>
@@ -20,6 +23,7 @@ extern "C" {
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <thread>
 #include <stdexcept>
 
@@ -87,6 +91,38 @@ void logMppRgbEncodeStep(const char* step) {
   std::cerr.flush();
 }
 
+std::string toLowerAscii(std::string value) {
+  for (char& ch : value) {
+    if (ch >= 'A' && ch <= 'Z') {
+      ch = static_cast<char>(ch - 'A' + 'a');
+    }
+  }
+  return value;
+}
+
+bool hasSuffixIgnoreCase(const std::string& value, const std::string& suffix) {
+  const std::string lowerValue = toLowerAscii(value);
+  const std::string lowerSuffix = toLowerAscii(suffix);
+  return lowerValue.size() >= lowerSuffix.size() &&
+         lowerValue.compare(lowerValue.size() - lowerSuffix.size(), lowerSuffix.size(), lowerSuffix) == 0;
+}
+
+AVCodecID toAvCodecId(const std::string& codec) {
+  if (codec == "hevc" || codec == "h265") {
+    return AV_CODEC_ID_HEVC;
+  }
+  return AV_CODEC_ID_H264;
+}
+
+void checkAvStatus(int status, const char* message) {
+  if (status >= 0) {
+    return;
+  }
+  char errorBuffer[AV_ERROR_MAX_STRING_SIZE] = {};
+  av_strerror(status, errorBuffer, sizeof(errorBuffer));
+  throw std::runtime_error(std::string(message) + ": " + errorBuffer);
+}
+
 }  // namespace
 
 MppEncoder::MppEncoder() = default;
@@ -120,11 +156,11 @@ void MppEncoder::init(const EncoderConfig& config) {
   }
   flushSubmitted_ = false;
   frameIndex_ = 0;
-
-  outputFile_ = std::ofstream(config.outputPath, std::ios::binary);
-  if (!outputFile_.is_open()) {
-    throw std::runtime_error("Failed to open output file: " + config.outputPath);
-  }
+  fpsNum_ = config.fpsNum > 0 ? config.fpsNum : (config.fps > 0 ? config.fps : 30);
+  fpsDen_ = config.fpsDen > 0 ? config.fpsDen : 1;
+  nextPacketPts_ = 0;
+  outputMp4Requested_ = hasSuffixIgnoreCase(config.outputPath, ".mp4");
+  initOutputSink(config);
   logMppRgbEncodeStep("init_output_opened");
 
   if (inputFormat_ == PixelFormat::kRgb888) {
@@ -164,8 +200,6 @@ void MppEncoder::init(const EncoderConfig& config) {
   checkMppStatus(api_->control(context_, MPP_SET_OUTPUT_TIMEOUT, &timeout),
                  "MPP_SET_OUTPUT_TIMEOUT failed");
   logMppRgbEncodeStep("init_set_timeout_done");
-  const int fpsNum = config.fpsNum > 0 ? config.fpsNum : (config.fps > 0 ? config.fps : 30);
-  const int fpsDen = config.fpsDen > 0 ? config.fpsDen : 1;
   const int targetBitrate = config.bitrate > 0 ? config.bitrate : 4000000;
 
   if (config.codec == "hevc" || config.codec == "h265") {
@@ -196,12 +230,12 @@ void MppEncoder::init(const EncoderConfig& config) {
   mpp_enc_cfg_set_u32(config_, "rc:drop_thd", 20);
   mpp_enc_cfg_set_u32(config_, "rc:drop_gap", 1);
   mpp_enc_cfg_set_s32(config_, "rc:fps_in_flex", 0);
-  mpp_enc_cfg_set_s32(config_, "rc:fps_in_num", fpsNum);
-  mpp_enc_cfg_set_s32(config_, "rc:fps_in_denom", fpsDen);
+  mpp_enc_cfg_set_s32(config_, "rc:fps_in_num", fpsNum_);
+  mpp_enc_cfg_set_s32(config_, "rc:fps_in_denom", fpsDen_);
   mpp_enc_cfg_set_s32(config_, "rc:fps_out_flex", 0);
-  mpp_enc_cfg_set_s32(config_, "rc:fps_out_num", fpsNum);
-  mpp_enc_cfg_set_s32(config_, "rc:fps_out_denom", fpsDen);
-  mpp_enc_cfg_set_s32(config_, "rc:gop", std::max(1, (fpsNum + fpsDen - 1) / fpsDen));
+  mpp_enc_cfg_set_s32(config_, "rc:fps_out_num", fpsNum_);
+  mpp_enc_cfg_set_s32(config_, "rc:fps_out_denom", fpsDen_);
+  mpp_enc_cfg_set_s32(config_, "rc:gop", std::max(1, (fpsNum_ + fpsDen_ - 1) / fpsDen_));
   mpp_enc_cfg_set_s32(config_, "rc:bps_target", targetBitrate);
   mpp_enc_cfg_set_s32(config_, "rc:bps_max", targetBitrate * 17 / 16);
   mpp_enc_cfg_set_s32(config_, "rc:bps_min", std::max(1, targetBitrate * 15 / 16));
@@ -230,11 +264,23 @@ void MppEncoder::init(const EncoderConfig& config) {
   checkMppStatus(mpp_packet_init_with_buffer(&headerPacket, packetBuffer_), "mpp_packet_init_with_buffer failed");
   logMppRgbEncodeStep("init_header_packet_done");
   mpp_packet_set_length(headerPacket, 0);
-  // Write SPS/PPS once during init so the raw .h264 output can be remuxed
-  // later without depending on an out-of-band header source.
   checkMppStatus(api_->control(context_, MPP_ENC_GET_HDR_SYNC, headerPacket), "MPP_ENC_GET_HDR_SYNC failed");
   logMppRgbEncodeStep("init_get_hdr_done");
-  writePacket(headerPacket);
+  if (outputMp4Requested_) {
+    void* headerData = mpp_packet_get_pos(headerPacket);
+    const size_t headerLength = mpp_packet_get_length(headerPacket);
+    if (headerData == nullptr || headerLength == 0) {
+      throw std::runtime_error("MPP_ENC_GET_HDR_SYNC returned empty codec header");
+    }
+    muxHeader_.assign(
+        static_cast<const std::uint8_t*>(headerData),
+        static_cast<const std::uint8_t*>(headerData) + headerLength);
+    initMp4Muxer(config);
+  } else {
+    // Write SPS/PPS once during init so the raw .h264 output can be remuxed
+    // later without depending on an out-of-band header source.
+    writePacket(headerPacket);
+  }
   mpp_packet_deinit(&headerPacket);
   logMppRgbEncodeStep("init_done");
 
@@ -318,8 +364,8 @@ void MppEncoder::encode(const RgbImage& frame, int64_t pts) {
     mpp_frame_set_hor_stride(inputFrame, horStride_);
     mpp_frame_set_ver_stride(inputFrame, verStride_);
     mpp_frame_set_fmt(inputFrame, frameFormat_);
-    (void)pts;
-    mpp_frame_set_pts(inputFrame, frameIndex_++);
+    mpp_frame_set_pts(inputFrame, pts >= 0 ? pts : frameIndex_);
+    ++frameIndex_;
     mpp_frame_set_buffer(inputFrame, inputBuffer_);
 
     checkMppStatus(api_->encode_put_frame(context_, inputFrame), "encode_put_frame failed");
@@ -344,11 +390,7 @@ void MppEncoder::encode(const RgbImage& frame, int64_t pts) {
       gotPacket = true;
       retries = 0;
       logMppRgbEncodeStep("encode_get_packet_done");
-      void* data = mpp_packet_get_pos(encodedPacket);
-      const size_t length = mpp_packet_get_length(encodedPacket);
-      if (data != nullptr && length > 0) {
-        outputFile_.write(static_cast<const char*>(data), static_cast<std::streamsize>(length));
-      }
+      writePacket(encodedPacket);
       eoi = mpp_packet_is_partition(encodedPacket) ? mpp_packet_is_eoi(encodedPacket) != 0 : true;
       mpp_packet_deinit(&encodedPacket);
     } while (!eoi);
@@ -452,7 +494,9 @@ void MppEncoder::flush() {
     flushSubmitted_ = true;
     mpp_frame_deinit(&eosFrame);
     drainPackets(true);
-    outputFile_.flush();
+    if (outputFile_.is_open()) {
+      outputFile_.flush();
+    }
   } catch (...) {
     if (eosFrame != nullptr) {
       mpp_frame_deinit(&eosFrame);
@@ -462,9 +506,7 @@ void MppEncoder::flush() {
 }
 
 void MppEncoder::close() {
-  if (outputFile_.is_open()) {
-    outputFile_.close();
-  }
+  closeOutputSink();
   if (inputBuffer_ != nullptr) {
     mpp_buffer_put(inputBuffer_);
     inputBuffer_ = nullptr;
@@ -489,12 +531,16 @@ void MppEncoder::close() {
 
   initialized_ = false;
   flushSubmitted_ = false;
+  outputMp4Requested_ = false;
   width_ = 0;
   height_ = 0;
   horStride_ = 0;
   verStride_ = 0;
   frameIndex_ = 0;
   inputFormat_ = PixelFormat::kUnknown;
+  fpsNum_ = 30;
+  fpsDen_ = 1;
+  nextPacketPts_ = 0;
 }
 
 void MppEncoder::writePacket(void* opaquePacket) {
@@ -505,8 +551,96 @@ void MppEncoder::writePacket(void* opaquePacket) {
 
   void* data = mpp_packet_get_pos(packet);
   const size_t length = mpp_packet_get_length(packet);
-  if (data != nullptr && length > 0) {
-    outputFile_.write(static_cast<const char*>(data), static_cast<std::streamsize>(length));
+  if (data == nullptr || length == 0) {
+    return;
+  }
+
+  if (writesMp4Container()) {
+    const bool partitioned = mpp_packet_is_partition(packet) != 0;
+    const bool endOfFrame = !partitioned || mpp_packet_is_eoi(packet) != 0;
+    AVPacket muxPacket;
+    av_init_packet(&muxPacket);
+    muxPacket.data = static_cast<std::uint8_t*>(data);
+    muxPacket.size = static_cast<int>(length);
+    muxPacket.stream_index = muxVideoStream_->index;
+    muxPacket.pts = nextPacketPts_;
+    muxPacket.dts = nextPacketPts_;
+    muxPacket.duration = endOfFrame ? 1 : 0;
+    muxPacket.flags = 0;
+    av_packet_rescale_ts(&muxPacket, AVRational{fpsDen_, fpsNum_}, muxVideoStream_->time_base);
+    checkAvStatus(av_interleaved_write_frame(muxFormatContext_, &muxPacket),
+                  "av_interleaved_write_frame failed");
+    if (endOfFrame) {
+      ++nextPacketPts_;
+    }
+    return;
+  }
+
+  outputFile_.write(static_cast<const char*>(data), static_cast<std::streamsize>(length));
+}
+
+void MppEncoder::initOutputSink(const EncoderConfig& config) {
+  closeOutputSink();
+  if (outputMp4Requested_) {
+    return;
+  }
+  outputFile_ = std::ofstream(config.outputPath, std::ios::binary);
+  if (!outputFile_.is_open()) {
+    throw std::runtime_error("Failed to open output file: " + config.outputPath);
+  }
+}
+
+void MppEncoder::initMp4Muxer(const EncoderConfig& config) {
+  checkAvStatus(
+      avformat_alloc_output_context2(&muxFormatContext_, nullptr, "mp4", config.outputPath.c_str()),
+      "avformat_alloc_output_context2 failed");
+  if (muxFormatContext_ == nullptr) {
+    throw std::runtime_error("Failed to create MP4 output context");
+  }
+
+  muxVideoStream_ = avformat_new_stream(muxFormatContext_, nullptr);
+  if (muxVideoStream_ == nullptr) {
+    throw std::runtime_error("avformat_new_stream failed");
+  }
+
+  muxVideoStream_->time_base = AVRational{fpsDen_, fpsNum_};
+  muxVideoStream_->avg_frame_rate = AVRational{fpsNum_, fpsDen_};
+  muxVideoStream_->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
+  muxVideoStream_->codecpar->codec_id = toAvCodecId(config.codec);
+  muxVideoStream_->codecpar->width = width_;
+  muxVideoStream_->codecpar->height = height_;
+  muxVideoStream_->codecpar->format = AV_PIX_FMT_YUV420P;
+
+  if (!muxHeader_.empty()) {
+    muxVideoStream_->codecpar->extradata =
+        static_cast<std::uint8_t*>(av_mallocz(muxHeader_.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+    if (muxVideoStream_->codecpar->extradata == nullptr) {
+      throw std::runtime_error("av_mallocz failed for MP4 codec extradata");
+    }
+    std::memcpy(muxVideoStream_->codecpar->extradata, muxHeader_.data(), muxHeader_.size());
+    muxVideoStream_->codecpar->extradata_size = static_cast<int>(muxHeader_.size());
+  }
+
+  if ((muxFormatContext_->oformat->flags & AVFMT_NOFILE) == 0) {
+    checkAvStatus(avio_open(&muxFormatContext_->pb, config.outputPath.c_str(), AVIO_FLAG_WRITE),
+                  "avio_open failed");
+  }
+  checkAvStatus(avformat_write_header(muxFormatContext_, nullptr), "avformat_write_header failed");
+}
+
+void MppEncoder::closeOutputSink() {
+  if (muxFormatContext_ != nullptr) {
+    av_write_trailer(muxFormatContext_);
+    if ((muxFormatContext_->oformat->flags & AVFMT_NOFILE) == 0 && muxFormatContext_->pb != nullptr) {
+      avio_closep(&muxFormatContext_->pb);
+    }
+    avformat_free_context(muxFormatContext_);
+    muxFormatContext_ = nullptr;
+    muxVideoStream_ = nullptr;
+    muxHeader_.clear();
+  }
+  if (outputFile_.is_open()) {
+    outputFile_.close();
   }
 }
 

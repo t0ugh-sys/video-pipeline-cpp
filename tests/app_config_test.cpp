@@ -83,6 +83,37 @@ bool testRejectMissingOptionValue() {
                 "expected missing option value message");
 }
 
+bool testRockchipStableOutputFlags() {
+  std::vector<std::string> arguments = {
+      "video_pipeline",
+      "--backend", "rockchip",
+      "--infer-workers", "2",
+      "--rknn-zero-copy", "false",
+      "--progress-every", "300",
+      "--encoder-fps", "30",
+      "--encoder-bitrate", "20000000",
+      "--output-overlay", "rga",
+      "--output-video", "/edge/workspace/vis_modelzoo_full.h264",
+      "/edge/workspace/2_h264_clean.mp4",
+      "/edge/workspace/rk-video-pipeline-cpp/models/stall_int8.rknn",
+      "640",
+      "640"};
+  std::vector<char*> argv = makeArgv(arguments);
+  const ParseResult result = parseAppConfig(static_cast<int>(argv.size()), argv.data());
+  return expect(result.status == ParseStatus::kOk, "expected stable rockchip flags to parse successfully") &&
+         expect(result.config.decoderBackend == DecoderBackendType::kRockchipMpp, "expected rockchip decoder preset") &&
+         expect(result.config.preprocBackend == PreprocBackendType::kRockchipRga, "expected rockchip preprocessor preset") &&
+         expect(result.config.inferBackend == InferBackendType::kRockchipRknn, "expected rockchip infer preset") &&
+         expect(result.config.inferWorkers == 2, "expected infer workers to be parsed") &&
+         expect(!result.config.rknnZeroCopy, "expected rknn-zero-copy override to be parsed") &&
+         expect(result.config.progressEvery == 300, "expected progress interval to be parsed") &&
+         expect(result.config.encoderFps == 30, "expected encoder fps to be parsed") &&
+         expect(result.config.encoderBitrate == 20000000, "expected encoder bitrate to be parsed") &&
+         expect(result.config.visual.outputOverlayMode == OutputOverlayMode::kRga,
+                "expected output overlay mode to be parsed") &&
+         expect(result.config.visual.outputVideo == "/edge/workspace/vis_modelzoo_full.h264", "expected output video path to be parsed");
+}
+
 }  // namespace
 
 int main() {
@@ -92,5 +123,6 @@ int main() {
   ok = ok && testRejectOddPositionals();
   ok = ok && testRejectUnknownOption();
   ok = ok && testRejectMissingOptionValue();
+  ok = ok && testRockchipStableOutputFlags();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

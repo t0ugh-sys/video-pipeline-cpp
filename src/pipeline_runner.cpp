@@ -9,6 +9,8 @@
 #include "preproc_interface.hpp"
 #include "visualizer.hpp"
 
+#include "../../rknn_model_zoo/utils/font.h"
+
 #if defined(ENABLE_RGA_PREPROC) && !defined(WIN32)
 extern "C" {
 #include <mpp_buffer.h>
@@ -18,8 +20,11 @@ extern "C" {
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <deque>
 #include <fstream>
 #include <iostream>
@@ -57,6 +62,9 @@ struct ProcessedFrame {
   double inferMs = 0.0;
   double postprocMs = 0.0;
 };
+
+constexpr int kModelZooBoxThickness = 3;
+constexpr int kModelZooFontPixelSize = 10;
 
 template <typename T>
 class BoundedQueue {
@@ -235,7 +243,13 @@ bool wantsHardwareEncodedAnnotatedOutput(const AppConfig& config) {
   return hasSuffixIgnoreCase(config.visual.outputVideo, ".h264") ||
          hasSuffixIgnoreCase(config.visual.outputVideo, ".264") ||
          hasSuffixIgnoreCase(config.visual.outputVideo, ".h265") ||
-         hasSuffixIgnoreCase(config.visual.outputVideo, ".hevc");
+         hasSuffixIgnoreCase(config.visual.outputVideo, ".hevc") ||
+         hasSuffixIgnoreCase(config.visual.outputVideo, ".mp4");
+}
+
+bool usesRgaAnnotatedOutput(const AppConfig& config) {
+  return wantsHardwareEncodedAnnotatedOutput(config) &&
+         config.visual.outputOverlayMode == OutputOverlayMode::kRga;
 }
 
 int resolveEncoderFps(const AppConfig& config, const SourceVideoInfo& sourceVideoInfo) {
@@ -325,6 +339,163 @@ bool shouldKeepEncodedFrame(
   return currCount != prevCount;
 }
 
+void fillRgbaRect(
+    std::vector<std::uint8_t>& rgba,
+    int imageWidth,
+    int imageHeight,
+    int x,
+    int y,
+    int width,
+    int height,
+    std::uint8_t r,
+    std::uint8_t g,
+    std::uint8_t b,
+    std::uint8_t a) {
+  const int x0 = std::clamp(x, 0, imageWidth);
+  const int y0 = std::clamp(y, 0, imageHeight);
+  const int x1 = std::clamp(x + width, 0, imageWidth);
+  const int y1 = std::clamp(y + height, 0, imageHeight);
+  if (x0 >= x1 || y0 >= y1) {
+    return;
+  }
+
+  for (int yy = y0; yy < y1; ++yy) {
+    for (int xx = x0; xx < x1; ++xx) {
+      const std::size_t offset =
+          static_cast<std::size_t>((yy * imageWidth + xx) * 4);
+      rgba[offset + 0] = r;
+      rgba[offset + 1] = g;
+      rgba[offset + 2] = b;
+      rgba[offset + 3] = a;
+    }
+  }
+}
+
+void drawRectangleOnOverlay(
+    std::vector<std::uint8_t>& rgba,
+    int imageWidth,
+    int imageHeight,
+    int x,
+    int y,
+    int width,
+    int height,
+    int thickness,
+    std::uint8_t r,
+    std::uint8_t g,
+    std::uint8_t b,
+    std::uint8_t a) {
+  if (width <= 0 || height <= 0 || thickness <= 0) {
+    return;
+  }
+
+  fillRgbaRect(rgba, imageWidth, imageHeight, x, y, width, thickness, r, g, b, a);
+  fillRgbaRect(rgba, imageWidth, imageHeight, x, y + height - thickness, width, thickness, r, g, b, a);
+  fillRgbaRect(rgba, imageWidth, imageHeight, x, y, thickness, height, r, g, b, a);
+  fillRgbaRect(rgba, imageWidth, imageHeight, x + width - thickness, y, thickness, height, r, g, b, a);
+}
+
+int resizeBilinearC1(
+    const unsigned char* srcPixels,
+    int srcWidth,
+    int srcHeight,
+    unsigned char* dstPixels,
+    int dstWidth,
+    int dstHeight) {
+  const int xRatio = static_cast<int>((static_cast<float>(srcWidth - 1) / dstWidth) * (1 << 16));
+  const int yRatio = static_cast<int>((static_cast<float>(srcHeight - 1) / dstHeight) * (1 << 16));
+
+  for (int i = 0; i < dstHeight; ++i) {
+    for (int j = 0; j < dstWidth; ++j) {
+      const int x = (xRatio * j) >> 16;
+      const int y = (yRatio * i) >> 16;
+      const int xDiff = (xRatio * j) & 0xffff;
+      const int yDiff = (yRatio * i) & 0xffff;
+
+      const int index = y * srcWidth + x;
+      const int a = srcPixels[index];
+      const int b = srcPixels[index + 1];
+      const int c = srcPixels[index + srcWidth];
+      const int d = srcPixels[index + srcWidth + 1];
+
+      const std::uint64_t accum =
+          static_cast<std::uint64_t>(a) * static_cast<std::uint64_t>(65536 - xDiff) * static_cast<std::uint64_t>(65536 - yDiff) +
+          static_cast<std::uint64_t>(b) * static_cast<std::uint64_t>(xDiff) * static_cast<std::uint64_t>(65536 - yDiff) +
+          static_cast<std::uint64_t>(c) * static_cast<std::uint64_t>(yDiff) * static_cast<std::uint64_t>(65536 - xDiff) +
+          static_cast<std::uint64_t>(d) * static_cast<std::uint64_t>(xDiff) * static_cast<std::uint64_t>(yDiff);
+      dstPixels[i * dstWidth + j] = static_cast<unsigned char>(accum >> 32);
+    }
+  }
+
+  return 0;
+}
+
+void drawTextOnOverlay(
+    std::vector<std::uint8_t>& rgba,
+    int width,
+    int height,
+    const char* text,
+    int x,
+    int y,
+    int fontPixelSize,
+    std::uint8_t r,
+    std::uint8_t g,
+    std::uint8_t b) {
+  std::vector<unsigned char> resizedFontBitmap(
+      static_cast<std::size_t>(fontPixelSize * fontPixelSize * 2));
+
+  const int n = static_cast<int>(std::strlen(text));
+  int cursorX = x;
+  int cursorY = y;
+  for (int i = 0; i < n; ++i) {
+    const char ch = text[i];
+    if (ch == '\n') {
+      cursorX = x;
+      cursorY += fontPixelSize * 2;
+      continue;
+    }
+    if (std::isprint(static_cast<unsigned char>(ch)) == 0) {
+      continue;
+    }
+
+    const int fontBitmapIndex = ch - ' ';
+    if (fontBitmapIndex < 0 || fontBitmapIndex >= 95) {
+      continue;
+    }
+    const unsigned char* fontBitmap = mono_font_data[fontBitmapIndex];
+    resizeBilinearC1(fontBitmap, 20, 40, resizedFontBitmap.data(), fontPixelSize, fontPixelSize * 2);
+
+    for (int yy = cursorY; yy < cursorY + fontPixelSize * 2; ++yy) {
+      if (yy < 0) {
+        continue;
+      }
+      if (yy >= height) {
+        break;
+      }
+
+      const unsigned char* alpha = resizedFontBitmap.data() +
+          static_cast<std::size_t>(yy - cursorY) * fontPixelSize;
+      for (int xx = cursorX; xx < cursorX + fontPixelSize; ++xx) {
+        if (xx < 0) {
+          continue;
+        }
+        if (xx >= width) {
+          break;
+        }
+
+        const unsigned char a = alpha[xx - cursorX];
+        const std::size_t offset =
+            static_cast<std::size_t>((yy * width + xx) * 4);
+        rgba[offset + 0] = static_cast<unsigned char>((rgba[offset + 0] * (255 - a) + r * a) / 255);
+        rgba[offset + 1] = static_cast<unsigned char>((rgba[offset + 1] * (255 - a) + g * a) / 255);
+        rgba[offset + 2] = static_cast<unsigned char>((rgba[offset + 2] * (255 - a) + b * a) / 255);
+        rgba[offset + 3] = std::max(rgba[offset + 3], a);
+      }
+    }
+
+    cursorX += fontPixelSize;
+  }
+}
+
 #if defined(ENABLE_RGA_PREPROC) && !defined(WIN32)
 std::shared_ptr<void> makeMppBufferOwner(MppBuffer buffer) {
   return std::shared_ptr<void>(buffer, [](void* opaque) {
@@ -344,15 +515,7 @@ DecodedFrame makeAnnotatedEncodeFrame(
 
   // Keep these groups alive across frames so the hardware overlay path does not
   // churn DRM buffers on every annotated output frame.
-  static MppBufferGroup overlayGroup = nullptr;
   static MppBufferGroup outputGroup = nullptr;
-  if (overlayGroup == nullptr) {
-    if (mpp_buffer_group_get_internal(
-            &overlayGroup,
-            static_cast<MppBufferType>(MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE)) != MPP_OK) {
-      throw std::runtime_error("mpp_buffer_group_get_internal failed for RGBA overlay");
-    }
-  }
   if (outputGroup == nullptr) {
     if (mpp_buffer_group_get_internal(
             &outputGroup,
@@ -360,26 +523,38 @@ DecodedFrame makeAnnotatedEncodeFrame(
       throw std::runtime_error("mpp_buffer_group_get_internal failed for hardware overlay output");
     }
   }
+  static MppBufferGroup rgbaGroup = nullptr;
+  if (rgbaGroup == nullptr) {
+    if (mpp_buffer_group_get_internal(
+            &rgbaGroup,
+            static_cast<MppBufferType>(MPP_BUFFER_TYPE_DRM | MPP_BUFFER_FLAGS_CACHABLE)) != MPP_OK) {
+      throw std::runtime_error("mpp_buffer_group_get_internal failed for hardware overlay RGBA scratch");
+    }
+  }
 
   const int horStride = frame.horizontalStride > 0 ? frame.horizontalStride : frame.width;
   const int verStride = frame.verticalStride > 0 ? frame.verticalStride : frame.height;
   const std::size_t outputBytes =
       static_cast<std::size_t>(horStride) * static_cast<std::size_t>(verStride) * 3 / 2;
+  const std::size_t rgbaBytes =
+      static_cast<std::size_t>(horStride) * static_cast<std::size_t>(verStride) * 4;
   const std::size_t overlayBytes =
       static_cast<std::size_t>(frame.width) * static_cast<std::size_t>(frame.height) * 4;
 
-  MppBuffer overlayBuffer = nullptr;
   MppBuffer outputBuffer = nullptr;
-  if (mpp_buffer_get(overlayGroup, &overlayBuffer, overlayBytes) != MPP_OK || overlayBuffer == nullptr) {
-    throw std::runtime_error("mpp_buffer_get failed for hardware overlay RGBA buffer");
-  }
   if (mpp_buffer_get(outputGroup, &outputBuffer, outputBytes) != MPP_OK || outputBuffer == nullptr) {
-    mpp_buffer_put(overlayBuffer);
     throw std::runtime_error("mpp_buffer_get failed for hardware overlay NV12 output buffer");
   }
+  MppBuffer rgbaBuffer = nullptr;
+  if (mpp_buffer_get(rgbaGroup, &rgbaBuffer, rgbaBytes) != MPP_OK || rgbaBuffer == nullptr) {
+    mpp_buffer_put(outputBuffer);
+    throw std::runtime_error("mpp_buffer_get failed for hardware overlay RGBA scratch buffer");
+  }
 
+  std::vector<std::uint8_t> overlayData(overlayBytes, 0);
   rga_buffer_handle_t srcHandle = 0;
   rga_buffer_handle_t overlayHandle = 0;
+  rga_buffer_handle_t rgbaHandle = 0;
   rga_buffer_handle_t outputHandle = 0;
   try {
     srcHandle = importbuffer_fd(frame.dmaFd, horStride, verStride, RK_FORMAT_YCbCr_420_SP);
@@ -387,13 +562,18 @@ DecodedFrame makeAnnotatedEncodeFrame(
       throw std::runtime_error("RGA importbuffer_fd failed for hardware overlay source");
     }
 
-    const int overlayFd = mpp_buffer_get_fd(overlayBuffer);
-    if (overlayFd < 0) {
-      throw std::runtime_error("mpp_buffer_get_fd failed for hardware overlay RGBA buffer");
-    }
-    overlayHandle = importbuffer_fd(overlayFd, static_cast<int>(overlayBytes));
+    overlayHandle = importbuffer_virtualaddr(overlayData.data(), static_cast<int>(overlayBytes));
     if (overlayHandle == 0) {
-      throw std::runtime_error("RGA importbuffer_fd failed for hardware overlay RGBA handle");
+      throw std::runtime_error("RGA importbuffer_virtualaddr failed for hardware overlay RGBA handle");
+    }
+
+    const int rgbaFd = mpp_buffer_get_fd(rgbaBuffer);
+    if (rgbaFd < 0) {
+      throw std::runtime_error("mpp_buffer_get_fd failed for hardware overlay RGBA scratch");
+    }
+    rgbaHandle = importbuffer_fd(rgbaFd, horStride, verStride, RK_FORMAT_RGBA_8888);
+    if (rgbaHandle == 0) {
+      throw std::runtime_error("RGA importbuffer_fd failed for hardware overlay RGBA scratch handle");
     }
 
     const int outputFd = mpp_buffer_get_fd(outputBuffer);
@@ -409,65 +589,105 @@ DecodedFrame makeAnnotatedEncodeFrame(
         srcHandle, frame.width, frame.height, RK_FORMAT_YCbCr_420_SP, horStride, verStride);
     rga_buffer_t overlay = wrapbuffer_handle(
         overlayHandle, frame.width, frame.height, RK_FORMAT_RGBA_8888);
+    rga_buffer_t rgba = wrapbuffer_handle(
+        rgbaHandle, frame.width, frame.height, RK_FORMAT_RGBA_8888, horStride, verStride);
     rga_buffer_t dst = wrapbuffer_handle(
         outputHandle, frame.width, frame.height, RK_FORMAT_YCbCr_420_SP, horStride, verStride);
 
-    im_rect fullRect{};
-    fullRect.x = 0;
-    fullRect.y = 0;
-    fullRect.width = frame.width;
-    fullRect.height = frame.height;
-
-    IM_STATUS status = imfill(overlay, fullRect, 0x00000000);
-    if (status != IM_STATUS_SUCCESS) {
-      throw std::runtime_error(std::string("RGA imfill failed for hardware overlay: ") + imStrError_t(status));
-    }
-
-    const int thickness = std::max(1, static_cast<int>(config.bboxThickness));
+    // Clear the host RGBA overlay on CPU first. On this board the RGA_COLORFILL
+    // path for this overlay plane is not stable and fails with Invalid argument.
+    std::memset(overlayData.data(), 0, overlayBytes);
+    IM_STATUS status = IM_STATUS_SUCCESS;
+    const int thickness = std::max(1, kModelZooBoxThickness);
     for (const auto& box : result.boxes) {
       const int x1 = std::clamp(static_cast<int>(box.x1), 0, frame.width - 1);
       const int y1 = std::clamp(static_cast<int>(box.y1), 0, frame.height - 1);
       const int x2 = std::clamp(static_cast<int>(box.x2), x1 + 1, frame.width);
       const int y2 = std::clamp(static_cast<int>(box.y2), y1 + 1, frame.height);
-      im_rect rect{};
-      rect.x = x1;
-      rect.y = y1;
-      rect.width = std::max(1, x2 - x1);
-      rect.height = std::max(1, y2 - y1);
+      drawRectangleOnOverlay(
+          overlayData,
+          frame.width,
+          frame.height,
+          x1,
+          y1,
+          std::max(1, x2 - x1),
+          std::max(1, y2 - y1),
+          thickness,
+          0,
+          0,
+          255,
+          255);
 
-      status = imrectangle(overlay, rect, 0xff00ff00, thickness);
-      if (status != IM_STATUS_SUCCESS) {
-        throw std::runtime_error(
-            std::string("RGA imrectangle failed while drawing hardware boxes: ") + imStrError_t(status));
+      char text[256] = {};
+      if (config.showLabel && !box.label.empty() && config.showConf) {
+        std::snprintf(text, sizeof(text), "%s %.1f%%", box.label.c_str(), box.score * 100.0f);
+      } else if (config.showLabel && !box.label.empty()) {
+        std::snprintf(text, sizeof(text), "%s", box.label.c_str());
+      } else if (config.showConf) {
+        std::snprintf(text, sizeof(text), "%.1f%%", box.score * 100.0f);
+      }
+      if (text[0] != '\0') {
+        drawTextOnOverlay(
+            overlayData,
+            frame.width,
+            frame.height,
+            text,
+            x1,
+            y1 - 20,
+            kModelZooFontPixelSize,
+            255,
+            0,
+            0);
       }
     }
 
-    im_rect srcRect{};
-    srcRect.x = 0;
-    srcRect.y = 0;
-    srcRect.width = frame.width;
-    srcRect.height = frame.height;
-    im_rect bgRect = srcRect;
-    im_rect dstRect = srcRect;
-    status = improcess(
-        src,
-        dst,
-        overlay,
-        srcRect,
-        dstRect,
-        bgRect,
-        -1,
-        nullptr,
-        nullptr,
-        IM_SYNC | IM_ALPHA_BLEND_DST_OVER | IM_ALPHA_BLEND_PRE_MUL);
+    // Use the official stable building blocks from librga:
+    // 1. imcvtcolor: NV12 -> RGBA
+    // 2. imblend: RGBA overlay over RGBA background
+    // 3. imcvtcolor: RGBA -> NV12
+    // This avoids the direct YUV alpha composite path that produced black
+    // output on this board/driver combination.
+    int checkStatus = imcheck(src, rgba, {}, {});
+    if (checkStatus != IM_STATUS_NOERROR) {
+      throw std::runtime_error(
+          std::string("RGA imcheck failed for NV12->RGBA conversion: ") +
+          imStrError_t(static_cast<IM_STATUS>(checkStatus)));
+    }
+    status = imcvtcolor(src, rgba, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGBA_8888);
     if (status != IM_STATUS_SUCCESS) {
       throw std::runtime_error(
-          std::string("RGA improcess failed for hardware overlay composite: ") + imStrError_t(status));
+          std::string("RGA NV12->RGBA conversion failed for hardware overlay: ") + imStrError_t(status));
+    }
+
+    checkStatus = imcheck(overlay, rgba, {}, {});
+    if (checkStatus != IM_STATUS_NOERROR) {
+      throw std::runtime_error(
+          std::string("RGA imcheck failed for RGBA overlay blend: ") +
+          imStrError_t(static_cast<IM_STATUS>(checkStatus)));
+    }
+    status = imblend(overlay, rgba, IM_ALPHA_BLEND_SRC_OVER | IM_ALPHA_BLEND_PRE_MUL);
+    if (status != IM_STATUS_SUCCESS) {
+      throw std::runtime_error(
+          std::string("RGA RGBA overlay blend failed: ") + imStrError_t(status));
+    }
+
+    checkStatus = imcheck(rgba, dst, {}, {});
+    if (checkStatus != IM_STATUS_NOERROR) {
+      throw std::runtime_error(
+          std::string("RGA imcheck failed for RGBA->NV12 conversion: ") +
+          imStrError_t(static_cast<IM_STATUS>(checkStatus)));
+    }
+    status = imcvtcolor(rgba, dst, RK_FORMAT_RGBA_8888, RK_FORMAT_YCbCr_420_SP);
+    if (status != IM_STATUS_SUCCESS) {
+      throw std::runtime_error(
+          std::string("RGA RGBA->NV12 conversion failed for hardware overlay: ") + imStrError_t(status));
     }
 
     releasebuffer_handle(srcHandle);
     releasebuffer_handle(overlayHandle);
+    releasebuffer_handle(rgbaHandle);
     releasebuffer_handle(outputHandle);
+    mpp_buffer_put(rgbaBuffer);
 
     DecodedFrame annotated = frame;
     annotated.dmaFd = mpp_buffer_get_fd(outputBuffer);
@@ -476,8 +696,9 @@ DecodedFrame makeAnnotatedEncodeFrame(
   } catch (...) {
     if (srcHandle != 0) releasebuffer_handle(srcHandle);
     if (overlayHandle != 0) releasebuffer_handle(overlayHandle);
+    if (rgbaHandle != 0) releasebuffer_handle(rgbaHandle);
     if (outputHandle != 0) releasebuffer_handle(outputHandle);
-    if (overlayBuffer != nullptr) mpp_buffer_put(overlayBuffer);
+    if (rgbaBuffer != nullptr) mpp_buffer_put(rgbaBuffer);
     if (outputBuffer != nullptr) mpp_buffer_put(outputBuffer);
     throw;
   }
@@ -521,11 +742,12 @@ void validateAppConfig(const AppConfig& config) {
       !wantsHardwareEncodedAnnotatedOutput(config) &&
       detectAvailableEncoderBackend() == EncoderBackendType::kRockchipMpp) {
     throw std::runtime_error(
-        "On the Rockchip path, --output-video now uses hardware encoding and writes a raw bitstream. "
-        "Use a .h264/.264/.h265/.hevc output path.");
+        "On the Rockchip path, --output-video now uses hardware encoding. "
+        "Use a .h264/.264/.h265/.hevc raw bitstream path or .mp4 for muxed output.");
   }
 
-  if (config.visual.display || !config.visual.outputVideo.empty()) {
+  if (config.visual.display ||
+      (!config.visual.outputVideo.empty() && config.visual.outputOverlayMode != OutputOverlayMode::kRga)) {
     const auto visualizer = createVisualizer();
     if (!visualizer->isAvailable()) {
       throw std::runtime_error(
@@ -535,9 +757,11 @@ void validateAppConfig(const AppConfig& config) {
 }
 
 void runPipeline(const AppConfig& config) {
-  const bool needsVisualization = config.visual.display || !config.visual.outputVideo.empty();
-  const bool needsDisplayFrame = needsVisualization || config.dumpFirstFrame;
   const bool needsHardwareEncodedAnnotatedVideo = wantsHardwareEncodedAnnotatedOutput(config);
+  const bool useRgaAnnotatedOutput = usesRgaAnnotatedOutput(config);
+  const bool needsVisualizerDraw = config.visual.display ||
+                                   (!config.visual.outputVideo.empty() && !useRgaAnnotatedOutput);
+  const bool needsDisplayFrame = needsVisualizerDraw || config.dumpFirstFrame;
   const std::size_t inferenceQueueCapacity = static_cast<std::size_t>(std::max(2, config.inferWorkers * 2));
   const std::size_t rgaMaxInflightFrames = static_cast<std::size_t>(std::max(1, config.inferWorkers * 2 + 4));
 
@@ -623,7 +847,7 @@ void runPipeline(const AppConfig& config) {
       bool encoderInitialized = false;
       bool annotatedVideoEncoderInitialized = false;
       const int outputEncoderFps = resolveEncoderFps(config, sourceVideoInfo);
-      if (needsVisualization) {
+      if (needsVisualizerDraw) {
         visualizer = createVisualizer();
       }
       if (needsDisplayFrame) {
@@ -689,7 +913,7 @@ void runPipeline(const AppConfig& config) {
           std::optional<DetectionResult> displayResult;
           if (needsDisplayFrame) {
             const auto [displayWidth, displayHeight] =
-                needsVisualization
+                needsVisualizerDraw
                     ? computeDisplaySize(config, current.decodedFrame.width, current.decodedFrame.height)
                     : std::pair<int, int>{current.decodedFrame.width, current.decodedFrame.height};
             const auto displayPreprocStart = Clock::now();
@@ -729,7 +953,7 @@ void runPipeline(const AppConfig& config) {
             maybeDumpFirstFrame(config, displayImage.value(), displayedCount);
           }
 
-          if (needsVisualization && displayImage.has_value() && displayResult.has_value()) {
+          if (needsVisualizerDraw && displayImage.has_value() && displayResult.has_value()) {
             if (!visualizerInitialized) {
               VisualConfig visualConfig = config.visual;
               if (needsHardwareEncodedAnnotatedVideo) {
@@ -747,19 +971,51 @@ void runPipeline(const AppConfig& config) {
                 encCfg.fps = outputEncoderFps;
                 encCfg.fpsNum = resolveEncoderFpsNum(config, sourceVideoInfo);
                 encCfg.fpsDen = resolveEncoderFpsDen(config, sourceVideoInfo);
-                encCfg.width = drawnImage.width;
-                encCfg.height = drawnImage.height;
+                encCfg.width = useRgaAnnotatedOutput ? current.decodedFrame.width : drawnImage.width;
+                encCfg.height = useRgaAnnotatedOutput ? current.decodedFrame.height : drawnImage.height;
                 encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
-                encCfg.inputFormat = PixelFormat::kRgb888;
+                encCfg.inputFormat = useRgaAnnotatedOutput ? PixelFormat::kNv12 : PixelFormat::kRgb888;
                 annotatedVideoEncoder->init(encCfg);
                 annotatedVideoEncoderInitialized = true;
               }
               if (keepEncodedFrame) {
-                annotatedVideoEncoder->encode(drawnImage, current.pts);
+                if (useRgaAnnotatedOutput) {
+                  DecodedFrame annotatedFrame =
+                      makeAnnotatedEncodeFrame(current.decodedFrame, current.result, config.visual);
+                  annotatedVideoEncoder->encodeDecodedFrame(annotatedFrame, current.pts);
+                } else {
+                  annotatedVideoEncoder->encode(drawnImage, current.pts);
+                }
               }
             }
             (void)drawnImage;
             visualizer->show();
+          } else if (annotatedVideoEncoder && useRgaAnnotatedOutput) {
+            if (!annotatedVideoEncoderInitialized) {
+              EncoderConfig encCfg;
+              encCfg.outputPath = config.visual.outputVideo;
+              encCfg.codec = config.encoderCodec;
+              encCfg.fps = outputEncoderFps;
+              encCfg.fpsNum = resolveEncoderFpsNum(config, sourceVideoInfo);
+              encCfg.fpsDen = resolveEncoderFpsDen(config, sourceVideoInfo);
+              encCfg.width = current.decodedFrame.width;
+              encCfg.height = current.decodedFrame.height;
+              encCfg.horStride = current.decodedFrame.horizontalStride > 0
+                  ? current.decodedFrame.horizontalStride
+                  : current.decodedFrame.width;
+              encCfg.verStride = current.decodedFrame.verticalStride > 0
+                  ? current.decodedFrame.verticalStride
+                  : current.decodedFrame.height;
+              encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
+              encCfg.inputFormat = PixelFormat::kNv12;
+              annotatedVideoEncoder->init(encCfg);
+              annotatedVideoEncoderInitialized = true;
+            }
+            if (keepEncodedFrame) {
+              DecodedFrame annotatedFrame =
+                  makeAnnotatedEncodeFrame(current.decodedFrame, current.result, config.visual);
+              annotatedVideoEncoder->encodeDecodedFrame(annotatedFrame, current.pts);
+            }
           }
 
           ++nextIndex;

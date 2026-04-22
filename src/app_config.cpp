@@ -62,6 +62,12 @@ ModelOutputLayout parseModelOutputLayout(const std::string& value) {
   throw std::runtime_error("Unsupported model output layout: " + value);
 }
 
+OutputOverlayMode parseOutputOverlayMode(const std::string& value) {
+  if (value == "cpu") return OutputOverlayMode::kCpu;
+  if (value == "rga") return OutputOverlayMode::kRga;
+  throw std::runtime_error("Unsupported output overlay mode: " + value);
+}
+
 void applyBackendPreset(const std::string& backendName, AppConfig& config) {
   if (backendName == "rockchip" || backendName == "mpp") {
     config.decoderBackend = DecoderBackendType::kRockchipMpp;
@@ -128,6 +134,7 @@ ParseResult parseAppConfig(int argc, char* argv[]) {
       if (argument == "--display") { config.visual.display = true; continue; }
       if (argument == "--display-max-width") { config.visual.displayMaxWidth = parseIntValue(requireNextArg(argc, argv, index, "--display-max-width"), "--display-max-width"); continue; }
       if (argument == "--display-max-height") { config.visual.displayMaxHeight = parseIntValue(requireNextArg(argc, argv, index, "--display-max-height"), "--display-max-height"); continue; }
+      if (argument == "--output-overlay") { config.visual.outputOverlayMode = parseOutputOverlayMode(requireNextArg(argc, argv, index, "--output-overlay")); continue; }
       if (argument == "--output-video") { config.visual.outputVideo = requireNextArg(argc, argv, index, "--output-video"); continue; }
       if (argument == "--output-rtsp") { config.visual.outputRtsp = requireNextArg(argc, argv, index, "--output-rtsp"); continue; }
       if (argument == "--encoder-output") { config.encoderOutput = requireNextArg(argc, argv, index, "--encoder-output"); continue; }
@@ -171,6 +178,7 @@ std::string buildUsageMessage(const std::string& programName) {
   message += "  --display                               Enable display window\n";
   message += "  --display-max-width <n>                 Max display-path width, 0 keeps source width\n";
   message += "  --display-max-height <n>                Max display-path height, 0 keeps source height\n";
+  message += "  --output-overlay <cpu|rga>              Overlay mode for --output-video (default: cpu)\n";
   message += "  --output-video <path>                   Write annotated video to a file (.h264/.264/.h265/.hevc on Rockchip)\n";
   message += "  --output-rtsp <url>                     Stream annotated video to RTSP\n";
   message += "  --encoder-output <path>                 Write raw decode stream (MPP h264/h265)\n";
