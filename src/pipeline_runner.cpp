@@ -394,35 +394,33 @@ void drawRectangleOnOverlay(
   fillRgbaRect(rgba, imageWidth, imageHeight, x + width - thickness, y, thickness, height, r, g, b, a);
 }
 
-int resizeBilinearC1(
+void drawLabelBackgroundOnOverlay(
+    std::vector<std::uint8_t>& rgba,
+    int imageWidth,
+    int imageHeight,
+    int x,
+    int y,
+    int width,
+    int height,
+    std::uint8_t r,
+    std::uint8_t g,
+    std::uint8_t b,
+    std::uint8_t a) {
+  fillRgbaRect(rgba, imageWidth, imageHeight, x, y, width, height, r, g, b, a);
+}
+
+int resizeNearestC1(
     const unsigned char* srcPixels,
     int srcWidth,
     int srcHeight,
     unsigned char* dstPixels,
     int dstWidth,
     int dstHeight) {
-  const int xRatio = static_cast<int>((static_cast<float>(srcWidth - 1) / dstWidth) * (1 << 16));
-  const int yRatio = static_cast<int>((static_cast<float>(srcHeight - 1) / dstHeight) * (1 << 16));
-
   for (int i = 0; i < dstHeight; ++i) {
+    const int y = std::clamp((i * srcHeight) / dstHeight, 0, srcHeight - 1);
     for (int j = 0; j < dstWidth; ++j) {
-      const int x = (xRatio * j) >> 16;
-      const int y = (yRatio * i) >> 16;
-      const int xDiff = (xRatio * j) & 0xffff;
-      const int yDiff = (yRatio * i) & 0xffff;
-
-      const int index = y * srcWidth + x;
-      const int a = srcPixels[index];
-      const int b = srcPixels[index + 1];
-      const int c = srcPixels[index + srcWidth];
-      const int d = srcPixels[index + srcWidth + 1];
-
-      const std::uint64_t accum =
-          static_cast<std::uint64_t>(a) * static_cast<std::uint64_t>(65536 - xDiff) * static_cast<std::uint64_t>(65536 - yDiff) +
-          static_cast<std::uint64_t>(b) * static_cast<std::uint64_t>(xDiff) * static_cast<std::uint64_t>(65536 - yDiff) +
-          static_cast<std::uint64_t>(c) * static_cast<std::uint64_t>(yDiff) * static_cast<std::uint64_t>(65536 - xDiff) +
-          static_cast<std::uint64_t>(d) * static_cast<std::uint64_t>(xDiff) * static_cast<std::uint64_t>(yDiff);
-      dstPixels[i * dstWidth + j] = static_cast<unsigned char>(accum >> 32);
+      const int x = std::clamp((j * srcWidth) / dstWidth, 0, srcWidth - 1);
+      dstPixels[i * dstWidth + j] = srcPixels[y * srcWidth + x];
     }
   }
 
@@ -462,7 +460,7 @@ void drawTextOnOverlay(
       continue;
     }
     const unsigned char* fontBitmap = mono_font_data[fontBitmapIndex];
-    resizeBilinearC1(fontBitmap, 20, 40, resizedFontBitmap.data(), fontPixelSize, fontPixelSize * 2);
+    resizeNearestC1(fontBitmap, 20, 40, resizedFontBitmap.data(), fontPixelSize, fontPixelSize * 2);
 
     for (int yy = cursorY; yy < cursorY + fontPixelSize * 2; ++yy) {
       if (yy < 0) {
@@ -482,7 +480,7 @@ void drawTextOnOverlay(
           break;
         }
 
-        const unsigned char a = alpha[xx - cursorX];
+        const unsigned char a = alpha[xx - cursorX] >= 128 ? 255 : 0;
         const std::size_t offset =
             static_cast<std::size_t>((yy * width + xx) * 4);
         rgba[offset + 0] = static_cast<unsigned char>((rgba[offset + 0] * (255 - a) + r * a) / 255);
@@ -627,17 +625,33 @@ DecodedFrame makeAnnotatedEncodeFrame(
         std::snprintf(text, sizeof(text), "%.1f%%", box.score * 100.0f);
       }
       if (text[0] != '\0') {
+        const int textWidth = static_cast<int>(std::strlen(text)) * kModelZooFontPixelSize;
+        const int textHeight = kModelZooFontPixelSize * 2;
+        const int textX = std::clamp(x1, 0, std::max(0, frame.width - textWidth - 4));
+        const int textY = std::clamp(y1 - 20, 0, std::max(0, frame.height - textHeight - 2));
+        drawLabelBackgroundOnOverlay(
+            overlayData,
+            frame.width,
+            frame.height,
+            textX,
+            textY,
+            textWidth + 4,
+            textHeight,
+            255,
+            0,
+            0,
+            255);
         drawTextOnOverlay(
             overlayData,
             frame.width,
             frame.height,
             text,
-            x1,
-            y1 - 20,
+            textX + 2,
+            textY,
             kModelZooFontPixelSize,
             255,
-            0,
-            0);
+            255,
+            255);
       }
     }
 

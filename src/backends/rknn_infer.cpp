@@ -187,6 +187,26 @@ std::vector<std::int64_t> toShape(const rknn_tensor_attr& attr) {
   return shape;
 }
 
+bool looksLikeFlatYolov8Tensor(const InferenceTensor& tensor) {
+  if (tensor.shape.size() != 3 || tensor.quantization != TensorQuantizationType::kAffineAsymmetric) {
+    return false;
+  }
+  if (tensor.dataType != TensorDataType::kInt8 && tensor.dataType != TensorDataType::kUint8) {
+    return false;
+  }
+  const auto dim1 = tensor.shape[1];
+  const auto dim2 = tensor.shape[2];
+  return (dim1 == 84 || dim1 == 85 || dim2 == 84 || dim2 == 85);
+}
+
+std::size_t tensorElementCount(const InferenceTensor& tensor) {
+  std::size_t count = 1;
+  for (const auto dim : tensor.shape) {
+    count *= static_cast<std::size_t>(dim);
+  }
+  return count;
+}
+
 }  // namespace
 
 namespace {
@@ -363,8 +383,15 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
   checkRknnStatus(rknn_run(context_, nullptr), "rknn_run failed");
 
   std::vector<rknn_output> outputs(output_templates_.size());
+  const bool useFloatOutputsForFlatSingleHead =
+      output_templates_.size() == 1 && looksLikeFlatYolov8Tensor(output_templates_.front());
   for (std::size_t i = 0; i < outputs.size(); ++i) {
-    outputs[i].want_float = output_templates_[i].dataType == TensorDataType::kFloat32 ? 1 : 0;
+    outputs[i].want_float =
+        (output_templates_[i].dataType == TensorDataType::kFloat32 || useFloatOutputsForFlatSingleHead) ? 1 : 0;
+  }
+  if (verbose_ && useFloatOutputsForFlatSingleHead) {
+    std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
+              << " output_path=float reason=single-head flat YOLO tensor uses runtime float decode\n";
   }
   RknnOutputGuard outputGuard(context_, outputs);
 
@@ -379,7 +406,7 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
     result[i].rawData.resize(outputs[i].size);
     std::memcpy(result[i].rawData.data(), outputs[i].buf, outputs[i].size);
     if (outputs[i].want_float != 0) {
-      const auto count = outputs[i].size / sizeof(float);
+      const auto count = tensorElementCount(result[i]);
       const auto* data = static_cast<const float*>(outputs[i].buf);
       result[i].data.assign(data, data + count);
     }

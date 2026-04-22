@@ -22,6 +22,22 @@ struct DenseOrientationStats {
 constexpr std::size_t kMaxCandidatesBeforeNms = 200;
 constexpr std::size_t kMaxDetectionsAfterNms = 50;
 
+const std::vector<std::string>& coco80Labels() {
+  static const std::vector<std::string> labels = {
+      "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+      "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+      "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+      "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+      "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+      "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+      "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+      "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+      "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+      "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+      "toothbrush"};
+  return labels;
+}
+
 std::vector<std::string> loadLabels(const std::string& path) {
   std::vector<std::string> labels;
   if (path.empty()) return labels;
@@ -248,6 +264,7 @@ std::string YoloPostprocessor::name() const {
 
 const std::vector<std::string>& YoloPostprocessor::labelsForClassCount(int classCount) const {
   if (!options_.labels.empty()) return options_.labels;
+  if (classCount == 80) return coco80Labels();
   if (static_cast<int>(cachedGeneratedLabels_.size()) < classCount) {
     cachedGeneratedLabels_.clear();
     for (int i = 0; i < classCount; ++i) cachedGeneratedLabels_.push_back("class_" + std::to_string(i));
@@ -322,6 +339,9 @@ ModelOutputLayout YoloPostprocessor::inferLayout(const InferenceOutput& output) 
       reason = "single-output shape matches [N,6] end-to-end layout";
       return resolved;
     }
+    // Flat [1,84,8400] exports are not the official RKNN Model Zoo YOLOv8 path.
+    // Keep them on a dedicated decoder so branch-head models stay aligned to the
+    // official Rockchip postprocess semantics.
     resolved = looksLikeYolov8Flat(output.front())
                    ? ModelOutputLayout::kYolov8Flat
                    : ModelOutputLayout::kYolov8Flat;
@@ -489,11 +509,11 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
   struct Branch {
     InferenceTensor box;
     InferenceTensor cls;
-    InferenceTensor score;
+    InferenceTensor scoreSum;
     std::vector<InferenceTensor> aux;
     bool hasBox = false;
     bool hasCls = false;
-    bool hasScore = false;
+    bool hasScoreSum = false;
   };
 
   const int expectedClassChannels = classChannelCount(output);
@@ -512,9 +532,9 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
       branch.hasCls = true;
       continue;
     }
-    if (!branch.hasScore && view.channels == 1) {
-      branch.score = tensor;
-      branch.hasScore = true;
+    if (!branch.hasScoreSum && view.channels == 1) {
+      branch.scoreSum = tensor;
+      branch.hasScoreSum = true;
       continue;
     }
     branch.aux.push_back(tensor);
@@ -524,10 +544,10 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
   for (auto& [_, branch] : branches) {
     if (!branch.hasBox) continue;
     if (!branch.hasCls) {
-      if (branch.hasScore && expectedClassChannels == 1) {
-        branch.cls = branch.score;
+      if (branch.hasScoreSum && expectedClassChannels == 1) {
+        branch.cls = branch.scoreSum;
         branch.hasCls = true;
-        branch.hasScore = false;
+        branch.hasScoreSum = false;
       } else {
         continue;
       }
@@ -535,9 +555,9 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
 
     TensorView boxView{};
     TensorView clsView{};
-    TensorView scoreView{};
+    TensorView scoreSumView{};
     if (!buildTensorView(branch.box, boxView) || !buildTensorView(branch.cls, clsView)) continue;
-    if (branch.hasScore && !buildTensorView(branch.score, scoreView)) continue;
+    if (branch.hasScoreSum && !buildTensorView(branch.scoreSum, scoreSumView)) continue;
 
     const auto& labels = labelsForClassCount(clsView.channels);
     const float strideX = static_cast<float>(modelInput.width) / static_cast<float>(boxView.width);
@@ -545,20 +565,21 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
 
     for (int y = 0; y < boxView.height; ++y) {
       for (int x = 0; x < boxView.width; ++x) {
-        float objectness = 1.0f;
-        if (branch.hasScore) {
-          objectness = tensorValueAt(branch.score, scoreView, 0, y, x);
-          if (objectness > 1.0f || objectness < 0.0f) objectness = sigmoid(objectness);
+        // Official RKNN YOLOv8 uses the optional 1-channel branch as score_sum
+        // for early rejection only. The final detection score is the best class score.
+        if (branch.hasScoreSum) {
+          const float scoreSum = tensorValueAt(branch.scoreSum, scoreSumView, 0, y, x);
+          if (scoreSum < options_.confThreshold) {
+            continue;
+          }
         }
         float bestScore = 0.0f;
         int bestClass = 0;
         for (int c = 0; c < clsView.channels; ++c) {
           float cls = tensorValueAt(branch.cls, clsView, c, y, x);
-          if (cls > 1.0f || cls < 0.0f) cls = sigmoid(cls);
           if (cls > bestScore) { bestScore = cls; bestClass = c; }
         }
-        const float score = bestScore * objectness;
-        if (score < options_.confThreshold) continue;
+        if (bestScore < options_.confThreshold) continue;
         float left = 0.0f, top = 0.0f, right = 0.0f, bottom = 0.0f;
         if (boxView.channels == 4) {
           left = tensorValueAt(branch.box, boxView, 0, y, x);
@@ -587,7 +608,7 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
         const float centerX = (static_cast<float>(x) + 0.5f) * strideX;
         const float centerY = (static_cast<float>(y) + 0.5f) * strideY;
         box.x1 = centerX - left * strideX; box.y1 = centerY - top * strideY; box.x2 = centerX + right * strideX; box.y2 = centerY + bottom * strideY;
-        box.score = score; box.classId = bestClass;
+        box.score = bestScore; box.classId = bestClass;
         if (bestClass >= 0 && bestClass < static_cast<int>(labels.size())) box.label = labels[bestClass];
         boxes.push_back(box);
       }

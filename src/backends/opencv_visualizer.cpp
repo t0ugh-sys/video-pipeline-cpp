@@ -16,6 +16,7 @@ namespace {
 
 constexpr unsigned int COLOR_BLUE = 0xFF0000FFU;
 constexpr unsigned int COLOR_RED = 0xFFFF0000U;
+constexpr unsigned int COLOR_WHITE = 0xFFFFFFFFU;
 constexpr int kModelZooBoxThickness = 3;
 constexpr int kModelZooFontPixelSize = 10;
 
@@ -167,35 +168,18 @@ void drawRectangleC3(
   }
 }
 
-int resizeBilinearC1(
+int resizeNearestC1(
     const unsigned char* srcPixels,
     int srcWidth,
     int srcHeight,
     unsigned char* dstPixels,
     int dstWidth,
     int dstHeight) {
-  const int xRatio = static_cast<int>((static_cast<float>(srcWidth - 1) / dstWidth) * (1 << 16));
-  const int yRatio = static_cast<int>((static_cast<float>(srcHeight - 1) / dstHeight) * (1 << 16));
-
   for (int i = 0; i < dstHeight; ++i) {
+    const int y = std::clamp((i * srcHeight) / dstHeight, 0, srcHeight - 1);
     for (int j = 0; j < dstWidth; ++j) {
-      const int x = (xRatio * j) >> 16;
-      const int y = (yRatio * i) >> 16;
-      const int xDiff = (xRatio * j) & 0xffff;
-      const int yDiff = (yRatio * i) & 0xffff;
-
-      const int index = y * srcWidth + x;
-      const int a = srcPixels[index];
-      const int b = srcPixels[index + 1];
-      const int c = srcPixels[index + srcWidth];
-      const int d = srcPixels[index + srcWidth + 1];
-
-      const std::uint64_t accum =
-          static_cast<std::uint64_t>(a) * static_cast<std::uint64_t>(65536 - xDiff) * static_cast<std::uint64_t>(65536 - yDiff) +
-          static_cast<std::uint64_t>(b) * static_cast<std::uint64_t>(xDiff) * static_cast<std::uint64_t>(65536 - yDiff) +
-          static_cast<std::uint64_t>(c) * static_cast<std::uint64_t>(yDiff) * static_cast<std::uint64_t>(65536 - xDiff) +
-          static_cast<std::uint64_t>(d) * static_cast<std::uint64_t>(xDiff) * static_cast<std::uint64_t>(yDiff);
-      dstPixels[i * dstWidth + j] = static_cast<unsigned char>(accum >> 32);
+      const int x = std::clamp((j * srcWidth) / dstWidth, 0, srcWidth - 1);
+      dstPixels[i * dstWidth + j] = srcPixels[y * srcWidth + x];
     }
   }
 
@@ -235,7 +219,7 @@ void drawTextC3(
       continue;
     }
     const unsigned char* fontBitmap = mono_font_data[fontBitmapIndex];
-    resizeBilinearC1(fontBitmap, 20, 40, resizedFontBitmap.data(), fontPixelSize, fontPixelSize * 2);
+    resizeNearestC1(fontBitmap, 20, 40, resizedFontBitmap.data(), fontPixelSize, fontPixelSize * 2);
 
     for (int j = cursorY; j < cursorY + fontPixelSize * 2; ++j) {
       if (j < 0) {
@@ -257,7 +241,7 @@ void drawTextC3(
           break;
         }
 
-        const unsigned char a = alpha[k - cursorX];
+        const unsigned char a = alpha[k - cursorX] >= 128 ? 255 : 0;
         p[k * 3 + 0] = static_cast<unsigned char>((p[k * 3 + 0] * (255 - a) + penColor[0] * a) / 255);
         p[k * 3 + 1] = static_cast<unsigned char>((p[k * 3 + 1] * (255 - a) + penColor[1] * a) / 255);
         p[k * 3 + 2] = static_cast<unsigned char>((p[k * 3 + 2] * (255 - a) + penColor[2] * a) / 255);
@@ -281,6 +265,20 @@ void drawRectangle(
   }
   const unsigned int drawColor = convertColorRgb888(color);
   drawRectangleC3(image.data.data(), image.width, image.height, x, y, width, height, drawColor, thickness);
+}
+
+void fillLabelBackground(
+    RgbImage& image,
+    int x,
+    int y,
+    int width,
+    int height,
+    unsigned int color) {
+  if (image.data.empty() || image.width <= 0 || image.height <= 0) {
+    return;
+  }
+  const unsigned int drawColor = convertColorRgb888(color);
+  drawRectangleC3(image.data.data(), image.width, image.height, x, y, width, height, drawColor, height);
 }
 
 void drawText(
@@ -354,7 +352,12 @@ class OpenCVVisualizer : public IVisualizer {
         std::snprintf(text, sizeof(text), "%.1f%%", box.score * 100.0f);
       }
       if (text[0] != '\0') {
-        drawText(output, text, x1, y1 - 20, COLOR_RED, kModelZooFontPixelSize);
+        const int textWidth = static_cast<int>(std::strlen(text)) * kModelZooFontPixelSize;
+        const int textHeight = kModelZooFontPixelSize * 2;
+        const int textX = clampValue(x1, 0, std::max(0, output.width - textWidth - 4));
+        const int textY = clampValue(y1 - 20, 0, std::max(0, output.height - textHeight - 2));
+        fillLabelBackground(output, textX, textY, textWidth + 4, textHeight, COLOR_RED);
+        drawText(output, text, textX + 2, textY, COLOR_WHITE, kModelZooFontPixelSize);
       }
     }
 
