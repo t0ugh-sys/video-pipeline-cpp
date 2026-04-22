@@ -1,9 +1,11 @@
 #include "backends/yolo_postproc.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <stdexcept>
@@ -11,6 +13,12 @@
 namespace {
 struct DenseLayout { int proposals = 0; int attributes = 0; bool transposed = false; };
 struct TensorView { const InferenceTensor* tensor = nullptr; int channels = 0; int height = 0; int width = 0; bool nchw = true; };
+struct BranchSummary { int boxCount = 0; int clsCount = 0; int scoreCount = 0; };
+struct DenseOrientationStats {
+  float bestScore = -1.0f;
+  float classMin = std::numeric_limits<float>::infinity();
+  float classMax = -std::numeric_limits<float>::infinity();
+};
 constexpr std::size_t kMaxCandidatesBeforeNms = 200;
 constexpr std::size_t kMaxDetectionsAfterNms = 50;
 
@@ -59,7 +67,123 @@ bool buildTensorView(const InferenceTensor& tensor, TensorView& view) {
   return view.channels > 0 && view.height > 0 && view.width > 0;
 }
 
+bool looksLikeYolo26E2E(const InferenceTensor& tensor) {
+  DenseLayout layout;
+  return buildDenseLayout(tensor, layout) && layout.attributes == 6;
+}
+
+bool looksLikeYolov8Flat(const InferenceTensor& tensor) {
+  DenseLayout layout;
+  if (!buildDenseLayout(tensor, layout)) {
+    return false;
+  }
+  // Typical flat YOLOv8 export:
+  //   [1, 84, 8400] or [1, 8400, 84]
+  // Some variants keep objectness as 85 attrs.
+  return layout.proposals >= 100 && (layout.attributes == 84 || layout.attributes == 85);
+}
+
+std::map<std::pair<int, int>, BranchSummary> summarizeYoloBranches(
+    const InferenceOutput& output,
+    int expectedClassChannels) {
+  std::map<std::pair<int, int>, BranchSummary> summaries;
+  for (const auto& tensor : output) {
+    TensorView view;
+    if (!buildTensorView(tensor, view)) {
+      continue;
+    }
+
+    auto& summary = summaries[{view.height, view.width}];
+    if (view.channels == 1) {
+      summary.scoreCount++;
+    } else if (view.channels == expectedClassChannels) {
+      summary.clsCount++;
+    } else if (view.channels == 4 || (view.channels % 4 == 0 && view.channels <= 64)) {
+      summary.boxCount++;
+    }
+  }
+  return summaries;
+}
+
+ModelOutputLayout inferBranchLayout(const InferenceOutput& output, int expectedClassChannels) {
+  const auto summaries = summarizeYoloBranches(output, expectedClassChannels);
+  if (summaries.empty()) {
+    return output.size() <= 6 ? ModelOutputLayout::kYolov8RknnBranch6
+                              : ModelOutputLayout::kYolov8RknnBranch9;
+  }
+
+  bool allHaveBoxAndCls = true;
+  bool anyHaveScore = false;
+  bool anyMissingScore = false;
+  for (const auto& [_, summary] : summaries) {
+    if (summary.boxCount <= 0 || summary.clsCount <= 0) {
+      allHaveBoxAndCls = false;
+      break;
+    }
+    if (summary.scoreCount > 0) {
+      anyHaveScore = true;
+    } else {
+      anyMissingScore = true;
+    }
+  }
+
+  if (!allHaveBoxAndCls) {
+    return output.size() <= 6 ? ModelOutputLayout::kYolov8RknnBranch6
+                              : ModelOutputLayout::kYolov8RknnBranch9;
+  }
+
+  if (anyHaveScore && !anyMissingScore) {
+    return ModelOutputLayout::kYolov8RknnBranch9;
+  }
+  return ModelOutputLayout::kYolov8RknnBranch6;
+}
+
 float sigmoid(float value) { return 1.0f / (1.0f + std::exp(-value)); }
+
+float denseValueAt(
+    const std::vector<float>& values,
+    int proposals,
+    int attributes,
+    bool transposed,
+    int proposalIndex,
+    int attributeIndex) {
+  return transposed
+      ? values[static_cast<std::size_t>(attributeIndex * proposals + proposalIndex)]
+      : values[static_cast<std::size_t>(proposalIndex * attributes + attributeIndex)];
+}
+
+DenseOrientationStats evaluateDenseOrientation(
+    const std::vector<float>& values,
+    int proposals,
+    int attributes,
+    bool transposed,
+    bool hasObjectness,
+    int classOffset,
+    int classCount) {
+  DenseOrientationStats stats;
+  for (int i = 0; i < proposals; ++i) {
+    float objectness = 1.0f;
+    if (hasObjectness) {
+      objectness = denseValueAt(values, proposals, attributes, transposed, i, 4);
+      if (objectness > 1.0f || objectness < 0.0f) {
+        objectness = sigmoid(objectness);
+      }
+    }
+    float bestScore = 0.0f;
+    for (int c = 0; c < classCount; ++c) {
+      const float rawCls = denseValueAt(values, proposals, attributes, transposed, i, classOffset + c);
+      stats.classMin = std::min(stats.classMin, rawCls);
+      stats.classMax = std::max(stats.classMax, rawCls);
+      float cls = rawCls;
+      if (cls > 1.0f || cls < 0.0f) {
+        cls = sigmoid(cls);
+      }
+      bestScore = std::max(bestScore, cls * objectness);
+    }
+    stats.bestScore = std::max(stats.bestScore, bestScore);
+  }
+  return stats;
+}
 
 float tensorValueAt(const InferenceTensor& tensor, const TensorView& view, int c, int y, int x) {
   const std::size_t index = view.nchw
@@ -184,13 +308,46 @@ int YoloPostprocessor::classChannelCount(const InferenceOutput& output) const {
 }
 
 ModelOutputLayout YoloPostprocessor::inferLayout(const InferenceOutput& output) const {
-  if (options_.outputLayout != ModelOutputLayout::kAuto) return options_.outputLayout;
-  if (output.size() == 1) {
-    DenseLayout layout;
-    if (buildDenseLayout(output.front(), layout) && layout.attributes == 6) return ModelOutputLayout::kYolo26E2E;
-    return ModelOutputLayout::kYolov8Flat;
+  ModelOutputLayout layout = options_.outputLayout;
+  if (layout != ModelOutputLayout::kAuto) {
+    return layout;
   }
-  return output.size() <= 6 ? ModelOutputLayout::kYolov8RknnBranch6 : ModelOutputLayout::kYolov8RknnBranch9;
+
+  ModelOutputLayout resolved = ModelOutputLayout::kYolov8Flat;
+  std::string reason;
+
+  if (output.size() == 1) {
+    if (looksLikeYolo26E2E(output.front())) {
+      const ModelOutputLayout resolved = ModelOutputLayout::kYolo26E2E;
+      reason = "single-output shape matches [N,6] end-to-end layout";
+      return resolved;
+    }
+    resolved = looksLikeYolov8Flat(output.front())
+                   ? ModelOutputLayout::kYolov8Flat
+                   : ModelOutputLayout::kYolov8Flat;
+    reason = "single-output dense proposal tensor";
+  } else {
+    resolved = inferBranchLayout(output, classChannelCount(output));
+    reason = "multi-output branch-head tensor set";
+  }
+
+  if (options_.verbose && !autoLayoutLogged_) {
+    std::cerr << "[POST] auto layout resolved to " << layoutToString(resolved)
+              << " from " << reason;
+    if (!output.empty() && output.size() == 1 && !output.front().shape.empty()) {
+      std::cerr << " [";
+      for (std::size_t i = 0; i < output.front().shape.size(); ++i) {
+        if (i != 0) std::cerr << ", ";
+        std::cerr << output.front().shape[i];
+      }
+      std::cerr << "]";
+    } else {
+      std::cerr << " output_count=" << output.size();
+    }
+    std::cerr << "\n";
+    autoLayoutLogged_ = true;
+  }
+  return resolved;
 }
 
 DetectionResult YoloPostprocessor::postprocess(const InferenceOutput& output, const RgbImage& modelInput, int originalWidth, int originalHeight, int64_t pts) {
@@ -214,10 +371,49 @@ DetectionResult YoloPostprocessor::postprocessDenseTensor(const InferenceTensor&
   const auto& labels = labelsForClassCount(classCount);
   DetectionResult result{pts, {}, originalWidth, originalHeight};
   std::vector<BoundingBox> boxes;
+  const DenseOrientationStats primaryOrientation = evaluateDenseOrientation(
+      values, layout.proposals, layout.attributes, layout.transposed, hasObjectness, classOffset, classCount);
+  const DenseOrientationStats alternateOrientation = evaluateDenseOrientation(
+      values, layout.proposals, layout.attributes, !layout.transposed, hasObjectness, classOffset, classCount);
+  bool useTransposed = layout.transposed;
+  // Some single-head exports report [1,84,8400] but must be read proposal-first.
+  // Prefer the orientation that exposes non-degenerate class channels.
+  const bool primaryLooksDead =
+      primaryOrientation.classMin == 0.0f && primaryOrientation.classMax == 0.0f;
+  const bool alternateHasSignal =
+      alternateOrientation.classMin != 0.0f || alternateOrientation.classMax != 0.0f;
+  if (primaryLooksDead && alternateHasSignal) {
+    useTransposed = !layout.transposed;
+  } else if (alternateOrientation.bestScore > primaryOrientation.bestScore + 1e-5f &&
+             (alternateOrientation.classMax - alternateOrientation.classMin) >
+                 (primaryOrientation.classMax - primaryOrientation.classMin) + 1e-5f) {
+    useTransposed = !layout.transposed;
+  }
   auto proposalValue = [&](int proposalIndex, int attributeIndex) -> float {
-    return layout.transposed ? values[static_cast<std::size_t>(attributeIndex * layout.proposals + proposalIndex)] : values[static_cast<std::size_t>(proposalIndex * layout.attributes + attributeIndex)];
+    return denseValueAt(values, layout.proposals, layout.attributes, useTransposed, proposalIndex, attributeIndex);
   };
+  float debugBestScore = -1.0f;
+  int debugBestProposal = -1;
+  int debugBestClass = -1;
+  float debugBestObjectness = 1.0f;
+  std::array<float, 4> boxMin = {
+      std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::infinity()};
+  std::array<float, 4> boxMax = {
+      -std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity()};
+  float classMin = std::numeric_limits<float>::infinity();
+  float classMax = -std::numeric_limits<float>::infinity();
   for (int i = 0; i < layout.proposals; ++i) {
+    for (int c = 0; c < 4; ++c) {
+      const float value = proposalValue(i, c);
+      boxMin[c] = std::min(boxMin[c], value);
+      boxMax[c] = std::max(boxMax[c], value);
+    }
     float objectness = 1.0f;
     if (hasObjectness) {
       objectness = proposalValue(i, 4);
@@ -226,11 +422,20 @@ DetectionResult YoloPostprocessor::postprocessDenseTensor(const InferenceTensor&
     float bestScore = 0.0f;
     int bestClass = 0;
     for (int c = 0; c < classCount; ++c) {
-      float cls = proposalValue(i, classOffset + c);
+      const float rawCls = proposalValue(i, classOffset + c);
+      classMin = std::min(classMin, rawCls);
+      classMax = std::max(classMax, rawCls);
+      float cls = rawCls;
       if (cls > 1.0f || cls < 0.0f) cls = sigmoid(cls);
       if (cls > bestScore) { bestScore = cls; bestClass = c; }
     }
     const float score = bestScore * objectness;
+    if (score > debugBestScore) {
+      debugBestScore = score;
+      debugBestProposal = i;
+      debugBestClass = bestClass;
+      debugBestObjectness = objectness;
+    }
     if (score < options_.confThreshold) continue;
     float cx = proposalValue(i, 0);
     float cy = proposalValue(i, 1);
@@ -244,6 +449,35 @@ DetectionResult YoloPostprocessor::postprocessDenseTensor(const InferenceTensor&
     box.score = score; box.classId = bestClass;
     if (bestClass >= 0 && bestClass < static_cast<int>(labels.size())) box.label = labels[bestClass];
     boxes.push_back(box);
+  }
+  if (options_.verbose && !denseTensorStatsLogged_) {
+    std::cerr << "[POST] dense tensor stats: proposals=" << layout.proposals
+              << " attrs=" << layout.attributes
+              << " has_objectness=" << (hasObjectness ? "true" : "false")
+              << " orientation=" << (useTransposed ? "attr_first" : "proposal_first")
+              << " best_score=" << debugBestScore
+              << " best_class=" << debugBestClass
+              << " best_proposal=" << debugBestProposal
+              << " best_objectness=" << debugBestObjectness
+              << " box_minmax=["
+              << boxMin[0] << ".." << boxMax[0] << ", "
+              << boxMin[1] << ".." << boxMax[1] << ", "
+              << boxMin[2] << ".." << boxMax[2] << ", "
+              << boxMin[3] << ".." << boxMax[3] << "]"
+              << " class_minmax=[" << classMin << ".." << classMax << "]"
+              << " primary_best=" << primaryOrientation.bestScore
+              << " primary_class_minmax=[" << primaryOrientation.classMin << ".." << primaryOrientation.classMax << "]"
+              << " alternate_best=" << alternateOrientation.bestScore
+              << " alternate_class_minmax=[" << alternateOrientation.classMin << ".." << alternateOrientation.classMax << "]";
+    if (debugBestProposal >= 0) {
+      std::cerr << " raw_box=["
+                << proposalValue(debugBestProposal, 0) << ", "
+                << proposalValue(debugBestProposal, 1) << ", "
+                << proposalValue(debugBestProposal, 2) << ", "
+                << proposalValue(debugBestProposal, 3) << "]";
+    }
+    std::cerr << "\n";
+    denseTensorStatsLogged_ = true;
   }
   boxes = nms(boxes, options_.nmsThreshold);
   mapBoxesToOriginal(boxes, modelInput, originalWidth, originalHeight);
@@ -439,4 +673,20 @@ void YoloPostprocessor::mapBoxesToOriginal(std::vector<BoundingBox>& boxes, cons
     }
   }
   clampBoxes(boxes, originalWidth, originalHeight);
+}
+
+const char* YoloPostprocessor::layoutToString(ModelOutputLayout layout) {
+  switch (layout) {
+    case ModelOutputLayout::kAuto:
+      return "auto";
+    case ModelOutputLayout::kYolov8Flat:
+      return "yolov8_flat_8400x84";
+    case ModelOutputLayout::kYolov8RknnBranch6:
+      return "yolov8_rknn_branch_6";
+    case ModelOutputLayout::kYolov8RknnBranch9:
+      return "yolov8_rknn_branch_9";
+    case ModelOutputLayout::kYolo26E2E:
+      return "yolo26_e2e";
+  }
+  return "unknown";
 }

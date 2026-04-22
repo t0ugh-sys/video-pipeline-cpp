@@ -86,6 +86,15 @@ std::string describeTensorAttr(const rknn_tensor_attr& attr) {
   return stream.str();
 }
 
+const char* toQuantizationName(rknn_tensor_qnt_type type) {
+  switch (type) {
+    case RKNN_TENSOR_QNT_NONE: return "none";
+    case RKNN_TENSOR_QNT_DFP: return "dfp";
+    case RKNN_TENSOR_QNT_AFFINE_ASYMMETRIC: return "affine";
+    default: return "unknown";
+  }
+}
+
 std::vector<std::string> buildStaticFdInputReasons(
     bool isNhwc,
     bool hasNativeInputAttr,
@@ -423,6 +432,18 @@ void RknnInfer::queryTensorInfo() {
   for (std::uint32_t i = 0; i < ioNum.n_output; ++i) {
     rknn_tensor_attr outputAttr = makeTensorAttr(i);
     checkRknnStatus(rknn_query(context_, RKNN_QUERY_OUTPUT_ATTR, &outputAttr, sizeof(outputAttr)), "RKNN_QUERY_OUTPUT_ATTR failed");
+
+    if (verbose_) {
+      std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
+                << "/" << runtime_config_.workerCount
+                << " output_attr[" << i << "] "
+                << describeTensorAttr(outputAttr)
+                << " qnt=" << toQuantizationName(outputAttr.qnt_type)
+                << " zp=" << outputAttr.zp
+                << " scale=" << outputAttr.scale
+                << " name=" << (outputAttr.name[0] != '\0' ? outputAttr.name : ("output_" + std::to_string(i)))
+                << "\n";
+    }
 
     InferenceTensor tensor;
     tensor.name = outputAttr.name[0] != '\0' ? outputAttr.name : ("output_" + std::to_string(i));

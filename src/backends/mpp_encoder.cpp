@@ -123,6 +123,50 @@ void checkAvStatus(int status, const char* message) {
   throw std::runtime_error(std::string(message) + ": " + errorBuffer);
 }
 
+bool hasAnnexBStartCode(const std::uint8_t* data, std::size_t size, std::size_t offset, std::size_t* startCodeSize) {
+  if (offset + 3 <= size &&
+      data[offset] == 0x00 &&
+      data[offset + 1] == 0x00 &&
+      data[offset + 2] == 0x01) {
+    *startCodeSize = 3;
+    return true;
+  }
+  if (offset + 4 <= size &&
+      data[offset] == 0x00 &&
+      data[offset + 1] == 0x00 &&
+      data[offset + 2] == 0x00 &&
+      data[offset + 3] == 0x01) {
+    *startCodeSize = 4;
+    return true;
+  }
+  return false;
+}
+
+bool containsH264IdrNal(const std::uint8_t* data, std::size_t size) {
+  if (data == nullptr || size < 5) {
+    return false;
+  }
+
+  for (std::size_t i = 0; i + 4 <= size; ++i) {
+    std::size_t startCodeSize = 0;
+    if (!hasAnnexBStartCode(data, size, i, &startCodeSize)) {
+      continue;
+    }
+
+    const std::size_t nalOffset = i + startCodeSize;
+    if (nalOffset >= size) {
+      break;
+    }
+
+    const std::uint8_t nalType = data[nalOffset] & 0x1f;
+    if (nalType == 5) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 }  // namespace
 
 MppEncoder::MppEncoder() = default;
@@ -558,6 +602,8 @@ void MppEncoder::writePacket(void* opaquePacket) {
   if (writesMp4Container()) {
     const bool partitioned = mpp_packet_is_partition(packet) != 0;
     const bool endOfFrame = !partitioned || mpp_packet_is_eoi(packet) != 0;
+    // MPP gives Annex-B H.264. Mark IDR access units as keyframes so MP4 seeking stays sane.
+    const bool isKeyframe = containsH264IdrNal(static_cast<const std::uint8_t*>(data), length);
     AVPacket muxPacket;
     av_init_packet(&muxPacket);
     muxPacket.data = static_cast<std::uint8_t*>(data);
@@ -566,7 +612,7 @@ void MppEncoder::writePacket(void* opaquePacket) {
     muxPacket.pts = nextPacketPts_;
     muxPacket.dts = nextPacketPts_;
     muxPacket.duration = endOfFrame ? 1 : 0;
-    muxPacket.flags = 0;
+    muxPacket.flags = isKeyframe ? AV_PKT_FLAG_KEY : 0;
     av_packet_rescale_ts(&muxPacket, AVRational{fpsDen_, fpsNum_}, muxVideoStream_->time_base);
     checkAvStatus(av_interleaved_write_frame(muxFormatContext_, &muxPacket),
                   "av_interleaved_write_frame failed");

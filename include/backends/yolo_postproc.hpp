@@ -47,8 +47,11 @@ class YoloPostprocessor : public IPostprocessor {
       const RgbImage& modelInput,
       int originalWidth,
       int originalHeight);
+  static const char* layoutToString(ModelOutputLayout layout);
 
   YoloVersion version_;
   PostprocessOptions options_;
   mutable std::vector<std::string> cachedGeneratedLabels_;
+  mutable bool autoLayoutLogged_ = false;
+  mutable bool denseTensorStatsLogged_ = false;
 };
