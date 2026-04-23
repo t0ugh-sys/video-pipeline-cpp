@@ -267,20 +267,6 @@ void drawRectangle(
   drawRectangleC3(image.data.data(), image.width, image.height, x, y, width, height, drawColor, thickness);
 }
 
-void fillLabelBackground(
-    RgbImage& image,
-    int x,
-    int y,
-    int width,
-    int height,
-    unsigned int color) {
-  if (image.data.empty() || image.width <= 0 || image.height <= 0) {
-    return;
-  }
-  const unsigned int drawColor = convertColorRgb888(color);
-  drawRectangleC3(image.data.data(), image.width, image.height, x, y, width, height, drawColor, height);
-}
-
 void drawText(
     RgbImage& image,
     const char* text,
@@ -352,12 +338,7 @@ class OpenCVVisualizer : public IVisualizer {
         std::snprintf(text, sizeof(text), "%.1f%%", box.score * 100.0f);
       }
       if (text[0] != '\0') {
-        const int textWidth = static_cast<int>(std::strlen(text)) * kModelZooFontPixelSize;
-        const int textHeight = kModelZooFontPixelSize * 2;
-        const int textX = clampValue(x1, 0, std::max(0, output.width - textWidth - 4));
-        const int textY = clampValue(y1 - 20, 0, std::max(0, output.height - textHeight - 2));
-        fillLabelBackground(output, textX, textY, textWidth + 4, textHeight, COLOR_RED);
-        drawText(output, text, textX + 2, textY, COLOR_WHITE, kModelZooFontPixelSize);
+        drawText(output, text, x1, y1 - 20, COLOR_RED, kModelZooFontPixelSize);
       }
     }
 

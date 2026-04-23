@@ -32,7 +32,7 @@ bool testHelpRequest() {
 bool testBackendAndPositionals() {
   std::vector<std::string> arguments = {
       "video_pipeline", "--backend", "nvidia", "--gpu", "2", "--infer-workers", "3", "--max-frames", "99",
-      "--conf-threshold", "0.3", "--nms-threshold", "0.5", "--labels-path", "labels.txt",
+      "--conf-threshold", "0.3", "--nms-threshold", "0.5", "--postproc", "yolo26", "--labels-path", "labels.txt",
       "--letterbox", "false", "--verbose", "--dump-first-frame", "--model-output-layout",
       "yolov8_rknn_branch_6", "--display", "stream.mp4", "model.engine", "1280", "720"};
   std::vector<char*> argv = makeArgv(arguments);
@@ -46,6 +46,7 @@ bool testBackendAndPositionals() {
          expect(result.config.maxFrames == 99, "expected max frames to be parsed") &&
          expect(result.config.confThreshold == 0.3f, "expected conf threshold to be parsed") &&
          expect(result.config.nmsThreshold == 0.5f, "expected nms threshold to be parsed") &&
+         expect(result.config.postprocBackend == PostprocBackendType::kYolo26, "expected postproc backend to be parsed") &&
          expect(result.config.labelsPath == "labels.txt", "expected labels path to be parsed") &&
          expect(!result.config.letterbox, "expected letterbox override to be parsed") &&
          expect(result.config.verbose, "expected verbose flag to be enabled") &&

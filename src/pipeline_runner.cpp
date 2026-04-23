@@ -235,6 +235,34 @@ bool hasSuffixIgnoreCase(const std::string& value, const std::string& suffix) {
          lowerValue.compare(lowerValue.size() - lowerSuffix.size(), lowerSuffix.size(), lowerSuffix) == 0;
 }
 
+PostprocBackendType resolvePostprocBackend(const AppConfig& config) {
+  if (config.postprocBackend != PostprocBackendType::kAuto) {
+    return config.postprocBackend;
+  }
+
+  if (config.modelOutputLayout == ModelOutputLayout::kYolo26E2E) {
+    return PostprocBackendType::kYolo26;
+  }
+
+  return PostprocBackendType::kYoloV8;
+}
+
+const char* toModelOutputLayoutName(ModelOutputLayout layout) {
+  switch (layout) {
+    case ModelOutputLayout::kAuto:
+      return "auto";
+    case ModelOutputLayout::kYolov8Flat:
+      return "yolov8_flat_8400x84";
+    case ModelOutputLayout::kYolov8RknnBranch6:
+      return "yolov8_rknn_branch_6";
+    case ModelOutputLayout::kYolov8RknnBranch9:
+      return "yolov8_rknn_branch_9";
+    case ModelOutputLayout::kYolo26E2E:
+      return "yolo26_e2e";
+  }
+  return "unknown";
+}
+
 bool wantsHardwareEncodedAnnotatedOutput(const AppConfig& config) {
   if (config.visual.outputVideo.empty()) {
     return false;
@@ -392,21 +420,6 @@ void drawRectangleOnOverlay(
   fillRgbaRect(rgba, imageWidth, imageHeight, x, y + height - thickness, width, thickness, r, g, b, a);
   fillRgbaRect(rgba, imageWidth, imageHeight, x, y, thickness, height, r, g, b, a);
   fillRgbaRect(rgba, imageWidth, imageHeight, x + width - thickness, y, thickness, height, r, g, b, a);
-}
-
-void drawLabelBackgroundOnOverlay(
-    std::vector<std::uint8_t>& rgba,
-    int imageWidth,
-    int imageHeight,
-    int x,
-    int y,
-    int width,
-    int height,
-    std::uint8_t r,
-    std::uint8_t g,
-    std::uint8_t b,
-    std::uint8_t a) {
-  fillRgbaRect(rgba, imageWidth, imageHeight, x, y, width, height, r, g, b, a);
 }
 
 int resizeNearestC1(
@@ -625,33 +638,17 @@ DecodedFrame makeAnnotatedEncodeFrame(
         std::snprintf(text, sizeof(text), "%.1f%%", box.score * 100.0f);
       }
       if (text[0] != '\0') {
-        const int textWidth = static_cast<int>(std::strlen(text)) * kModelZooFontPixelSize;
-        const int textHeight = kModelZooFontPixelSize * 2;
-        const int textX = std::clamp(x1, 0, std::max(0, frame.width - textWidth - 4));
-        const int textY = std::clamp(y1 - 20, 0, std::max(0, frame.height - textHeight - 2));
-        drawLabelBackgroundOnOverlay(
-            overlayData,
-            frame.width,
-            frame.height,
-            textX,
-            textY,
-            textWidth + 4,
-            textHeight,
-            255,
-            0,
-            0,
-            255);
         drawTextOnOverlay(
             overlayData,
             frame.width,
             frame.height,
             text,
-            textX + 2,
-            textY,
+            x1,
+            y1 - 20,
             kModelZooFontPixelSize,
             255,
-            255,
-            255);
+            0,
+            0);
       }
     }
 
@@ -745,7 +742,12 @@ void validateAppConfig(const AppConfig& config) {
   requireCompiledIn(config.decoderBackend, "decoder", isCompiledIn, availableDecoderBackends, toString);
   requireCompiledIn(config.preprocBackend, "preprocessor", isCompiledIn, availablePreprocBackends, toString);
   requireCompiledIn(config.inferBackend, "inference", isCompiledIn, availableInferBackends, toString);
-  requireCompiledIn(config.postprocBackend, "postprocessor", isCompiledIn, availablePostprocBackends, toString);
+  requireCompiledIn(
+      resolvePostprocBackend(config),
+      "postprocessor",
+      isCompiledIn,
+      availablePostprocBackends,
+      toString);
 
   if (!config.visual.outputRtsp.empty()) {
     throw std::runtime_error(
@@ -778,6 +780,14 @@ void runPipeline(const AppConfig& config) {
   const bool needsDisplayFrame = needsVisualizerDraw || config.dumpFirstFrame;
   const std::size_t inferenceQueueCapacity = static_cast<std::size_t>(std::max(2, config.inferWorkers * 2));
   const std::size_t rgaMaxInflightFrames = static_cast<std::size_t>(std::max(1, config.inferWorkers * 2 + 4));
+  const PostprocBackendType resolvedPostprocBackend = resolvePostprocBackend(config);
+
+  if (config.verbose) {
+    std::cerr << "[PIPELINE] postproc requested=" << toString(config.postprocBackend)
+              << " resolved=" << toString(resolvedPostprocBackend)
+              << " model_output_layout=" << toModelOutputLayoutName(config.modelOutputLayout)
+              << " model=" << config.model.modelPath << "\n";
+  }
 
   int inferInputWidth = config.model.inputWidth;
   int inferInputHeight = config.model.inputHeight;
@@ -816,7 +826,7 @@ void runPipeline(const AppConfig& config) {
       try {
         auto infer = createInferBackend(config.inferBackend);
         infer->open(config.model, makeInferRuntimeConfig(config, workerIndex, config.inferWorkers));
-        auto postproc = createPostprocBackend(config.postprocBackend, makePostprocessOptions(config));
+        auto postproc = createPostprocBackend(resolvedPostprocBackend, makePostprocessOptions(config));
 
         PreparedFrame prepared;
         while (preparedQueue.pop(prepared)) {

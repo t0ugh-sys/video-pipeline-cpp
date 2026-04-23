@@ -156,6 +156,23 @@ ModelOutputLayout inferBranchLayout(const InferenceOutput& output, int expectedC
 
 float sigmoid(float value) { return 1.0f / (1.0f + std::exp(-value)); }
 
+float normalizeYolo26Confidence(float value) {
+  if (value > 1.0f && value <= 100.0f) {
+    return value / 100.0f;
+  }
+  if (value > 1.0f || value < 0.0f) {
+    return sigmoid(value);
+  }
+  return value;
+}
+
+bool looksLikeDiscreteClassId(float value, int classCount) {
+  if (value < -0.5f || value > static_cast<float>(classCount) - 0.5f) {
+    return false;
+  }
+  return std::fabs(value - std::round(value)) <= 0.25f;
+}
+
 float denseValueAt(
     const std::vector<float>& values,
     int proposals,
@@ -251,6 +268,37 @@ void clampBoxes(std::vector<BoundingBox>& boxes, int originalWidth, int original
   }
 }
 
+bool yolo26BoxesLookLikeModelContentCoords(
+    const std::vector<BoundingBox>& boxes,
+    const RgbImage& modelInput) {
+  if (boxes.empty()) {
+    return true;
+  }
+  if (!modelInput.letterbox.enabled) {
+    return true;
+  }
+
+  const float contentLeft = static_cast<float>(modelInput.letterbox.padLeft);
+  const float contentTop = static_cast<float>(modelInput.letterbox.padTop);
+  const float contentRight =
+      static_cast<float>(modelInput.letterbox.padLeft + modelInput.letterbox.resizedWidth);
+  const float contentBottom =
+      static_cast<float>(modelInput.letterbox.padTop + modelInput.letterbox.resizedHeight);
+
+  int insideContent = 0;
+  for (const auto& box : boxes) {
+    if (box.x1 >= contentLeft && box.y1 >= contentTop &&
+        box.x2 <= contentRight && box.y2 <= contentBottom) {
+      insideContent++;
+    }
+  }
+
+  // If most boxes already spill outside the resized-content region, they are
+  // unlikely to be model-space letterboxed coordinates and should not go
+  // through the generic letterbox undo path.
+  return insideContent * 2 >= static_cast<int>(boxes.size());
+}
+
 }  // namespace
 
 YoloPostprocessor::YoloPostprocessor(YoloVersion version, PostprocessOptions options)
@@ -339,16 +387,13 @@ ModelOutputLayout YoloPostprocessor::inferLayout(const InferenceOutput& output) 
       reason = "single-output shape matches [N,6] end-to-end layout";
       return resolved;
     }
-    // Flat [1,84,8400] exports are not the official RKNN Model Zoo YOLOv8 path.
-    // Keep them on a dedicated decoder so branch-head models stay aligned to the
-    // official Rockchip postprocess semantics.
-    resolved = looksLikeYolov8Flat(output.front())
-                   ? ModelOutputLayout::kYolov8Flat
-                   : ModelOutputLayout::kYolov8Flat;
-    reason = "single-output dense proposal tensor";
+    resolved = ModelOutputLayout::kYolov8Flat;
+    reason = looksLikeYolov8Flat(output.front())
+                 ? "single-head dense proposal tensor"
+                 : "single-output dense tensor";
   } else {
     resolved = inferBranchLayout(output, classChannelCount(output));
-    reason = "multi-output branch-head tensor set";
+    reason = "multi-head branch tensor set";
   }
 
   if (options_.verbose && !autoLayoutLogged_) {
@@ -371,11 +416,22 @@ ModelOutputLayout YoloPostprocessor::inferLayout(const InferenceOutput& output) 
 }
 
 DetectionResult YoloPostprocessor::postprocess(const InferenceOutput& output, const RgbImage& modelInput, int originalWidth, int originalHeight, int64_t pts) {
-  switch (inferLayout(output)) {
-    case ModelOutputLayout::kYolo26E2E:
-      return postprocessYolo26E2E(output.front(), modelInput, originalWidth, originalHeight, pts);
+  const ModelOutputLayout layout = inferLayout(output);
+  if (layout == ModelOutputLayout::kYolo26E2E) {
+    throw std::runtime_error(
+        "YOLO26 end-to-end [1,300,6] output is currently unsupported in this project. "
+        "Use FP16 YOLO26 or multi-head INT8 exports whose postprocess matches the YOLOv8 path.");
+  }
+  if (layout == ModelOutputLayout::kYolov8Flat && !flatExperimentalLogged_) {
+    std::cerr
+        << "[POST] info: single-head model routed to dense postprocess; "
+           "multi-head RKNN exports use the branch route aligned with RKNN Model Zoo\n";
+    flatExperimentalLogged_ = true;
+  }
+  switch (layout) {
     case ModelOutputLayout::kYolov8Flat:
       return postprocessDenseTensor(output.front(), modelInput, originalWidth, originalHeight, pts);
+    case ModelOutputLayout::kYolo26E2E:
     default:
       return postprocessBranchOutputs(output, modelInput, originalWidth, originalHeight, pts);
   }
@@ -636,24 +692,112 @@ DetectionResult YoloPostprocessor::postprocessYolo26E2E(const InferenceTensor& t
   DenseLayout layout;
   if (!buildDenseLayout(tensor, layout) || layout.attributes != 6) throw std::runtime_error("Unsupported YOLO26 end-to-end tensor shape");
   const auto values = valuesAsFloat(tensor);
-  const auto& labels = labelsForClassCount(1);
+  const auto& labels = labelsForClassCount(80);
   std::vector<BoundingBox> boxes;
   auto proposalValue = [&](int proposalIndex, int attributeIndex) -> float {
-    return layout.transposed ? values[static_cast<std::size_t>(attributeIndex * layout.proposals + proposalIndex)] : values[static_cast<std::size_t>(proposalIndex * layout.attributes + attributeIndex)];
+    return denseValueAt(
+        values,
+        layout.proposals,
+        layout.attributes,
+        layout.transposed,
+        proposalIndex,
+        attributeIndex);
   };
+  float confMin = std::numeric_limits<float>::infinity();
+  float confMax = -std::numeric_limits<float>::infinity();
+  float classMin = std::numeric_limits<float>::infinity();
+  float classMax = -std::numeric_limits<float>::infinity();
+  std::array<float, 4> boxMin = {
+      std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::infinity()};
+  std::array<float, 4> boxMax = {
+      -std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity(),
+      -std::numeric_limits<float>::infinity()};
   for (int i = 0; i < layout.proposals; ++i) {
-    const float conf = proposalValue(i, 4);
+    // The validated RKNN export emits [x1, y1, x2, y2, class, score].
+    const float clsValue = proposalValue(i, 4);
+    const float conf = normalizeYolo26Confidence(proposalValue(i, 5));
+    confMin = std::min(confMin, conf);
+    confMax = std::max(confMax, conf);
+    classMin = std::min(classMin, clsValue);
+    classMax = std::max(classMax, clsValue);
+    for (int c = 0; c < 4; ++c) {
+      const float value = proposalValue(i, c);
+      boxMin[c] = std::min(boxMin[c], value);
+      boxMax[c] = std::max(boxMax[c], value);
+    }
     if (conf < options_.confThreshold) continue;
     BoundingBox box;
-    box.x1 = proposalValue(i, 0); box.y1 = proposalValue(i, 1); box.x2 = proposalValue(i, 2); box.y2 = proposalValue(i, 3);
+    box.x1 = proposalValue(i, 0);
+    box.y1 = proposalValue(i, 1);
+    box.x2 = proposalValue(i, 2);
+    box.y2 = proposalValue(i, 3);
     if (std::max({std::fabs(box.x1), std::fabs(box.y1), std::fabs(box.x2), std::fabs(box.y2)}) <= 2.0f) {
-      box.x1 *= modelInput.width; box.y1 *= modelInput.height; box.x2 *= modelInput.width; box.y2 *= modelInput.height;
+      box.x1 *= modelInput.width;
+      box.y1 *= modelInput.height;
+      box.x2 *= modelInput.width;
+      box.y2 *= modelInput.height;
     }
-    box.score = conf; box.classId = static_cast<int>(proposalValue(i, 5));
+    box.score = conf;
+    box.classId = static_cast<int>(std::round(clsValue));
     if (box.classId >= 0 && box.classId < static_cast<int>(labels.size())) box.label = labels[box.classId];
     boxes.push_back(box);
   }
-  mapBoxesToOriginal(boxes, modelInput, originalWidth, originalHeight);
+  std::sort(boxes.begin(), boxes.end(), [](const BoundingBox& a, const BoundingBox& b) {
+    return a.score > b.score;
+  });
+  if (boxes.size() > kMaxDetectionsAfterNms) {
+    boxes.resize(kMaxDetectionsAfterNms);
+  }
+  if (options_.verbose && !denseTensorStatsLogged_) {
+    std::cerr << "[POST] yolo26 stats: proposals=" << layout.proposals
+              << " conf_minmax=[" << confMin << ".." << confMax << "]"
+              << " class_minmax=[" << classMin << ".." << classMax << "]"
+              << " orientation=" << (layout.transposed ? "attr_first" : "proposal_first")
+              << " class_index=4"
+              << " score_index=5"
+              << " box_minmax=["
+              << boxMin[0] << ".." << boxMax[0] << ", "
+              << boxMin[1] << ".." << boxMax[1] << ", "
+              << boxMin[2] << ".." << boxMax[2] << ", "
+              << boxMin[3] << ".." << boxMax[3] << "]"
+              << " sample0=["
+              << proposalValue(0, 0) << ", "
+              << proposalValue(0, 1) << ", "
+              << proposalValue(0, 2) << ", "
+              << proposalValue(0, 3) << ", "
+              << proposalValue(0, 4) << ", "
+              << proposalValue(0, 5) << "]\n";
+    const std::size_t previewCount = std::min<std::size_t>(boxes.size(), 10);
+    for (std::size_t i = 0; i < previewCount; ++i) {
+      std::cerr << "[POST] yolo26 top" << i
+                << " box=[" << boxes[i].x1 << ", " << boxes[i].y1 << ", "
+                << boxes[i].x2 << ", " << boxes[i].y2 << "]"
+                << " cls=" << boxes[i].classId
+                << " score=" << boxes[i].score
+                << " label=" << boxes[i].label << "\n";
+    }
+    denseTensorStatsLogged_ = true;
+  }
+  const bool mapFromModelCoords = yolo26BoxesLookLikeModelContentCoords(boxes, modelInput);
+  if (options_.verbose) {
+    std::cerr << "[POST] yolo26 coord_space="
+              << (mapFromModelCoords ? "model_letterbox" : "original_like")
+              << " letterbox_enabled=" << (modelInput.letterbox.enabled ? "true" : "false")
+              << " pad_left=" << modelInput.letterbox.padLeft
+              << " pad_top=" << modelInput.letterbox.padTop
+              << " resized=" << modelInput.letterbox.resizedWidth
+              << "x" << modelInput.letterbox.resizedHeight << "\n";
+  }
+  if (mapFromModelCoords) {
+    mapBoxesToOriginal(boxes, modelInput, originalWidth, originalHeight);
+  } else {
+    clampBoxes(boxes, originalWidth, originalHeight);
+  }
   return DetectionResult{pts, std::move(boxes), originalWidth, originalHeight};
 }
 

@@ -68,6 +68,14 @@ OutputOverlayMode parseOutputOverlayMode(const std::string& value) {
   throw std::runtime_error("Unsupported output overlay mode: " + value);
 }
 
+PostprocBackendType parsePostprocBackend(const std::string& value) {
+  if (value == "auto") return PostprocBackendType::kAuto;
+  if (value == "yolov8") return PostprocBackendType::kYoloV8;
+  if (value == "yolo26") return PostprocBackendType::kYolo26;
+  if (value == "yolov5") return PostprocBackendType::kYoloV5;
+  throw std::runtime_error("Unsupported postprocessor backend: " + value);
+}
+
 void applyBackendPreset(const std::string& backendName, AppConfig& config) {
   if (backendName == "rockchip" || backendName == "mpp") {
     config.decoderBackend = DecoderBackendType::kRockchipMpp;
@@ -125,6 +133,7 @@ ParseResult parseAppConfig(int argc, char* argv[]) {
       if (argument == "--max-frames") { config.maxFrames = parseIntValue(requireNextArg(argc, argv, index, "--max-frames"), "--max-frames"); continue; }
       if (argument == "--conf-threshold") { config.confThreshold = parseFloatValue(requireNextArg(argc, argv, index, "--conf-threshold"), "--conf-threshold"); continue; }
       if (argument == "--nms-threshold") { config.nmsThreshold = parseFloatValue(requireNextArg(argc, argv, index, "--nms-threshold"), "--nms-threshold"); continue; }
+      if (argument == "--postproc") { config.postprocBackend = parsePostprocBackend(requireNextArg(argc, argv, index, "--postproc")); continue; }
       if (argument == "--labels-path") { config.labelsPath = requireNextArg(argc, argv, index, "--labels-path"); continue; }
       if (argument == "--letterbox") { config.letterbox = parseBoolValue(requireNextArg(argc, argv, index, "--letterbox"), "--letterbox"); continue; }
       if (argument == "--rknn-zero-copy") { config.rknnZeroCopy = parseBoolValue(requireNextArg(argc, argv, index, "--rknn-zero-copy"), "--rknn-zero-copy"); continue; }
@@ -169,10 +178,11 @@ std::string buildUsageMessage(const std::string& programName) {
   message += "  --max-frames <n>                        Max frames to process (default: 0 = unlimited)\n";
   message += "  --conf-threshold <f>                    Detection confidence threshold\n";
   message += "  --nms-threshold <f>                     NMS IoU threshold\n";
+  message += "  --postproc <auto|yolov8|yolo26|yolov5> Postprocessor backend\n";
   message += "  --labels-path <path>                    Optional labels file path\n";
   message += "  --letterbox <true|false>                Enable letterbox preprocessing\n";
   message += "  --rknn-zero-copy <true|false>           Prefer DMA RGB input for RKNN, fallback to host-copy on failure\n";
-  message += "  --model-output-layout <name>            auto|yolov8_flat_8400x84|yolov8_rknn_branch_6|yolov8_rknn_branch_9|yolo26_e2e\n";
+  message += "  --model-output-layout <name>            auto|yolov8_flat_8400x84|yolov8_rknn_branch_6|yolov8_rknn_branch_9|yolo26_e2e (unsupported)\n";
   message += "  --verbose                               Enable verbose logs\n";
   message += "  --dump-first-frame                      Dump first inference input frame\n";
   message += "  --display                               Enable display window\n";

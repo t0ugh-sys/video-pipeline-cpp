@@ -114,7 +114,7 @@ Options:
   --labels-path <path>                    标签文件
   --letterbox <true|false>                是否启用 letterbox
   --rknn-zero-copy <true|false>           RKNN 优先使用 DMA RGB 输入
-  --model-output-layout <name>            auto|yolov8_flat_8400x84|yolov8_rknn_branch_6|yolov8_rknn_branch_9|yolo26_e2e
+  --model-output-layout <name>            auto|yolov8_flat_8400x84|yolov8_rknn_branch_6|yolov8_rknn_branch_9|yolo26_e2e(当前不支持)
   --verbose                               打开详细日志
   --dump-first-frame                      导出第一帧推理输入
   --display                               打开显示窗口
@@ -222,9 +222,11 @@ vision-inference-pipeline/
 
 | 模型 | 输出格式 | NMS |
 |------|----------|-----|
-| YOLOv8 | (batch, 84, 8400) = 4 bbox + 80 classes | 需要 |
-| YOLO26 (一对一) | (batch, 300, 6) = x1,y1,x2,y2,conf,class | **不需要** |
-| YOLO26 (一对多) | (batch, 84, 8400) | 需要 |
+| YOLOv8 单头 | 单输出 dense tensor，例如 `(batch, 84, 8400)` | 走单头 dense 路线 |
+| YOLOv8 多头 | RKNN Model Zoo 常见 branch outputs | 走多头 branch 路线 |
+| YOLO26 FP16 单头 | 单输出 dense tensor | 走单头 dense 路线 |
+| YOLO26 INT8 多头 | 多个 head 输出，后处理与 YOLOv8 branch 路径一致 | 走多头 branch 路线 |
+| YOLO26 End-to-End | `(batch, 300, 6)` / `yolo26_e2e` | **当前不支持** |
 
 ## 已知限制
 

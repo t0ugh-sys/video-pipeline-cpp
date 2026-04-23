@@ -199,6 +199,22 @@ bool looksLikeFlatYolov8Tensor(const InferenceTensor& tensor) {
   return (dim1 == 84 || dim1 == 85 || dim2 == 84 || dim2 == 85);
 }
 
+bool looksLikeYolo26E2ETensor(const InferenceTensor& tensor) {
+  if (tensor.quantization != TensorQuantizationType::kAffineAsymmetric) {
+    return false;
+  }
+  if (tensor.dataType != TensorDataType::kInt8 && tensor.dataType != TensorDataType::kUint8) {
+    return false;
+  }
+  if (tensor.shape.size() == 3 && tensor.shape[0] == 1) {
+    return tensor.shape[1] == 6 || tensor.shape[2] == 6;
+  }
+  if (tensor.shape.size() == 2) {
+    return tensor.shape[0] == 6 || tensor.shape[1] == 6;
+  }
+  return false;
+}
+
 std::size_t tensorElementCount(const InferenceTensor& tensor) {
   std::size_t count = 1;
   for (const auto dim : tensor.shape) {
@@ -383,15 +399,19 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
   checkRknnStatus(rknn_run(context_, nullptr), "rknn_run failed");
 
   std::vector<rknn_output> outputs(output_templates_.size());
-  const bool useFloatOutputsForFlatSingleHead =
+  const bool useFloatOutputsForFlatSingleOutput =
       output_templates_.size() == 1 && looksLikeFlatYolov8Tensor(output_templates_.front());
   for (std::size_t i = 0; i < outputs.size(); ++i) {
     outputs[i].want_float =
-        (output_templates_[i].dataType == TensorDataType::kFloat32 || useFloatOutputsForFlatSingleHead) ? 1 : 0;
+        (output_templates_[i].dataType == TensorDataType::kFloat32 || useFloatOutputsForFlatSingleOutput) ? 1 : 0;
   }
-  if (verbose_ && useFloatOutputsForFlatSingleHead) {
+  if (verbose_ && useFloatOutputsForFlatSingleOutput) {
     std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
-              << " output_path=float reason=single-head flat YOLO tensor uses runtime float decode\n";
+              << " output_path=float reason=single-output flat YOLO tensor uses runtime float decode\n";
+  }
+  if (verbose_ && output_templates_.size() == 1 && looksLikeYolo26E2ETensor(output_templates_.front())) {
+    std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
+              << " output_path=int8 reason=yolo26_e2e uses postprocess-side affine dequant\n";
   }
   RknnOutputGuard outputGuard(context_, outputs);
 

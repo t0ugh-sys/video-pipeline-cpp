@@ -268,4 +268,21 @@ if(BUILD_TESTING)
     endif()
     target_include_directories(app_config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME app_config_test COMMAND $<TARGET_FILE:app_config_test>)
+
+    if(ENABLE_RKNN_INFER AND OpenCV_FOUND AND NOT WIN32)
+        add_executable(yolo26_dump_raw
+            src/backends/rknn_infer.cpp
+            tests/yolo26_dump_raw.cpp)
+        if(MSVC)
+            set_property(TARGET yolo26_dump_raw PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+        target_include_directories(yolo26_dump_raw PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+            ${RKNN_INCLUDE_DIR}
+            ${OpenCV_INCLUDE_DIRS})
+        target_link_libraries(yolo26_dump_raw PRIVATE ${RKNN_LIBRARY} ${OpenCV_LIBS})
+        set_target_properties(yolo26_dump_raw PROPERTIES
+            BUILD_RPATH "${PROJECT_RKNN_LIBRARY_DIR}"
+            INSTALL_RPATH "${PROJECT_RKNN_LIBRARY_DIR}")
+    endif()
 endif()

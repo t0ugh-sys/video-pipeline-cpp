@@ -54,4 +54,5 @@ class YoloPostprocessor : public IPostprocessor {
   mutable std::vector<std::string> cachedGeneratedLabels_;
   mutable bool autoLayoutLogged_ = false;
   mutable bool denseTensorStatsLogged_ = false;
+  mutable bool flatExperimentalLogged_ = false;
 };
