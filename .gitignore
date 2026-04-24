@@ -1,6 +1,7 @@
 # Build output
 build/
 build-rockchip/
+build-*/
 *.o
 *.obj
 *.so
