@@ -621,29 +621,32 @@ DecodedFrame makeAnnotatedEncodeFrame(
         std::snprintf(text, sizeof(text), "%.1f%%", box.score * 100.0f);
       }
       if (text[0] != '\0') {
-        drawYoloLabelBoxOnOverlay(
-            overlayData,
-            frame.width,
-            frame.height,
-            text,
-            x1,
-            y1,
-            kModelZooFontPixelSize,
-            0,
-            0,
-            255,
-            220);
-        drawTextOnOverlay(
-            overlayData,
-            frame.width,
-            frame.height,
-            text,
-            x1,
-            y1 - 20,
-            kModelZooFontPixelSize,
-            255,
-            0,
-            0);
+        if (config.style == VisualStyle::kYolo) {
+          drawYoloLabelBoxOnOverlay(
+              overlayData,
+              frame.width,
+              frame.height,
+              text,
+              x1,
+              y1,
+              kModelZooFontPixelSize,
+              0,
+              0,
+              255,
+              220);
+        } else {
+          drawTextOnOverlay(
+              overlayData,
+              frame.width,
+              frame.height,
+              text,
+              x1,
+              y1 - 20,
+              kModelZooFontPixelSize,
+              255,
+              0,
+              0);
+        }
       }
     }
 

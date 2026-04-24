@@ -11,6 +11,11 @@ enum class OutputOverlayMode {
   kRga,
 };
 
+enum class VisualStyle {
+  kClassic,
+  kYolo,
+};
+
 /**
  * 可视化输出配置
  */
@@ -23,6 +28,7 @@ struct VisualConfig {
   int displayMaxHeight = 0;      // 显示路径最大高度，0 表示不限制
   bool showLabel = true;         // 显示类别标签
   bool showConf = true;          // 显示置信度
+  VisualStyle style = VisualStyle::kYolo;
   float bboxThickness = 2.0f;    // 框线粗细
   float fontScale = 0.5f;        // 字体大小
 };

@@ -335,8 +335,11 @@ class OpenCVVisualizer : public IVisualizer {
         std::snprintf(text, sizeof(text), "%.1f%%", box.score * 100.0f);
       }
       if (text[0] != '\0') {
-        drawYoloLabelBox(output, text, x1, y1, COLOR_YOLO_LABEL_BG, COLOR_WHITE, kModelZooFontPixelSize);
-        drawText(output, text, x1, y1 - 20, COLOR_RED, kModelZooFontPixelSize);
+        if (config_.style == VisualStyle::kYolo) {
+          drawYoloLabelBox(output, text, x1, y1, COLOR_YOLO_LABEL_BG, COLOR_WHITE, kModelZooFontPixelSize);
+        } else {
+          drawText(output, text, x1, y1 - 20, COLOR_RED, kModelZooFontPixelSize);
+        }
       }
     }
 
