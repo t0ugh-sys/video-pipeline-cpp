@@ -111,18 +111,50 @@ __global__ void nv12ToRgbResizeKernel(
   const int sampleX = min(max(static_cast<int>(srcX), 0), srcWidth - 1);
   const int sampleY = min(max(static_cast<int>(srcYf), 0), srcHeight - 1);
 
-  const float Y = static_cast<float>(srcY[sampleY * srcYStride + sampleX]);
+  const float yValue = static_cast<float>(srcY[sampleY * srcYStride + sampleX]);
   const int uvX = (sampleX / 2) * 2;
   const int uvY = sampleY / 2;
   const int uvIndex = uvY * srcUvStride + uvX;
-  const float U = static_cast<float>(srcUv[uvIndex]) - 128.0f;
-  const float V = static_cast<float>(srcUv[uvIndex + 1]) - 128.0f;
-  const float C = max(0.0f, Y - 16.0f);
+  const float uValue = static_cast<float>(srcUv[uvIndex]) - 128.0f;
+  const float vValue = static_cast<float>(srcUv[uvIndex + 1]) - 128.0f;
+  const float c = max(0.0f, yValue - 16.0f);
 
   const std::size_t dstIndex = static_cast<std::size_t>((y * dstWidth + x) * 3);
-  dstRgb[dstIndex + 0] = clampDevice(1.164f * C + 1.596f * V);
-  dstRgb[dstIndex + 1] = clampDevice(1.164f * C - 0.392f * U - 0.813f * V);
-  dstRgb[dstIndex + 2] = clampDevice(1.164f * C + 2.017f * U);
+  dstRgb[dstIndex + 0] = clampDevice(1.164f * c + 1.596f * vValue);
+  dstRgb[dstIndex + 1] = clampDevice(1.164f * c - 0.392f * uValue - 0.813f * vValue);
+  dstRgb[dstIndex + 2] = clampDevice(1.164f * c + 2.017f * uValue);
+}
+
+__global__ void letterboxRgbKernel(
+    const std::uint8_t* srcRgb,
+    int srcWidth,
+    int srcHeight,
+    std::uint8_t* dstRgb,
+    int dstWidth,
+    int dstHeight,
+    int padLeft,
+    int padTop,
+    std::uint8_t paddingValue) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x;
+  const int y = blockIdx.y * blockDim.y + threadIdx.y;
+  if (x >= dstWidth || y >= dstHeight) {
+    return;
+  }
+
+  const std::size_t dstIndex = static_cast<std::size_t>((y * dstWidth + x) * 3);
+  const int srcX = x - padLeft;
+  const int srcY = y - padTop;
+  if (srcX < 0 || srcX >= srcWidth || srcY < 0 || srcY >= srcHeight) {
+    dstRgb[dstIndex + 0] = paddingValue;
+    dstRgb[dstIndex + 1] = paddingValue;
+    dstRgb[dstIndex + 2] = paddingValue;
+    return;
+  }
+
+  const std::size_t srcIndex = static_cast<std::size_t>((srcY * srcWidth + srcX) * 3);
+  dstRgb[dstIndex + 0] = srcRgb[srcIndex + 0];
+  dstRgb[dstIndex + 1] = srcRgb[srcIndex + 1];
+  dstRgb[dstIndex + 2] = srcRgb[srcIndex + 2];
 }
 
 std::vector<std::uint8_t> convertOnCpu(
@@ -134,7 +166,6 @@ std::vector<std::uint8_t> convertOnCpu(
   }
 
   std::vector<std::uint8_t> output(static_cast<std::size_t>(outputWidth * outputHeight * 3));
-
   const int srcWidth = frame.width;
   const int srcHeight = frame.height;
   const int srcStride = frame.horizontalStride;
@@ -148,7 +179,7 @@ std::vector<std::uint8_t> convertOnCpu(
       const int x0 = std::clamp(static_cast<int>(srcX), 0, srcWidth - 1);
       const int y0 = std::clamp(static_cast<int>(srcY), 0, srcHeight - 1);
 
-      const float Y = static_cast<float>(frame.yData[static_cast<std::size_t>(y0 * srcStride + x0)]);
+      const float yValue = static_cast<float>(frame.yData[static_cast<std::size_t>(y0 * srcStride + x0)]);
       const int uvX = (x0 / 2) * 2;
       const int uvY = y0 / 2;
       const std::size_t uvIndex = static_cast<std::size_t>(uvY * uvStride + uvX);
@@ -156,18 +187,26 @@ std::vector<std::uint8_t> convertOnCpu(
         throw std::runtime_error("CUDA preprocessor received truncated UV data");
       }
 
-      const float U = static_cast<float>(frame.uvData[uvIndex]) - 128.0f;
-      const float V = static_cast<float>(frame.uvData[uvIndex + 1]) - 128.0f;
-      const float C = std::max(0.0f, Y - 16.0f);
+      const float uValue = static_cast<float>(frame.uvData[uvIndex]) - 128.0f;
+      const float vValue = static_cast<float>(frame.uvData[uvIndex + 1]) - 128.0f;
+      const float c = std::max(0.0f, yValue - 16.0f);
 
       const std::size_t outputIndex = static_cast<std::size_t>((y * outputWidth + x) * 3);
-      output[outputIndex + 0] = clampToByte(1.164f * C + 1.596f * V);
-      output[outputIndex + 1] = clampToByte(1.164f * C - 0.392f * U - 0.813f * V);
-      output[outputIndex + 2] = clampToByte(1.164f * C + 2.017f * U);
+      output[outputIndex + 0] = clampToByte(1.164f * c + 1.596f * vValue);
+      output[outputIndex + 1] = clampToByte(1.164f * c - 0.392f * uValue - 0.813f * vValue);
+      output[outputIndex + 2] = clampToByte(1.164f * c + 2.017f * uValue);
     }
   }
 
   return output;
+}
+
+std::shared_ptr<void> makeCudaBufferOwner(void* devicePtr) {
+  return std::shared_ptr<void>(devicePtr, [](void* ptr) {
+    if (ptr != nullptr) {
+      cudaFree(ptr);
+    }
+  });
 }
 
 }  // namespace
@@ -198,49 +237,88 @@ RgbImage CudaPreprocessor::convertAndResize(
   RgbImage output;
   output.width = outputWidth;
   output.height = outputHeight;
+  output.wstride = outputWidth;
+  output.hstride = outputHeight;
   output.format = PixelFormat::kRgb888;
   output.letterbox = plan.letterbox;
-  output.data.resize(static_cast<std::size_t>(outputWidth * outputHeight * 3));
 
-  std::vector<std::uint8_t> resizedRgb;
   if (!frame.isOnDevice) {
-    resizedRgb = convertOnCpu(frame, plan.resizedWidth, plan.resizedHeight);
-  } else {
-    if (frame.deviceY == 0 || frame.deviceUv == 0) {
-      throw std::runtime_error("CUDA preprocessor received an invalid device NV12 frame");
+    output.data.resize(static_cast<std::size_t>(outputWidth * outputHeight * 3));
+    std::vector<std::uint8_t> resizedRgb = convertOnCpu(frame, plan.resizedWidth, plan.resizedHeight);
+    if (plan.letterbox.enabled) {
+      copyIntoLetterboxedOutput(
+          resizedRgb, plan.resizedWidth, plan.resizedHeight, plan, options.paddingValue, output);
+    } else {
+      output.data = std::move(resizedRgb);
     }
-
-    resizedRgb.resize(static_cast<std::size_t>(plan.resizedWidth * plan.resizedHeight * 3));
-    std::uint8_t* deviceOutput = nullptr;
-    const std::size_t outputBytes = resizedRgb.size();
-    checkCudaStatus(cudaMalloc(&deviceOutput, outputBytes), "Failed to allocate CUDA RGB output buffer");
-
-    const dim3 block(16, 16);
-    const dim3 grid(
-        static_cast<unsigned int>((plan.resizedWidth + block.x - 1) / block.x),
-        static_cast<unsigned int>((plan.resizedHeight + block.y - 1) / block.y));
-    nv12ToRgbResizeKernel<<<grid, block>>>(
-        reinterpret_cast<const std::uint8_t*>(frame.deviceY),
-        reinterpret_cast<const std::uint8_t*>(frame.deviceUv),
-        frame.width,
-        frame.height,
-        frame.horizontalStride,
-        frame.chromaStride > 0 ? frame.chromaStride : frame.horizontalStride,
-        deviceOutput,
-        plan.resizedWidth,
-        plan.resizedHeight);
-    checkCudaStatus(cudaGetLastError(), "Failed to launch NV12->RGB CUDA kernel");
-    checkCudaStatus(cudaDeviceSynchronize(), "NV12->RGB CUDA kernel failed");
-    checkCudaStatus(
-        cudaMemcpy(resizedRgb.data(), deviceOutput, outputBytes, cudaMemcpyDeviceToHost),
-        "Failed to copy CUDA RGB output to host");
-    checkCudaStatus(cudaFree(deviceOutput), "Failed to release CUDA RGB output buffer");
+    return output;
   }
 
+  if (frame.deviceY == 0 || frame.deviceUv == 0) {
+    throw std::runtime_error("CUDA preprocessor received an invalid device NV12 frame");
+  }
+
+  std::uint8_t* resizedDevice = nullptr;
+  const std::size_t resizedBytes =
+      static_cast<std::size_t>(plan.resizedWidth) * static_cast<std::size_t>(plan.resizedHeight) * 3;
+  checkCudaStatus(cudaMalloc(&resizedDevice, resizedBytes), "Failed to allocate CUDA resized RGB buffer");
+
+  const dim3 block(16, 16);
+  const dim3 resizedGrid(
+      static_cast<unsigned int>((plan.resizedWidth + block.x - 1) / block.x),
+      static_cast<unsigned int>((plan.resizedHeight + block.y - 1) / block.y));
+  nv12ToRgbResizeKernel<<<resizedGrid, block>>>(
+      reinterpret_cast<const std::uint8_t*>(frame.deviceY),
+      reinterpret_cast<const std::uint8_t*>(frame.deviceUv),
+      frame.width,
+      frame.height,
+      frame.horizontalStride,
+      frame.chromaStride > 0 ? frame.chromaStride : frame.horizontalStride,
+      resizedDevice,
+      plan.resizedWidth,
+      plan.resizedHeight);
+  checkCudaStatus(cudaGetLastError(), "Failed to launch NV12->RGB CUDA kernel");
+
+  std::uint8_t* finalDevice = resizedDevice;
+  std::shared_ptr<void> finalOwner = makeCudaBufferOwner(resizedDevice);
+  std::size_t finalBytes = resizedBytes;
   if (plan.letterbox.enabled) {
-    copyIntoLetterboxedOutput(resizedRgb, plan.resizedWidth, plan.resizedHeight, plan, options.paddingValue, output);
-  } else {
-    output.data = std::move(resizedRgb);
+    std::uint8_t* letterboxedDevice = nullptr;
+    finalBytes = static_cast<std::size_t>(outputWidth) * static_cast<std::size_t>(outputHeight) * 3;
+    checkCudaStatus(
+        cudaMalloc(&letterboxedDevice, finalBytes),
+        "Failed to allocate CUDA letterboxed RGB buffer");
+    const dim3 dstGrid(
+        static_cast<unsigned int>((outputWidth + block.x - 1) / block.x),
+        static_cast<unsigned int>((outputHeight + block.y - 1) / block.y));
+    letterboxRgbKernel<<<dstGrid, block>>>(
+        resizedDevice,
+        plan.resizedWidth,
+        plan.resizedHeight,
+        letterboxedDevice,
+        outputWidth,
+        outputHeight,
+        plan.letterbox.padLeft,
+        plan.letterbox.padTop,
+        options.paddingValue);
+    checkCudaStatus(cudaGetLastError(), "Failed to launch CUDA letterbox kernel");
+    checkCudaStatus(cudaFree(resizedDevice), "Failed to free temporary CUDA resized RGB buffer");
+    finalDevice = letterboxedDevice;
+    finalOwner = makeCudaBufferOwner(letterboxedDevice);
+  }
+
+  checkCudaStatus(cudaDeviceSynchronize(), "CUDA preprocessing failed");
+
+  output.isOnDevice = true;
+  output.devicePtr = reinterpret_cast<std::uintptr_t>(finalDevice);
+  output.nativeHandle = finalOwner;
+  output.dmaSize = finalBytes;
+
+  if (options.needsCpuData) {
+    output.data.resize(finalBytes);
+    checkCudaStatus(
+        cudaMemcpy(output.data.data(), finalDevice, finalBytes, cudaMemcpyDeviceToHost),
+        "Failed to copy CUDA RGB output to host");
   }
 
   return output;

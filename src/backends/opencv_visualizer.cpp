@@ -2,8 +2,6 @@
 
 #include <opencv2/opencv.hpp>
 
-#include "../../../rknn_model_zoo/utils/font.h"
-
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -17,6 +15,7 @@ namespace {
 constexpr unsigned int COLOR_BLUE = 0xFF0000FFU;
 constexpr unsigned int COLOR_RED = 0xFFFF0000U;
 constexpr unsigned int COLOR_WHITE = 0xFFFFFFFFU;
+constexpr unsigned int COLOR_YOLO_LABEL_BG = 0xFF0000FFU;
 constexpr int kModelZooBoxThickness = 3;
 constexpr int kModelZooFontPixelSize = 10;
 
@@ -168,24 +167,6 @@ void drawRectangleC3(
   }
 }
 
-int resizeNearestC1(
-    const unsigned char* srcPixels,
-    int srcWidth,
-    int srcHeight,
-    unsigned char* dstPixels,
-    int dstWidth,
-    int dstHeight) {
-  for (int i = 0; i < dstHeight; ++i) {
-    const int y = std::clamp((i * srcHeight) / dstHeight, 0, srcHeight - 1);
-    for (int j = 0; j < dstWidth; ++j) {
-      const int x = std::clamp((j * srcWidth) / dstWidth, 0, srcWidth - 1);
-      dstPixels[i * dstWidth + j] = srcPixels[y * srcWidth + x];
-    }
-  }
-
-  return 0;
-}
-
 void drawTextC3(
     unsigned char* pixels,
     int width,
@@ -195,61 +176,22 @@ void drawTextC3(
     int y,
     int fontPixelSize,
     unsigned int color) {
-  const unsigned char* penColor = reinterpret_cast<unsigned char*>(&color);
-  const int stride = width * 3;
-  std::vector<unsigned char> resizedFontBitmap(
-      static_cast<std::size_t>(fontPixelSize * fontPixelSize * 2));
-
-  const int n = static_cast<int>(std::strlen(text));
-  int cursorX = x;
-  int cursorY = y;
-  for (int i = 0; i < n; ++i) {
-    const char ch = text[i];
-    if (ch == '\n') {
-      cursorX = x;
-      cursorY += fontPixelSize * 2;
-      continue;
-    }
-    if (std::isprint(static_cast<unsigned char>(ch)) == 0) {
-      continue;
-    }
-
-    const int fontBitmapIndex = ch - ' ';
-    if (fontBitmapIndex < 0 || fontBitmapIndex >= 95) {
-      continue;
-    }
-    const unsigned char* fontBitmap = mono_font_data[fontBitmapIndex];
-    resizeNearestC1(fontBitmap, 20, 40, resizedFontBitmap.data(), fontPixelSize, fontPixelSize * 2);
-
-    for (int j = cursorY; j < cursorY + fontPixelSize * 2; ++j) {
-      if (j < 0) {
-        continue;
-      }
-      if (j >= height) {
-        break;
-      }
-
-      const unsigned char* alpha = resizedFontBitmap.data() +
-          static_cast<std::size_t>(j - cursorY) * fontPixelSize;
-      unsigned char* p = pixels + stride * j;
-
-      for (int k = cursorX; k < cursorX + fontPixelSize; ++k) {
-        if (k < 0) {
-          continue;
-        }
-        if (k >= width) {
-          break;
-        }
-
-        const unsigned char a = alpha[k - cursorX] >= 128 ? 255 : 0;
-        p[k * 3 + 0] = static_cast<unsigned char>((p[k * 3 + 0] * (255 - a) + penColor[0] * a) / 255);
-        p[k * 3 + 1] = static_cast<unsigned char>((p[k * 3 + 1] * (255 - a) + penColor[1] * a) / 255);
-        p[k * 3 + 2] = static_cast<unsigned char>((p[k * 3 + 2] * (255 - a) + penColor[2] * a) / 255);
-      }
-    }
-
-    cursorX += fontPixelSize;
-  }
+  cv::Mat rgb(height, width, CV_8UC3, pixels);
+  const cv::Scalar drawColor(
+      static_cast<double>(color & 0xFFu),
+      static_cast<double>((color >> 8) & 0xFFu),
+      static_cast<double>((color >> 16) & 0xFFu));
+  const double fontScale = std::max(0.3, static_cast<double>(fontPixelSize) / 20.0);
+  const int thickness = std::max(1, fontPixelSize / 6);
+  cv::putText(
+      rgb,
+      text,
+      cv::Point(x, std::max(fontPixelSize, y + fontPixelSize)),
+      cv::FONT_HERSHEY_SIMPLEX,
+      fontScale,
+      drawColor,
+      thickness,
+      cv::LINE_AA);
 }
 
 void drawRectangle(
@@ -279,6 +221,61 @@ void drawText(
   }
   const unsigned int drawColor = convertColorRgb888(color);
   drawTextC3(image.data.data(), image.width, image.height, text, x, y, fontPixelSize, drawColor);
+}
+
+void drawYoloLabelBox(
+    RgbImage& image,
+    const char* text,
+    int anchorX,
+    int anchorY,
+    unsigned int backgroundColor,
+    unsigned int textColor,
+    int fontPixelSize) {
+  if (image.data.empty() || image.width <= 0 || image.height <= 0 || text == nullptr || text[0] == '\0') {
+    return;
+  }
+
+  cv::Mat rgb(image.height, image.width, CV_8UC3, image.data.data());
+  const double fontScale = std::max(0.3, static_cast<double>(fontPixelSize) / 20.0);
+  const int textThickness = std::max(1, fontPixelSize / 6);
+  int baseline = 0;
+  const cv::Size textSize =
+      cv::getTextSize(text, cv::FONT_HERSHEY_SIMPLEX, fontScale, textThickness, &baseline);
+
+  const int padX = std::max(4, fontPixelSize / 2);
+  const int padY = std::max(3, fontPixelSize / 3);
+  int labelX = std::clamp(anchorX, 0, std::max(0, image.width - 1));
+  int labelY = anchorY - textSize.height - baseline - padY * 2;
+  if (labelY < 0) {
+    labelY = std::clamp(anchorY + 1, 0, std::max(0, image.height - 1));
+  }
+
+  const int labelWidth = std::min(image.width - labelX, textSize.width + padX * 2);
+  const int labelHeight = std::min(std::max(1, image.height - labelY), textSize.height + baseline + padY * 2);
+  if (labelWidth <= 0 || labelHeight <= 0) {
+    return;
+  }
+
+  const cv::Rect labelRect(labelX, labelY, labelWidth, labelHeight);
+  const cv::Scalar bg(
+      static_cast<double>(backgroundColor & 0xFFu),
+      static_cast<double>((backgroundColor >> 8) & 0xFFu),
+      static_cast<double>((backgroundColor >> 16) & 0xFFu));
+  const cv::Scalar fg(
+      static_cast<double>(textColor & 0xFFu),
+      static_cast<double>((textColor >> 8) & 0xFFu),
+      static_cast<double>((textColor >> 16) & 0xFFu));
+
+  cv::rectangle(rgb, labelRect, bg, cv::FILLED);
+  cv::putText(
+      rgb,
+      text,
+      cv::Point(labelX + padX, labelY + padY + textSize.height),
+      cv::FONT_HERSHEY_SIMPLEX,
+      fontScale,
+      fg,
+      textThickness,
+      cv::LINE_AA);
 }
 
 cv::Mat rgbImageToMat(const RgbImage& frame) {
@@ -338,6 +335,7 @@ class OpenCVVisualizer : public IVisualizer {
         std::snprintf(text, sizeof(text), "%.1f%%", box.score * 100.0f);
       }
       if (text[0] != '\0') {
+        drawYoloLabelBox(output, text, x1, y1, COLOR_YOLO_LABEL_BG, COLOR_WHITE, kModelZooFontPixelSize);
         drawText(output, text, x1, y1 - 20, COLOR_RED, kModelZooFontPixelSize);
       }
     }

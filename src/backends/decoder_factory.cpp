@@ -12,7 +12,11 @@
 #include <stdexcept>
 
 DecoderBackendType detectAvailableDecoderBackend() {
-#if defined(ENABLE_MPP_DECODER)
+#if defined(ENABLE_NVDEC_DECODER) && defined(NVIDIA_PLATFORM)
+  return DecoderBackendType::kNvidiaNvdec;
+#elif defined(ENABLE_MPP_DECODER) && defined(ROCKCHIP_PLATFORM)
+  return DecoderBackendType::kRockchipMpp;
+#elif defined(ENABLE_MPP_DECODER)
   return DecoderBackendType::kRockchipMpp;
 #elif defined(ENABLE_NVDEC_DECODER)
   return DecoderBackendType::kNvidiaNvdec;

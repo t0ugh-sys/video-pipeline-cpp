@@ -2,8 +2,11 @@
 
 #include "encoder_interface.hpp"
 
+#include <cstdio>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
 #include <libavutil/buffer.h>
 }
 
@@ -24,14 +27,13 @@ class NvencEncoder : public IEncoderBackend {
   std::string name() const override { return "NVENC"; }
 
  private:
-  void checkAvStatus(int status, const char* message);
-
   AVCodecContext* codecCtx_ = nullptr;
+  AVFormatContext* formatCtx_ = nullptr;
+  AVStream* stream_ = nullptr;
   AVFrame* swFrame_ = nullptr;
   AVFrame* hwFrame_ = nullptr;
   AVBufferRef* hwDeviceCtx_ = nullptr;
   AVBufferRef* hwFramesCtx_ = nullptr;
-  FILE* outputFile_ = nullptr;
   bool initialized_ = false;
   int width_ = 0;
   int height_ = 0;

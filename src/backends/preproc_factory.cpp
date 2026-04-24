@@ -12,7 +12,11 @@
 #include <stdexcept>
 
 PreprocBackendType detectAvailablePreprocBackend() {
-#if defined(ENABLE_RGA_PREPROC)
+#if defined(ENABLE_CUDA_PREPROC) && defined(NVIDIA_PLATFORM)
+  return PreprocBackendType::kNvidiaCuda;
+#elif defined(ENABLE_RGA_PREPROC) && defined(ROCKCHIP_PLATFORM)
+  return PreprocBackendType::kRockchipRga;
+#elif defined(ENABLE_RGA_PREPROC)
   return PreprocBackendType::kRockchipRga;
 #elif defined(ENABLE_CUDA_PREPROC)
   return PreprocBackendType::kNvidiaCuda;

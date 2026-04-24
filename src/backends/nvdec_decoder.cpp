@@ -173,10 +173,26 @@ std::optional<DecodedFrame> NvdecDecoder::receiveFrame() {
   output.verticalStride = frame->height;
   output.chromaStride = frame->linesize[1] > 0 ? frame->linesize[1] : frame->linesize[0];
   output.format = PixelFormat::kNv12;
+  output.nativeFormat = frame->format;
   output.pts = frame->pts;
   output.dmaFd = -1;
 
   if (frame->format == AV_PIX_FMT_CUDA) {
+    if (frame->hw_frames_ctx == nullptr) {
+      av_frame_free(&frame);
+      throw std::runtime_error("NVDEC returned a CUDA frame without hw_frames_ctx");
+    }
+    const auto* framesCtx =
+        reinterpret_cast<const AVHWFramesContext*>(frame->hw_frames_ctx->data);
+    if (framesCtx == nullptr || framesCtx->sw_format != AV_PIX_FMT_NV12) {
+      av_frame_free(&frame);
+      throw std::runtime_error("NVDEC returned an unsupported CUDA surface format");
+    }
+    if (frame->data[0] == nullptr || frame->data[1] == nullptr) {
+      av_frame_free(&frame);
+      throw std::runtime_error("NVDEC returned an incomplete CUDA NV12 frame");
+    }
+
     AVFrame* retainedFrame = av_frame_clone(frame);
     if (!retainedFrame) {
       av_frame_free(&frame);

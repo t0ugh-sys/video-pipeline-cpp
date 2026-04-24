@@ -11,7 +11,11 @@
 #endif
 
 EncoderBackendType detectAvailableEncoderBackend() {
-#if defined(ENABLE_MPP_ENCODER)
+#if defined(ENABLE_NVENC_ENCODER) && defined(NVIDIA_PLATFORM)
+  return EncoderBackendType::kNvidiaNvEnc;
+#elif defined(ENABLE_MPP_ENCODER) && defined(ROCKCHIP_PLATFORM)
+  return EncoderBackendType::kRockchipMpp;
+#elif defined(ENABLE_MPP_ENCODER)
   return EncoderBackendType::kRockchipMpp;
 #elif defined(ENABLE_NVENC_ENCODER)
   return EncoderBackendType::kNvidiaNvEnc;

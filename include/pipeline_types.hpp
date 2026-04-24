@@ -74,6 +74,8 @@ struct RgbImage {
   int hstride = 0;
   int dmaFd = -1;
   std::size_t dmaSize = 0;
+  bool isOnDevice = false;
+  std::uintptr_t devicePtr = 0;
   PixelFormat format = PixelFormat::kRgb888;
   LetterboxInfo letterbox;
   std::shared_ptr<void> nativeHandle;

@@ -9,8 +9,6 @@
 #include "preproc_interface.hpp"
 #include "visualizer.hpp"
 
-#include "../../rknn_model_zoo/utils/font.h"
-
 #if defined(ENABLE_RGA_PREPROC) && !defined(WIN32)
 extern "C" {
 #include <mpp_buffer.h>
@@ -280,6 +278,10 @@ bool usesRgaAnnotatedOutput(const AppConfig& config) {
          config.visual.outputOverlayMode == OutputOverlayMode::kRga;
 }
 
+bool backendUsesNvidiaEncoder() {
+  return detectAvailableEncoderBackend() == EncoderBackendType::kNvidiaNvEnc;
+}
+
 int resolveEncoderFps(const AppConfig& config, const SourceVideoInfo& sourceVideoInfo) {
   if (config.encoderFps > 0) {
     return config.encoderFps;
@@ -422,24 +424,6 @@ void drawRectangleOnOverlay(
   fillRgbaRect(rgba, imageWidth, imageHeight, x + width - thickness, y, thickness, height, r, g, b, a);
 }
 
-int resizeNearestC1(
-    const unsigned char* srcPixels,
-    int srcWidth,
-    int srcHeight,
-    unsigned char* dstPixels,
-    int dstWidth,
-    int dstHeight) {
-  for (int i = 0; i < dstHeight; ++i) {
-    const int y = std::clamp((i * srcHeight) / dstHeight, 0, srcHeight - 1);
-    for (int j = 0; j < dstWidth; ++j) {
-      const int x = std::clamp((j * srcWidth) / dstWidth, 0, srcWidth - 1);
-      dstPixels[i * dstWidth + j] = srcPixels[y * srcWidth + x];
-    }
-  }
-
-  return 0;
-}
-
 void drawTextOnOverlay(
     std::vector<std::uint8_t>& rgba,
     int width,
@@ -451,60 +435,59 @@ void drawTextOnOverlay(
     std::uint8_t r,
     std::uint8_t g,
     std::uint8_t b) {
-  std::vector<unsigned char> resizedFontBitmap(
-      static_cast<std::size_t>(fontPixelSize * fontPixelSize * 2));
+  (void)rgba;
+  (void)width;
+  (void)height;
+  (void)text;
+  (void)x;
+  (void)y;
+  (void)fontPixelSize;
+  (void)r;
+  (void)g;
+  (void)b;
+}
 
-  const int n = static_cast<int>(std::strlen(text));
-  int cursorX = x;
-  int cursorY = y;
-  for (int i = 0; i < n; ++i) {
-    const char ch = text[i];
-    if (ch == '\n') {
-      cursorX = x;
-      cursorY += fontPixelSize * 2;
-      continue;
-    }
-    if (std::isprint(static_cast<unsigned char>(ch)) == 0) {
-      continue;
-    }
-
-    const int fontBitmapIndex = ch - ' ';
-    if (fontBitmapIndex < 0 || fontBitmapIndex >= 95) {
-      continue;
-    }
-    const unsigned char* fontBitmap = mono_font_data[fontBitmapIndex];
-    resizeNearestC1(fontBitmap, 20, 40, resizedFontBitmap.data(), fontPixelSize, fontPixelSize * 2);
-
-    for (int yy = cursorY; yy < cursorY + fontPixelSize * 2; ++yy) {
-      if (yy < 0) {
-        continue;
-      }
-      if (yy >= height) {
-        break;
-      }
-
-      const unsigned char* alpha = resizedFontBitmap.data() +
-          static_cast<std::size_t>(yy - cursorY) * fontPixelSize;
-      for (int xx = cursorX; xx < cursorX + fontPixelSize; ++xx) {
-        if (xx < 0) {
-          continue;
-        }
-        if (xx >= width) {
-          break;
-        }
-
-        const unsigned char a = alpha[xx - cursorX] >= 128 ? 255 : 0;
-        const std::size_t offset =
-            static_cast<std::size_t>((yy * width + xx) * 4);
-        rgba[offset + 0] = static_cast<unsigned char>((rgba[offset + 0] * (255 - a) + r * a) / 255);
-        rgba[offset + 1] = static_cast<unsigned char>((rgba[offset + 1] * (255 - a) + g * a) / 255);
-        rgba[offset + 2] = static_cast<unsigned char>((rgba[offset + 2] * (255 - a) + b * a) / 255);
-        rgba[offset + 3] = std::max(rgba[offset + 3], a);
-      }
-    }
-
-    cursorX += fontPixelSize;
+void drawYoloLabelBoxOnOverlay(
+    std::vector<std::uint8_t>& rgba,
+    int imageWidth,
+    int imageHeight,
+    const char* text,
+    int anchorX,
+    int anchorY,
+    int fontPixelSize,
+    std::uint8_t bgR,
+    std::uint8_t bgG,
+    std::uint8_t bgB,
+    std::uint8_t bgA) {
+  if (text == nullptr || text[0] == '\0') {
+    return;
   }
+
+  const int textLength = static_cast<int>(std::strlen(text));
+  const int charWidth = std::max(6, fontPixelSize);
+  const int padX = std::max(4, fontPixelSize / 2);
+  const int padY = std::max(3, fontPixelSize / 3);
+  const int labelWidth = textLength * charWidth + padX * 2;
+  const int labelHeight = fontPixelSize * 2 + padY * 2;
+
+  int labelX = std::clamp(anchorX, 0, std::max(0, imageWidth - 1));
+  int labelY = anchorY - labelHeight;
+  if (labelY < 0) {
+    labelY = std::clamp(anchorY + 1, 0, std::max(0, imageHeight - 1));
+  }
+
+  fillRgbaRect(
+      rgba,
+      imageWidth,
+      imageHeight,
+      labelX,
+      labelY,
+      std::min(labelWidth, std::max(0, imageWidth - labelX)),
+      std::min(labelHeight, std::max(0, imageHeight - labelY)),
+      bgR,
+      bgG,
+      bgB,
+      bgA);
 }
 
 #if defined(ENABLE_RGA_PREPROC) && !defined(WIN32)
@@ -638,6 +621,18 @@ DecodedFrame makeAnnotatedEncodeFrame(
         std::snprintf(text, sizeof(text), "%.1f%%", box.score * 100.0f);
       }
       if (text[0] != '\0') {
+        drawYoloLabelBoxOnOverlay(
+            overlayData,
+            frame.width,
+            frame.height,
+            text,
+            x1,
+            y1,
+            kModelZooFontPixelSize,
+            0,
+            0,
+            255,
+            220);
         drawTextOnOverlay(
             overlayData,
             frame.width,
@@ -762,6 +757,25 @@ void validateAppConfig(const AppConfig& config) {
         "Use a .h264/.264/.h265/.hevc raw bitstream path or .mp4 for muxed output.");
   }
 
+  if (!config.encoderOutput.empty()) {
+    auto encoder = createEncoderBackend(EncoderBackendType::kAuto);
+    if (!encoder->supportsDecodedFrameInput()) {
+      throw std::runtime_error(
+          "encoder-output currently requires an encoder backend that accepts decoded NV12 frames. "
+          "The selected auto encoder is '" +
+          encoder->name() +
+          "', which only accepts RGB images. Use --output-video for the NVIDIA path or switch to Rockchip MPP.");
+    }
+  }
+
+  if (config.visual.outputOverlayMode == OutputOverlayMode::kRga &&
+      !config.visual.outputVideo.empty() &&
+      backendUsesNvidiaEncoder()) {
+    throw std::runtime_error(
+        "output-overlay=rga is only available on the Rockchip RGA path. "
+        "Use --output-overlay cpu on the NVIDIA platform.");
+  }
+
   if (config.visual.display ||
       (!config.visual.outputVideo.empty() && config.visual.outputOverlayMode != OutputOverlayMode::kRga)) {
     const auto visualizer = createVisualizer();
@@ -796,6 +810,10 @@ void runPipeline(const AppConfig& config) {
     inferProbe->open(config.model, makeInferRuntimeConfig(config, 0, config.inferWorkers));
     inferInputWidth = inferProbe->inputWidth() > 0 ? inferProbe->inputWidth() : config.model.inputWidth;
     inferInputHeight = inferProbe->inputHeight() > 0 ? inferProbe->inputHeight() : config.model.inputHeight;
+    if (config.verbose) {
+      std::cerr << "[PIPELINE] infer_probe backend=" << inferProbe->name()
+                << " input=" << inferInputWidth << "x" << inferInputHeight << "\n";
+    }
   }
 
   auto decoder = createDecoderBackend(config.decoderBackend);
@@ -806,6 +824,17 @@ void runPipeline(const AppConfig& config) {
   packetSource.open(config.source);
   const SourceVideoInfo sourceVideoInfo = packetSource.videoInfo();
   decoder->open(packetSource.codec());
+  if (config.verbose) {
+    std::cerr << "[PIPELINE] stages decoder=" << decoder->name()
+              << " preproc=" << preproc->name()
+              << " infer=" << toString(config.inferBackend == InferBackendType::kAuto
+                     ? detectAvailableInferBackend()
+                     : config.inferBackend)
+              << " postproc=" << toString(resolvedPostprocBackend)
+              << " source=" << sourceVideoInfo.width << "x" << sourceVideoInfo.height
+              << " fps=" << sourceVideoInfo.fpsNum << "/" << sourceVideoInfo.fpsDen
+              << " infer_workers=" << config.inferWorkers << "\n";
+  }
 
   BoundedQueue<PreparedFrame> preparedQueue(inferenceQueueCapacity);
   BoundedQueue<ProcessedFrame> processedQueue(inferenceQueueCapacity);
@@ -880,9 +909,15 @@ void runPipeline(const AppConfig& config) {
       }
       if (!config.encoderOutput.empty()) {
         encoder = createEncoderBackend(EncoderBackendType::kAuto);
+        if (config.verbose) {
+          std::cerr << "[PIPELINE] raw_encoder backend=" << encoder->name() << "\n";
+        }
       }
       if (needsHardwareEncodedAnnotatedVideo) {
         annotatedVideoEncoder = createEncoderBackend(EncoderBackendType::kAuto);
+        if (config.verbose) {
+          std::cerr << "[PIPELINE] annotated_encoder backend=" << annotatedVideoEncoder->name() << "\n";
+        }
       }
 
       std::map<std::size_t, ProcessedFrame> pending;
@@ -923,6 +958,15 @@ void runPipeline(const AppConfig& config) {
                 : current.decodedFrame.height;
             encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
             encCfg.inputFormat = PixelFormat::kNv12;
+            if (config.verbose) {
+              std::cerr << "[PIPELINE] init_raw_encoder backend=" << encoder->name()
+                        << " codec=" << encCfg.codec
+                        << " path=" << encCfg.outputPath
+                        << " size=" << encCfg.width << "x" << encCfg.height
+                        << " stride=" << encCfg.horStride << "x" << encCfg.verStride
+                        << " fps=" << encCfg.fpsNum << "/" << encCfg.fpsDen
+                        << " bitrate=" << encCfg.bitrate << "\n";
+            }
             encoder->init(encCfg);
             encoderInitialized = true;
           }
@@ -983,6 +1027,10 @@ void runPipeline(const AppConfig& config) {
               if (needsHardwareEncodedAnnotatedVideo) {
                 visualConfig.outputVideo.clear();
               }
+              if (config.verbose) {
+                std::cerr << "[PIPELINE] init_visualizer size="
+                          << displayImage->width << "x" << displayImage->height << "\n";
+              }
               visualizer->init(displayImage->width, displayImage->height, visualConfig);
               visualizerInitialized = true;
             }
@@ -999,6 +1047,16 @@ void runPipeline(const AppConfig& config) {
                 encCfg.height = useRgaAnnotatedOutput ? current.decodedFrame.height : drawnImage.height;
                 encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
                 encCfg.inputFormat = useRgaAnnotatedOutput ? PixelFormat::kNv12 : PixelFormat::kRgb888;
+                if (config.verbose) {
+                  std::cerr << "[PIPELINE] init_annotated_encoder backend=" << annotatedVideoEncoder->name()
+                            << " codec=" << encCfg.codec
+                            << " path=" << encCfg.outputPath
+                            << " size=" << encCfg.width << "x" << encCfg.height
+                            << " fps=" << encCfg.fpsNum << "/" << encCfg.fpsDen
+                            << " bitrate=" << encCfg.bitrate
+                            << " input_format=" << (encCfg.inputFormat == PixelFormat::kNv12 ? "NV12" : "RGB888")
+                            << "\n";
+                }
                 annotatedVideoEncoder->init(encCfg);
                 annotatedVideoEncoderInitialized = true;
               }
@@ -1032,6 +1090,16 @@ void runPipeline(const AppConfig& config) {
                   : current.decodedFrame.height;
               encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
               encCfg.inputFormat = PixelFormat::kNv12;
+              if (config.verbose) {
+                std::cerr << "[PIPELINE] init_annotated_encoder backend=" << annotatedVideoEncoder->name()
+                          << " codec=" << encCfg.codec
+                          << " path=" << encCfg.outputPath
+                          << " size=" << encCfg.width << "x" << encCfg.height
+                          << " stride=" << encCfg.horStride << "x" << encCfg.verStride
+                          << " fps=" << encCfg.fpsNum << "/" << encCfg.fpsDen
+                          << " bitrate=" << encCfg.bitrate
+                          << " input_format=NV12\n";
+              }
               annotatedVideoEncoder->init(encCfg);
               annotatedVideoEncoderInitialized = true;
             }
@@ -1072,6 +1140,7 @@ void runPipeline(const AppConfig& config) {
   try {
     bool eosSubmitted = false;
     std::size_t producedFrames = 0;
+    bool loggedFirstDecodedFrame = false;
     while (!eosSubmitted && (config.maxFrames == 0 || producedFrames < static_cast<std::size_t>(config.maxFrames))) {
       const EncodedPacket packet = packetSource.readPacket();
       decoder->submitPacket(packet);
@@ -1083,6 +1152,19 @@ void runPipeline(const AppConfig& config) {
         const auto decodeEnd = Clock::now();
         if (!decodedFrame.has_value()) {
           break;
+        }
+
+        if (config.verbose && !loggedFirstDecodedFrame) {
+          loggedFirstDecodedFrame = true;
+          std::cerr << "[PIPELINE] first_decoded_frame"
+                    << " size=" << decodedFrame->width << "x" << decodedFrame->height
+                    << " stride=" << decodedFrame->horizontalStride << "x" << decodedFrame->verticalStride
+                    << " chroma_stride=" << decodedFrame->chromaStride
+                    << " format=" << (decodedFrame->format == PixelFormat::kNv12 ? "NV12" : "unknown")
+                    << " native_format=" << decodedFrame->nativeFormat
+                    << " on_device=" << (decodedFrame->isOnDevice ? "true" : "false")
+                    << " dma_fd=" << decodedFrame->dmaFd
+                    << "\n";
         }
 
         PreparedFrame prepared;

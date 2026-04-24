@@ -13,7 +13,11 @@
 #endif
 
 InferBackendType detectAvailableInferBackend() {
-#if defined(ENABLE_RKNN_INFER)
+#if defined(ENABLE_TRT_INFER) && defined(NVIDIA_PLATFORM)
+  return InferBackendType::kNvidiaTrt;
+#elif defined(ENABLE_RKNN_INFER) && defined(ROCKCHIP_PLATFORM)
+  return InferBackendType::kRockchipRknn;
+#elif defined(ENABLE_RKNN_INFER)
   return InferBackendType::kRockchipRknn;
 #elif defined(ENABLE_TRT_INFER)
   return InferBackendType::kNvidiaTrt;
