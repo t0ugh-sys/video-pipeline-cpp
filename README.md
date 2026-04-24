@@ -83,8 +83,37 @@ cmake -S . -B build -DPLATFORM=nvidia
 cmake --build build -j4
 
 # 运行
-./build/video_pipeline --backend nvidia test.mp4 yolov5s.engine 640 640
+./build/video_pipeline --backend nvidia --verbose test.mp4 yolov5s.engine 640 640
+
+# 带视频输出
+./build/video_pipeline \
+  --backend nvidia \
+  --verbose \
+  --visual-style yolo \
+  --output-video out.mp4 \
+  test.mp4 yolov5s.engine 640 640
 ```
+
+当前 NVIDIA 路线代码已接入：
+
+- FFmpeg demux
+- NVDEC decode
+- CUDA preprocess
+- TensorRT inference
+- YOLO postprocess
+- OpenCV draw
+- NVENC encode
+
+`--verbose` 下会输出：
+
+- `[PIPELINE] stages`
+- `[PIPELINE] first_decoded_frame`
+- `[TRT] input_binding`
+- `[TRT] output_binding`
+- `[TRT] input_mode`
+- `[PIPELINE] init_annotated_encoder`
+
+这些日志用于判断是否真正走到了 `NVDEC -> CUDA -> TensorRT -> NVENC` 硬件链路。
 
 ### 自动检测
 
@@ -121,6 +150,7 @@ Options:
   --display-max-width <n>                 显示路径最大宽度
   --display-max-height <n>                显示路径最大高度
   --output-overlay <cpu|rga>              输出视频叠加方式
+  --visual-style <classic|yolo>           检测框/标签绘制风格（默认：yolo）
   --output-video <path>                   输出带框视频
   --output-rtsp <url>                     输出 RTSP
   --encoder-output <path>                 输出原始解码视频流
@@ -129,6 +159,27 @@ Options:
   --encoder-fps <n>                       编码帧率 (默认：0 = 跟随输入，异常高帧率时内部会回落)
   -h, --help                              显示帮助
 ```
+
+## Visual Styles
+
+当前提供两种绘制风格：
+
+- `classic`
+  - 保留原有框线 + 纯文字标签样式
+- `yolo`
+  - 使用 YOLO 常见的实心标签底框样式
+
+示例：
+
+```bash
+./build/video_pipeline --visual-style classic test.mp4 model.engine 640 640
+./build/video_pipeline --visual-style yolo test.mp4 model.engine 640 640
+```
+
+说明：
+
+- OpenCV 可视化路径支持 `classic` 和 `yolo`
+- Rockchip RGA overlay 路径也接入了风格分支
 
 ## 环境变量
 
@@ -233,9 +284,38 @@ vision-inference-pipeline/
 - 这是"最小可改造工程骨架"，不是完整生产工程
 - CUDA 预处理需要完整实现零拷贝路径
 - Rockchip `--output-video` 当前输出的是裸 `.h264/.h265` 码流，不是 mp4 容器
+- NVIDIA `--output-video` 现已通过 FFmpeg mux 写容器；代码路径已接通，但仍建议在目标机上用 `ffprobe` 做首轮验证
 - 输入视频帧率异常高时，Rockchip 输出路径会按目标编码帧率做丢帧，避免输出慢放
 - Rockchip 带框输出当前优先保证稳定性，不追求端到端零拷贝
 - RTSP 长时间断流重连尚未实现
+
+## Current NVIDIA Status
+
+当前 NVIDIA 路线代码状态：
+
+```text
+FFmpeg demux
+  -> NVDEC decode
+  -> CUDA preprocess
+  -> TensorRT inference
+  -> CPU postprocess
+  -> OpenCV draw
+  -> NVENC encode
+```
+
+已经落地的点：
+
+- `PLATFORM=nvidia` 默认打开 `NVDEC + CUDA preproc + TensorRT + NVENC`
+- CUDA 预处理已支持 letterbox
+- TensorRT 已支持多输出结构化返回
+- TensorRT 输入会优先走设备侧路径，并在 `--verbose` 打印 `input_mode`
+- NVENC 已改为通过 FFmpeg mux 写文件
+
+仍需目标机验证的点：
+
+- 不同 FFmpeg / CUDA / 驱动组合下的 `AV_PIX_FMT_CUDA` surface 兼容性
+- 具体 TensorRT engine 的输入 dtype / layout 组合
+- `.mp4` 输出在目标机上的实际封装与回放兼容性
 
 ## Rockchip 当前状态
 
