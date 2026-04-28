@@ -15,9 +15,21 @@ namespace {
 constexpr unsigned int COLOR_BLUE = 0xFF0000FFU;
 constexpr unsigned int COLOR_RED = 0xFFFF0000U;
 constexpr unsigned int COLOR_WHITE = 0xFFFFFFFFU;
-constexpr unsigned int COLOR_YOLO_LABEL_BG = 0xFF0000FFU;
 constexpr int kModelZooBoxThickness = 3;
 constexpr int kModelZooFontPixelSize = 10;
+
+struct RgbColor {
+  std::uint8_t r = 0;
+  std::uint8_t g = 0;
+  std::uint8_t b = 0;
+};
+
+constexpr RgbColor kUltralyticsPalette[] = {
+    {4, 42, 255},   {11, 219, 235}, {243, 243, 243}, {0, 223, 183},  {17, 31, 104},
+    {255, 111, 221}, {255, 68, 79}, {204, 237, 0},   {0, 243, 68},   {189, 0, 255},
+    {0, 180, 255},  {221, 0, 186}, {0, 255, 255},   {38, 192, 0},   {1, 255, 179},
+    {125, 36, 255}, {123, 0, 104}, {255, 27, 108},  {252, 109, 47}, {162, 255, 11},
+};
 
 int clampValue(float value, int minValue, int maxValue) {
   if (value < static_cast<float>(minValue)) {
@@ -40,6 +52,27 @@ unsigned int convertColorRgb888(unsigned int srcColor) {
   dst[1] = g;
   dst[2] = b;
   return dstColor;
+}
+
+unsigned int encodeRgb888(std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+  unsigned int color = 0;
+  auto* dst = reinterpret_cast<unsigned char*>(&color);
+  dst[0] = r;
+  dst[1] = g;
+  dst[2] = b;
+  return color;
+}
+
+RgbColor ultralyticsColorForClass(int classId) {
+  const std::size_t paletteSize = sizeof(kUltralyticsPalette) / sizeof(kUltralyticsPalette[0]);
+  const std::size_t index =
+      static_cast<std::size_t>(classId >= 0 ? classId : 0) % paletteSize;
+  return kUltralyticsPalette[index];
+}
+
+unsigned int ultralyticsTextColor(const RgbColor& background) {
+  const int luminance = static_cast<int>(background.r) + static_cast<int>(background.g) + static_cast<int>(background.b);
+  return luminance >= 600 ? encodeRgb888(16, 16, 16) : COLOR_WHITE;
 }
 
 void drawRectangleC3(
@@ -324,7 +357,9 @@ class OpenCVVisualizer : public IVisualizer {
       const int w = std::max(1, x2 - x1);
       const int h = std::max(1, y2 - y1);
 
-      drawRectangle(output, x1, y1, w, h, COLOR_BLUE, kModelZooBoxThickness);
+      const RgbColor classColor = ultralyticsColorForClass(box.classId);
+      const unsigned int classColorValue = encodeRgb888(classColor.r, classColor.g, classColor.b);
+      drawRectangle(output, x1, y1, w, h, config_.style == VisualStyle::kYolo ? classColorValue : COLOR_BLUE, kModelZooBoxThickness);
 
       char text[256] = {};
       if (config_.showLabel && !box.label.empty() && config_.showConf) {
@@ -336,7 +371,14 @@ class OpenCVVisualizer : public IVisualizer {
       }
       if (text[0] != '\0') {
         if (config_.style == VisualStyle::kYolo) {
-          drawYoloLabelBox(output, text, x1, y1, COLOR_YOLO_LABEL_BG, COLOR_WHITE, kModelZooFontPixelSize);
+          drawYoloLabelBox(
+              output,
+              text,
+              x1,
+              y1,
+              classColorValue,
+              ultralyticsTextColor(classColor),
+              kModelZooFontPixelSize);
         } else {
           drawText(output, text, x1, y1 - 20, COLOR_RED, kModelZooFontPixelSize);
         }

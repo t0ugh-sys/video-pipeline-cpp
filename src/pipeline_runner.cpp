@@ -9,6 +9,8 @@
 #include "preproc_interface.hpp"
 #include "visualizer.hpp"
 
+#include "../../rknn_model_zoo/utils/font.h"
+
 #if defined(ENABLE_RGA_PREPROC) && !defined(WIN32)
 extern "C" {
 #include <mpp_buffer.h>
@@ -63,6 +65,19 @@ struct ProcessedFrame {
 
 constexpr int kModelZooBoxThickness = 3;
 constexpr int kModelZooFontPixelSize = 10;
+
+struct RgbColor {
+  std::uint8_t r = 0;
+  std::uint8_t g = 0;
+  std::uint8_t b = 0;
+};
+
+constexpr RgbColor kUltralyticsPalette[] = {
+    {4, 42, 255},   {11, 219, 235}, {243, 243, 243}, {0, 223, 183},  {17, 31, 104},
+    {255, 111, 221}, {255, 68, 79}, {204, 237, 0},   {0, 243, 68},   {189, 0, 255},
+    {0, 180, 255},  {221, 0, 186}, {0, 255, 255},   {38, 192, 0},   {1, 255, 179},
+    {125, 36, 255}, {123, 0, 104}, {255, 27, 108},  {252, 109, 47}, {162, 255, 11},
+};
 
 template <typename T>
 class BoundedQueue {
@@ -401,6 +416,39 @@ void fillRgbaRect(
   }
 }
 
+RgbColor ultralyticsColorForClass(int classId) {
+  const std::size_t paletteSize = sizeof(kUltralyticsPalette) / sizeof(kUltralyticsPalette[0]);
+  const std::size_t index =
+      static_cast<std::size_t>(classId >= 0 ? classId : 0) % paletteSize;
+  return kUltralyticsPalette[index];
+}
+
+RgbColor ultralyticsTextColor(const RgbColor& background) {
+  const int luminance = static_cast<int>(background.r) + static_cast<int>(background.g) + static_cast<int>(background.b);
+  if (luminance >= 600) {
+    return {16, 16, 16};
+  }
+  return {255, 255, 255};
+}
+
+int resizeNearestC1(
+    const unsigned char* srcPixels,
+    int srcWidth,
+    int srcHeight,
+    unsigned char* dstPixels,
+    int dstWidth,
+    int dstHeight) {
+  for (int i = 0; i < dstHeight; ++i) {
+    const int y = std::clamp((i * srcHeight) / dstHeight, 0, srcHeight - 1);
+    for (int j = 0; j < dstWidth; ++j) {
+      const int x = std::clamp((j * srcWidth) / dstWidth, 0, srcWidth - 1);
+      dstPixels[i * dstWidth + j] = srcPixels[y * srcWidth + x];
+    }
+  }
+
+  return 0;
+}
+
 void drawRectangleOnOverlay(
     std::vector<std::uint8_t>& rgba,
     int imageWidth,
@@ -435,16 +483,60 @@ void drawTextOnOverlay(
     std::uint8_t r,
     std::uint8_t g,
     std::uint8_t b) {
-  (void)rgba;
-  (void)width;
-  (void)height;
-  (void)text;
-  (void)x;
-  (void)y;
-  (void)fontPixelSize;
-  (void)r;
-  (void)g;
-  (void)b;
+  std::vector<unsigned char> resizedFontBitmap(
+      static_cast<std::size_t>(fontPixelSize * fontPixelSize * 2));
+
+  const int n = static_cast<int>(std::strlen(text));
+  int cursorX = x;
+  int cursorY = y;
+  for (int i = 0; i < n; ++i) {
+    const char ch = text[i];
+    if (ch == '\n') {
+      cursorX = x;
+      cursorY += fontPixelSize * 2;
+      continue;
+    }
+    if (std::isprint(static_cast<unsigned char>(ch)) == 0) {
+      continue;
+    }
+
+    const int fontBitmapIndex = ch - ' ';
+    if (fontBitmapIndex < 0 || fontBitmapIndex >= 95) {
+      continue;
+    }
+    const unsigned char* fontBitmap = mono_font_data[fontBitmapIndex];
+    resizeNearestC1(fontBitmap, 20, 40, resizedFontBitmap.data(), fontPixelSize, fontPixelSize * 2);
+
+    for (int yy = cursorY; yy < cursorY + fontPixelSize * 2; ++yy) {
+      if (yy < 0) {
+        continue;
+      }
+      if (yy >= height) {
+        break;
+      }
+
+      const unsigned char* alpha = resizedFontBitmap.data() +
+          static_cast<std::size_t>(yy - cursorY) * fontPixelSize;
+      for (int xx = cursorX; xx < cursorX + fontPixelSize; ++xx) {
+        if (xx < 0) {
+          continue;
+        }
+        if (xx >= width) {
+          break;
+        }
+
+        const unsigned char a = alpha[xx - cursorX] >= 128 ? 255 : 0;
+        const std::size_t offset =
+            static_cast<std::size_t>((yy * width + xx) * 4);
+        rgba[offset + 0] = static_cast<unsigned char>((rgba[offset + 0] * (255 - a) + r * a) / 255);
+        rgba[offset + 1] = static_cast<unsigned char>((rgba[offset + 1] * (255 - a) + g * a) / 255);
+        rgba[offset + 2] = static_cast<unsigned char>((rgba[offset + 2] * (255 - a) + b * a) / 255);
+        rgba[offset + 3] = std::max(rgba[offset + 3], a);
+      }
+    }
+
+    cursorX += fontPixelSize;
+  }
 }
 
 void drawYoloLabelBoxOnOverlay(
@@ -458,7 +550,10 @@ void drawYoloLabelBoxOnOverlay(
     std::uint8_t bgR,
     std::uint8_t bgG,
     std::uint8_t bgB,
-    std::uint8_t bgA) {
+    std::uint8_t bgA,
+    std::uint8_t textR,
+    std::uint8_t textG,
+    std::uint8_t textB) {
   if (text == nullptr || text[0] == '\0') {
     return;
   }
@@ -488,6 +583,17 @@ void drawYoloLabelBoxOnOverlay(
       bgG,
       bgB,
       bgA);
+  drawTextOnOverlay(
+      rgba,
+      imageWidth,
+      imageHeight,
+      text,
+      labelX + padX,
+      labelY + padY,
+      fontPixelSize,
+      textR,
+      textG,
+      textB);
 }
 
 #if defined(ENABLE_RGA_PREPROC) && !defined(WIN32)
@@ -598,6 +704,7 @@ DecodedFrame makeAnnotatedEncodeFrame(
       const int y1 = std::clamp(static_cast<int>(box.y1), 0, frame.height - 1);
       const int x2 = std::clamp(static_cast<int>(box.x2), x1 + 1, frame.width);
       const int y2 = std::clamp(static_cast<int>(box.y2), y1 + 1, frame.height);
+      const RgbColor classColor = ultralyticsColorForClass(box.classId);
       drawRectangleOnOverlay(
           overlayData,
           frame.width,
@@ -607,9 +714,9 @@ DecodedFrame makeAnnotatedEncodeFrame(
           std::max(1, x2 - x1),
           std::max(1, y2 - y1),
           thickness,
-          0,
-          0,
-          255,
+          config.style == VisualStyle::kYolo ? classColor.r : 0,
+          config.style == VisualStyle::kYolo ? classColor.g : 0,
+          config.style == VisualStyle::kYolo ? classColor.b : 255,
           255);
 
       char text[256] = {};
@@ -622,6 +729,7 @@ DecodedFrame makeAnnotatedEncodeFrame(
       }
       if (text[0] != '\0') {
         if (config.style == VisualStyle::kYolo) {
+          const RgbColor textColor = ultralyticsTextColor(classColor);
           drawYoloLabelBoxOnOverlay(
               overlayData,
               frame.width,
@@ -630,10 +738,13 @@ DecodedFrame makeAnnotatedEncodeFrame(
               x1,
               y1,
               kModelZooFontPixelSize,
-              0,
-              0,
-              255,
-              220);
+              classColor.r,
+              classColor.g,
+              classColor.b,
+              220,
+              textColor.r,
+              textColor.g,
+              textColor.b);
         } else {
           drawTextOnOverlay(
               overlayData,
