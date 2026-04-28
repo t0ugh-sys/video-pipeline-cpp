@@ -26,7 +26,9 @@ bool testHelpRequest() {
   std::vector<std::string> arguments = {"video_pipeline", "--help"};
   std::vector<char*> argv = makeArgv(arguments);
   const ParseResult result = parseAppConfig(static_cast<int>(argv.size()), argv.data());
-  return expect(result.status == ParseStatus::kHelp, "expected help request to return kHelp");
+  return expect(result.status == ParseStatus::kHelp, "expected help request to return kHelp") &&
+         expect(result.message.find("--visual-style <classic|yolo>") != std::string::npos,
+                "expected help output to include visual-style");
 }
 
 bool testBackendAndPositionals() {
@@ -115,6 +117,37 @@ bool testRockchipStableOutputFlags() {
          expect(result.config.visual.outputVideo == "/edge/workspace/vis_modelzoo_full.h264", "expected output video path to be parsed");
 }
 
+bool testVisualStyleParsing() {
+  std::vector<std::string> arguments = {
+      "video_pipeline",
+      "--backend", "rockchip",
+      "--visual-style", "classic",
+      "stream.mp4",
+      "model.rknn",
+      "640",
+      "640"};
+  std::vector<char*> argv = makeArgv(arguments);
+  const ParseResult result = parseAppConfig(static_cast<int>(argv.size()), argv.data());
+  return expect(result.status == ParseStatus::kOk, "expected visual-style classic to parse successfully") &&
+         expect(result.config.visual.style == VisualStyle::kClassic, "expected classic visual style to be parsed");
+}
+
+bool testRejectInvalidVisualStyle() {
+  std::vector<std::string> arguments = {
+      "video_pipeline",
+      "--backend", "rockchip",
+      "--visual-style", "invalid",
+      "stream.mp4",
+      "model.rknn",
+      "640",
+      "640"};
+  std::vector<char*> argv = makeArgv(arguments);
+  const ParseResult result = parseAppConfig(static_cast<int>(argv.size()), argv.data());
+  return expect(result.status == ParseStatus::kError, "expected invalid visual-style to fail") &&
+         expect(result.message.find("Unsupported visual style: invalid") != std::string::npos,
+                "expected invalid visual-style error message");
+}
+
 }  // namespace
 
 int main() {
@@ -125,5 +158,7 @@ int main() {
   ok = ok && testRejectUnknownOption();
   ok = ok && testRejectMissingOptionValue();
   ok = ok && testRockchipStableOutputFlags();
+  ok = ok && testVisualStyleParsing();
+  ok = ok && testRejectInvalidVisualStyle();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

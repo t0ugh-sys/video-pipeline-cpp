@@ -387,10 +387,15 @@ ModelOutputLayout YoloPostprocessor::inferLayout(const InferenceOutput& output) 
       reason = "single-output shape matches [N,6] end-to-end layout";
       return resolved;
     }
+    if (!looksLikeYolov8Flat(output.front())) {
+      throw std::runtime_error(
+          "Unsupported single-output YOLO tensor in auto layout mode. "
+          "Only YOLOv8-compatible [1,84,8400]/[1,8400,84] dense exports and "
+          "YOLO26 end-to-end [1,300,6] are recognized automatically. "
+          "Specify --model-output-layout explicitly for other exports.");
+    }
     resolved = ModelOutputLayout::kYolov8Flat;
-    reason = looksLikeYolov8Flat(output.front())
-                 ? "single-head dense proposal tensor"
-                 : "single-output dense tensor";
+    reason = "single-head dense proposal tensor";
   } else {
     resolved = inferBranchLayout(output, classChannelCount(output));
     reason = "multi-head branch tensor set";
