@@ -26,7 +26,18 @@ cmake --build build-rockchip -j4
 
 # 最小运行
 ./build-rockchip/video_pipeline --backend rockchip test.mp4 yolov5s.rknn 640 640
+
+# RTSP 输入
+./build-rockchip/video_pipeline --backend rockchip \
+  rtsp://127.0.0.1:554/stream \
+  yolov5s.rknn 640 640
 ```
+
+RTSP 输入说明：
+
+- 输入源位置参数本身就支持 `rtsp://...`
+- 当前输入端显式按 RTSP 打开，并优先使用 `TCP`
+- 已设置低延迟/低缓冲打开参数；长时间断流自动重连仍未实现
 
 ### Rockchip 稳定参数
 
@@ -51,7 +62,7 @@ cmake --build build-rockchip -j4
 - `--infer-workers 2` 是当前比较稳的吞吐/稳定性折中
 - `--rknn-zero-copy false` 是当前带框输出路径的稳态选项
 - `--encoder-fps 30` 用来避免把异常高输入帧率原样写进输出导致慢放/卡顿
-- `--output-video` 在 Rockchip 路径下输出的是裸码流，建议使用 `.h264`
+- `--output-video` 在 Rockchip 路径下支持裸码流 `.h264/.h265`、`.mp4`，也可以改用 `--output-rtsp rtsp://...`
 - 默认 `--output-overlay cpu` 走现有稳定的 CPU 画框 + RGA 颜色转换 + MPP 编码链路
 - `--output-overlay rga` 走可选的硬件叠加路径：
   `NV12 -> RGA RGBA scratch -> RGA blend -> RGA NV12 -> MPP encode`
@@ -152,7 +163,7 @@ Options:
   --output-overlay <cpu|rga>              输出视频叠加方式
   --visual-style <classic|yolo>           检测框/标签绘制风格（默认：yolo）
   --output-video <path>                   输出带框视频
-  --output-rtsp <url>                     输出 RTSP
+  --output-rtsp <url>                     输出带框 RTSP 推流
   --encoder-output <path>                 输出原始解码视频流
   --encoder-codec <h264|h265>             编码格式
   --encoder-bitrate <bps>                 编码码率
@@ -283,7 +294,7 @@ vision-inference-pipeline/
 
 - 这是"最小可改造工程骨架"，不是完整生产工程
 - CUDA 预处理需要完整实现零拷贝路径
-- Rockchip `--output-video` 当前输出的是裸 `.h264/.h265` 码流，不是 mp4 容器
+- Rockchip 标注输出当前支持裸 `.h264/.h265`、`.mp4` 与 `rtsp://` 推流
 - NVIDIA `--output-video` 现已通过 FFmpeg mux 写容器；代码路径已接通，但仍建议在目标机上用 `ffprobe` 做首轮验证
 - 输入视频帧率异常高时，Rockchip 输出路径会按目标编码帧率做丢帧，避免输出慢放
 - Rockchip 带框输出当前优先保证稳定性，不追求端到端零拷贝

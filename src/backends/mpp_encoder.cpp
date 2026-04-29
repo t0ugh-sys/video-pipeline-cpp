@@ -4,6 +4,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/avutil.h>
+#include <libavutil/dict.h>
 #include <mpp_buffer.h>
 #include <mpp_err.h>
 #include <mpp_frame.h>
@@ -107,6 +108,17 @@ bool hasSuffixIgnoreCase(const std::string& value, const std::string& suffix) {
          lowerValue.compare(lowerValue.size() - lowerSuffix.size(), lowerSuffix.size(), lowerSuffix) == 0;
 }
 
+bool startsWithIgnoreCase(const std::string& value, const std::string& prefix) {
+  const std::string lowerValue = toLowerAscii(value);
+  const std::string lowerPrefix = toLowerAscii(prefix);
+  return lowerValue.size() >= lowerPrefix.size() &&
+         lowerValue.compare(0, lowerPrefix.size(), lowerPrefix) == 0;
+}
+
+bool isRtspUrl(const std::string& value) {
+  return startsWithIgnoreCase(value, "rtsp://");
+}
+
 AVCodecID toAvCodecId(const std::string& codec) {
   if (codec == "hevc" || codec == "h265") {
     return AV_CODEC_ID_HEVC;
@@ -203,7 +215,7 @@ void MppEncoder::init(const EncoderConfig& config) {
   fpsNum_ = config.fpsNum > 0 ? config.fpsNum : (config.fps > 0 ? config.fps : 30);
   fpsDen_ = config.fpsDen > 0 ? config.fpsDen : 1;
   nextPacketPts_ = 0;
-  outputMp4Requested_ = hasSuffixIgnoreCase(config.outputPath, ".mp4");
+  outputMuxingRequested_ = hasSuffixIgnoreCase(config.outputPath, ".mp4") || isRtspUrl(config.outputPath);
   initOutputSink(config);
   logMppRgbEncodeStep("init_output_opened");
 
@@ -310,7 +322,7 @@ void MppEncoder::init(const EncoderConfig& config) {
   mpp_packet_set_length(headerPacket, 0);
   checkMppStatus(api_->control(context_, MPP_ENC_GET_HDR_SYNC, headerPacket), "MPP_ENC_GET_HDR_SYNC failed");
   logMppRgbEncodeStep("init_get_hdr_done");
-  if (outputMp4Requested_) {
+  if (outputMuxingRequested_) {
     void* headerData = mpp_packet_get_pos(headerPacket);
     const size_t headerLength = mpp_packet_get_length(headerPacket);
     if (headerData == nullptr || headerLength == 0) {
@@ -575,7 +587,7 @@ void MppEncoder::close() {
 
   initialized_ = false;
   flushSubmitted_ = false;
-  outputMp4Requested_ = false;
+  outputMuxingRequested_ = false;
   width_ = 0;
   height_ = 0;
   horStride_ = 0;
@@ -627,7 +639,7 @@ void MppEncoder::writePacket(void* opaquePacket) {
 
 void MppEncoder::initOutputSink(const EncoderConfig& config) {
   closeOutputSink();
-  if (outputMp4Requested_) {
+  if (outputMuxingRequested_) {
     return;
   }
   outputFile_ = std::ofstream(config.outputPath, std::ios::binary);
@@ -637,11 +649,14 @@ void MppEncoder::initOutputSink(const EncoderConfig& config) {
 }
 
 void MppEncoder::initMp4Muxer(const EncoderConfig& config) {
+  avformat_network_init();
+  const bool outputRtsp = isRtspUrl(config.outputPath);
+  const char* formatName = outputRtsp ? "rtsp" : "mp4";
   checkAvStatus(
-      avformat_alloc_output_context2(&muxFormatContext_, nullptr, "mp4", config.outputPath.c_str()),
+      avformat_alloc_output_context2(&muxFormatContext_, nullptr, formatName, config.outputPath.c_str()),
       "avformat_alloc_output_context2 failed");
   if (muxFormatContext_ == nullptr) {
-    throw std::runtime_error("Failed to create MP4 output context");
+    throw std::runtime_error(std::string("Failed to create ") + (outputRtsp ? "RTSP" : "MP4") + " output context");
   }
 
   muxVideoStream_ = avformat_new_stream(muxFormatContext_, nullptr);
@@ -671,7 +686,14 @@ void MppEncoder::initMp4Muxer(const EncoderConfig& config) {
     checkAvStatus(avio_open(&muxFormatContext_->pb, config.outputPath.c_str(), AVIO_FLAG_WRITE),
                   "avio_open failed");
   }
-  checkAvStatus(avformat_write_header(muxFormatContext_, nullptr), "avformat_write_header failed");
+  AVDictionary* muxOptions = nullptr;
+  if (outputRtsp) {
+    av_dict_set(&muxOptions, "rtsp_transport", "tcp", 0);
+    av_dict_set(&muxOptions, "muxdelay", "0.1", 0);
+  }
+  const int headerStatus = avformat_write_header(muxFormatContext_, &muxOptions);
+  av_dict_free(&muxOptions);
+  checkAvStatus(headerStatus, "avformat_write_header failed");
 }
 
 void MppEncoder::closeOutputSink() {

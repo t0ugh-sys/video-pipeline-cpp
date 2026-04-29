@@ -248,6 +248,28 @@ bool hasSuffixIgnoreCase(const std::string& value, const std::string& suffix) {
          lowerValue.compare(lowerValue.size() - lowerSuffix.size(), lowerSuffix.size(), lowerSuffix) == 0;
 }
 
+bool startsWithIgnoreCase(const std::string& value, const std::string& prefix) {
+  const std::string lowerValue = toLowerAscii(value);
+  const std::string lowerPrefix = toLowerAscii(prefix);
+  return lowerValue.size() >= lowerPrefix.size() &&
+         lowerValue.compare(0, lowerPrefix.size(), lowerPrefix) == 0;
+}
+
+bool isRtspUrl(const std::string& value) {
+  return startsWithIgnoreCase(value, "rtsp://");
+}
+
+std::string annotatedOutputTarget(const AppConfig& config) {
+  if (!config.visual.outputRtsp.empty()) {
+    return config.visual.outputRtsp;
+  }
+  return config.visual.outputVideo;
+}
+
+bool hasAnnotatedOutputTarget(const AppConfig& config) {
+  return !annotatedOutputTarget(config).empty();
+}
+
 PostprocBackendType resolvePostprocBackend(const AppConfig& config) {
   if (config.postprocBackend != PostprocBackendType::kAuto) {
     return config.postprocBackend;
@@ -277,15 +299,20 @@ const char* toModelOutputLayoutName(ModelOutputLayout layout) {
 }
 
 bool wantsHardwareEncodedAnnotatedOutput(const AppConfig& config) {
-  if (config.visual.outputVideo.empty()) {
+  const std::string outputTarget = annotatedOutputTarget(config);
+  if (outputTarget.empty()) {
     return false;
   }
 
-  return hasSuffixIgnoreCase(config.visual.outputVideo, ".h264") ||
-         hasSuffixIgnoreCase(config.visual.outputVideo, ".264") ||
-         hasSuffixIgnoreCase(config.visual.outputVideo, ".h265") ||
-         hasSuffixIgnoreCase(config.visual.outputVideo, ".hevc") ||
-         hasSuffixIgnoreCase(config.visual.outputVideo, ".mp4");
+  if (isRtspUrl(outputTarget)) {
+    return true;
+  }
+
+  return hasSuffixIgnoreCase(outputTarget, ".h264") ||
+         hasSuffixIgnoreCase(outputTarget, ".264") ||
+         hasSuffixIgnoreCase(outputTarget, ".h265") ||
+         hasSuffixIgnoreCase(outputTarget, ".hevc") ||
+         hasSuffixIgnoreCase(outputTarget, ".mp4");
 }
 
 bool usesRgaAnnotatedOutput(const AppConfig& config) {
@@ -858,17 +885,20 @@ void validateAppConfig(const AppConfig& config) {
       availablePostprocBackends,
       toString);
 
-  if (!config.visual.outputRtsp.empty()) {
-    throw std::runtime_error(
-        "output-rtsp is disabled on the hardware-first path because it still depends on an unimplemented streaming sink.");
+  if (!config.visual.outputVideo.empty() && !config.visual.outputRtsp.empty()) {
+    throw std::runtime_error("Specify only one annotated output target: use either --output-video or --output-rtsp");
   }
 
-  if (!config.visual.outputVideo.empty() &&
+  if (!config.visual.outputRtsp.empty() && !isRtspUrl(config.visual.outputRtsp)) {
+    throw std::runtime_error("output-rtsp must start with rtsp://");
+  }
+
+  if (hasAnnotatedOutputTarget(config) &&
       !wantsHardwareEncodedAnnotatedOutput(config) &&
       detectAvailableEncoderBackend() == EncoderBackendType::kRockchipMpp) {
     throw std::runtime_error(
-        "On the Rockchip path, --output-video now uses hardware encoding. "
-        "Use a .h264/.264/.h265/.hevc raw bitstream path or .mp4 for muxed output.");
+        "On the Rockchip path, annotated output uses hardware encoding. "
+        "Use .h264/.264/.h265/.hevc raw bitstream, .mp4, or rtsp:// for muxed streaming output.");
   }
 
   if (!config.encoderOutput.empty()) {
@@ -883,15 +913,14 @@ void validateAppConfig(const AppConfig& config) {
   }
 
   if (config.visual.outputOverlayMode == OutputOverlayMode::kRga &&
-      !config.visual.outputVideo.empty() &&
+      hasAnnotatedOutputTarget(config) &&
       backendUsesNvidiaEncoder()) {
     throw std::runtime_error(
-        "output-overlay=rga is only available on the Rockchip RGA path. "
-        "Use --output-overlay cpu on the NVIDIA platform.");
+        "output-overlay=rga is only available on the Rockchip RGA path. Use --output-overlay cpu on the NVIDIA platform.");
   }
 
   if (config.visual.display ||
-      (!config.visual.outputVideo.empty() && config.visual.outputOverlayMode != OutputOverlayMode::kRga)) {
+      (hasAnnotatedOutputTarget(config) && config.visual.outputOverlayMode != OutputOverlayMode::kRga)) {
     const auto visualizer = createVisualizer();
     if (!visualizer->isAvailable()) {
       throw std::runtime_error(
@@ -901,10 +930,11 @@ void validateAppConfig(const AppConfig& config) {
 }
 
 void runPipeline(const AppConfig& config) {
+  const std::string annotatedOutputPath = annotatedOutputTarget(config);
   const bool needsHardwareEncodedAnnotatedVideo = wantsHardwareEncodedAnnotatedOutput(config);
   const bool useRgaAnnotatedOutput = usesRgaAnnotatedOutput(config);
   const bool needsVisualizerDraw = config.visual.display ||
-                                   (!config.visual.outputVideo.empty() && !useRgaAnnotatedOutput);
+                                   (!annotatedOutputPath.empty() && !useRgaAnnotatedOutput);
   const bool needsDisplayFrame = needsVisualizerDraw || config.dumpFirstFrame;
   const std::size_t inferenceQueueCapacity = static_cast<std::size_t>(std::max(2, config.inferWorkers * 2));
   const std::size_t rgaMaxInflightFrames = static_cast<std::size_t>(std::max(1, config.inferWorkers * 2 + 4));
@@ -1140,6 +1170,7 @@ void runPipeline(const AppConfig& config) {
               VisualConfig visualConfig = config.visual;
               if (needsHardwareEncodedAnnotatedVideo) {
                 visualConfig.outputVideo.clear();
+                visualConfig.outputRtsp.clear();
               }
               if (config.verbose) {
                 std::cerr << "[PIPELINE] init_visualizer size="
@@ -1152,7 +1183,7 @@ void runPipeline(const AppConfig& config) {
             if (annotatedVideoEncoder) {
               if (!annotatedVideoEncoderInitialized) {
                 EncoderConfig encCfg;
-                encCfg.outputPath = config.visual.outputVideo;
+                encCfg.outputPath = annotatedOutputPath;
                 encCfg.codec = config.encoderCodec;
                 encCfg.fps = outputEncoderFps;
                 encCfg.fpsNum = resolveEncoderFpsNum(config, sourceVideoInfo);
@@ -1189,7 +1220,7 @@ void runPipeline(const AppConfig& config) {
           } else if (annotatedVideoEncoder && useRgaAnnotatedOutput) {
             if (!annotatedVideoEncoderInitialized) {
               EncoderConfig encCfg;
-              encCfg.outputPath = config.visual.outputVideo;
+              encCfg.outputPath = annotatedOutputPath;
               encCfg.codec = config.encoderCodec;
               encCfg.fps = outputEncoderFps;
               encCfg.fpsNum = resolveEncoderFpsNum(config, sourceVideoInfo);

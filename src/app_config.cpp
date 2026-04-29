@@ -195,10 +195,10 @@ std::string buildUsageMessage(const std::string& programName) {
   message += "  --display                               Enable display window\n";
   message += "  --display-max-width <n>                 Max display-path width, 0 keeps source width\n";
   message += "  --display-max-height <n>                Max display-path height, 0 keeps source height\n";
-  message += "  --output-overlay <cpu|rga>              Overlay mode for --output-video (default: cpu)\n";
+  message += "  --output-overlay <cpu|rga>              Overlay mode for --output-video/--output-rtsp (default: cpu)\n";
   message += "  --visual-style <classic|yolo>           Detection label style (default: yolo)\n";
-  message += "  --output-video <path>                   Write annotated video to a file (.h264/.264/.h265/.hevc on Rockchip)\n";
-  message += "  --output-rtsp <url>                     Stream annotated video to RTSP\n";
+  message += "  --output-video <path>                   Write annotated video to a file (.h264/.264/.h265/.hevc/.mp4 on Rockchip)\n";
+  message += "  --output-rtsp <url>                     Stream annotated video to an RTSP server\n";
   message += "  --encoder-output <path>                 Write raw decode stream (MPP h264/h265)\n";
   message += "  --encoder-codec <h264|h265>             Encoder codec (default: h264)\n";
   message += "  --encoder-bitrate <bps>                 Encoder bitrate (default: 0 = auto)\n";

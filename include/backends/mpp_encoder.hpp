@@ -53,7 +53,7 @@ class MppEncoder : public IEncoderBackend {
   std::mutex rgaMutex_;
   bool initialized_ = false;
   bool flushSubmitted_ = false;
-  bool outputMp4Requested_ = false;
+  bool outputMuxingRequested_ = false;
   int width_ = 0;
   int height_ = 0;
   int horStride_ = 0;

@@ -13,6 +13,26 @@ extern "C" {
 
 namespace {
 
+std::string toLowerAscii(std::string value) {
+  for (char& ch : value) {
+    if (ch >= 'A' && ch <= 'Z') {
+      ch = static_cast<char>(ch - 'A' + 'a');
+    }
+  }
+  return value;
+}
+
+bool startsWithIgnoreCase(const std::string& value, const std::string& prefix) {
+  const std::string lowerValue = toLowerAscii(value);
+  const std::string lowerPrefix = toLowerAscii(prefix);
+  return lowerValue.size() >= lowerPrefix.size() &&
+         lowerValue.compare(0, lowerPrefix.size(), lowerPrefix) == 0;
+}
+
+bool isRtspUrl(const std::string& value) {
+  return startsWithIgnoreCase(value, "rtsp://");
+}
+
 void checkAvStatus(int status, const char* message) {
   if (status < 0) {
     char err[AV_ERROR_MAX_STRING_SIZE];
@@ -98,7 +118,9 @@ void NvencEncoder::init(const EncoderConfig& config) {
     ret = avcodec_open2(codecCtx_, encoder, nullptr);
     checkAvStatus(ret, "Failed to open NVENC encoder");
 
-    ret = avformat_alloc_output_context2(&formatCtx_, nullptr, nullptr, config.outputPath.c_str());
+    avformat_network_init();
+    const char* formatName = isRtspUrl(config.outputPath) ? "rtsp" : nullptr;
+    ret = avformat_alloc_output_context2(&formatCtx_, nullptr, formatName, config.outputPath.c_str());
     checkAvStatus(ret, "Failed to create output format context");
     if (!formatCtx_) {
       throw std::runtime_error("Failed to create output format context");
@@ -117,7 +139,13 @@ void NvencEncoder::init(const EncoderConfig& config) {
       checkAvStatus(ret, "Failed to open output muxer target");
     }
 
-    ret = avformat_write_header(formatCtx_, nullptr);
+    AVDictionary* muxOptions = nullptr;
+    if (isRtspUrl(config.outputPath)) {
+      av_dict_set(&muxOptions, "rtsp_transport", "tcp", 0);
+      av_dict_set(&muxOptions, "muxdelay", "0.1", 0);
+    }
+    ret = avformat_write_header(formatCtx_, &muxOptions);
+    av_dict_free(&muxOptions);
     checkAvStatus(ret, "Failed to write output container header");
 
     swFrame_ = av_frame_alloc();

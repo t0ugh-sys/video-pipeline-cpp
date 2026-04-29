@@ -9,6 +9,7 @@ extern "C" {
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 namespace {
 
@@ -22,6 +23,26 @@ bool containerNameContains(const AVInputFormat* format, const char* token) {
   return format != nullptr && format->name != nullptr && std::strstr(format->name, token) != nullptr;
 }
 
+std::string toLowerAscii(std::string value) {
+  for (char& ch : value) {
+    if (ch >= 'A' && ch <= 'Z') {
+      ch = static_cast<char>(ch - 'A' + 'a');
+    }
+  }
+  return value;
+}
+
+bool startsWithIgnoreCase(const std::string& value, const std::string& prefix) {
+  const std::string lowerValue = toLowerAscii(value);
+  const std::string lowerPrefix = toLowerAscii(prefix);
+  return lowerValue.size() >= lowerPrefix.size() &&
+         lowerValue.compare(0, lowerPrefix.size(), lowerPrefix) == 0;
+}
+
+bool isRtspUrl(const std::string& value) {
+  return startsWithIgnoreCase(value, "rtsp://");
+}
+
 }  // namespace
 
 FFmpegPacketSource::~FFmpegPacketSource() {
@@ -32,7 +53,16 @@ void FFmpegPacketSource::open(const InputSourceConfig& config) {
   close();
   avformat_network_init();
 
-  int result = avformat_open_input(&formatContext_, config.uri.c_str(), nullptr, nullptr);
+  AVDictionary* inputOptions = nullptr;
+  if (isRtspUrl(config.uri)) {
+    av_dict_set(&inputOptions, "rtsp_transport", "tcp", 0);
+    av_dict_set(&inputOptions, "fflags", "nobuffer", 0);
+    av_dict_set(&inputOptions, "flags", "low_delay", 0);
+    av_dict_set(&inputOptions, "stimeout", "5000000", 0);
+  }
+
+  int result = avformat_open_input(&formatContext_, config.uri.c_str(), nullptr, &inputOptions);
+  av_dict_free(&inputOptions);
   if (result < 0) {
     throwFfmpegError("Failed to open input", result);
   }

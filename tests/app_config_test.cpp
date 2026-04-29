@@ -132,6 +132,24 @@ bool testVisualStyleParsing() {
          expect(result.config.visual.style == VisualStyle::kClassic, "expected classic visual style to be parsed");
 }
 
+bool testRtspOutputParsing() {
+  std::vector<std::string> arguments = {
+      "video_pipeline",
+      "--backend", "rockchip",
+      "--output-rtsp", "rtsp://127.0.0.1:8554/live/test",
+      "rtsp://127.0.0.1:554/input",
+      "model.rknn",
+      "640",
+      "640"};
+  std::vector<char*> argv = makeArgv(arguments);
+  const ParseResult result = parseAppConfig(static_cast<int>(argv.size()), argv.data());
+  return expect(result.status == ParseStatus::kOk, "expected output-rtsp to parse successfully") &&
+         expect(result.config.visual.outputRtsp == "rtsp://127.0.0.1:8554/live/test",
+                "expected output rtsp url to be parsed") &&
+         expect(result.config.source.uri == "rtsp://127.0.0.1:554/input",
+                "expected input rtsp uri to be parsed");
+}
+
 bool testRejectInvalidVisualStyle() {
   std::vector<std::string> arguments = {
       "video_pipeline",
@@ -159,6 +177,7 @@ int main() {
   ok = ok && testRejectMissingOptionValue();
   ok = ok && testRockchipStableOutputFlags();
   ok = ok && testVisualStyleParsing();
+  ok = ok && testRtspOutputParsing();
   ok = ok && testRejectInvalidVisualStyle();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
