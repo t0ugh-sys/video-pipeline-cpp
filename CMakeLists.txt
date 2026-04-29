@@ -293,6 +293,15 @@ if(BUILD_TESTING)
     target_include_directories(app_config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME app_config_test COMMAND $<TARGET_FILE:app_config_test>)
 
+    add_executable(yolo_postproc_test
+        src/backends/yolo_postproc.cpp
+        tests/yolo_postproc_test.cpp)
+    if(MSVC)
+        set_property(TARGET yolo_postproc_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    target_include_directories(yolo_postproc_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME yolo_postproc_test COMMAND $<TARGET_FILE:yolo_postproc_test>)
+
     if(ENABLE_RKNN_INFER AND OpenCV_FOUND AND NOT WIN32)
         add_executable(yolo26_dump_raw
             src/backends/rknn_infer.cpp
