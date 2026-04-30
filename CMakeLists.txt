@@ -320,14 +320,16 @@ if(BUILD_TESTING)
     target_include_directories(yolo_postproc_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME yolo_postproc_test COMMAND $<TARGET_FILE:yolo_postproc_test>)
 
-    add_executable(validate_app_config_test
-        ${TEST_PIPELINE_SOURCES}
-        tests/validate_app_config_test.cpp)
-    if(MSVC)
-        set_property(TARGET validate_app_config_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    if(ENABLE_MPP_DECODER AND ENABLE_RGA_PREPROC AND ENABLE_RKNN_INFER AND NOT WIN32)
+        add_executable(validate_app_config_test
+            ${TEST_PIPELINE_SOURCES}
+            tests/validate_app_config_test.cpp)
+        if(MSVC)
+            set_property(TARGET validate_app_config_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+        configure_pipeline_target(validate_app_config_test)
+        add_test(NAME validate_app_config_test COMMAND $<TARGET_FILE:validate_app_config_test>)
     endif()
-    configure_pipeline_target(validate_app_config_test)
-    add_test(NAME validate_app_config_test COMMAND $<TARGET_FILE:validate_app_config_test>)
 
     if(NOT WIN32)
         add_test(

@@ -38,6 +38,21 @@ if [[ ! -f "${MODEL_PATH}" ]]; then
   exit 1
 fi
 
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "error: ffmpeg is required but was not found in PATH" >&2
+  exit 1
+fi
+
+if ! command -v ffprobe >/dev/null 2>&1; then
+  echo "error: ffprobe is required but was not found in PATH" >&2
+  exit 1
+fi
+
+if [[ "${OUTPUT_H264_PATH}" != *.h264 && "${OUTPUT_H264_PATH}" != *.264 ]]; then
+  echo "error: rockchip_output_regression.sh expects a raw H.264 output path ending with .h264 or .264: ${OUTPUT_H264_PATH}" >&2
+  exit 1
+fi
+
 rm -f "${OUTPUT_H264_PATH}" "${OUTPUT_MP4_PATH}"
 
 "${BIN_PATH}" \

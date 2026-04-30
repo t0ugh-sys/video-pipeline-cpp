@@ -110,6 +110,7 @@ OUTPUT_RTSP_URL=rtsp://127.0.0.1:8554/live/test \
 - 如果 RTSP server 起流较慢，可通过 `STREAM_READY_TIMEOUT_SEC` 调大等待时间
 - 如果希望更频繁或更保守地探测输出流，可通过 `STREAM_READY_POLL_INTERVAL_SEC` 调整轮询间隔
 - 如果 `ffprobe` 单次探测超时过短，可通过 `FFPROBE_TIMEOUT_SEC` 调整
+- 如果 `ffprobe` 回拉 RTSP 时也需要改传输方式，可通过 `FFPROBE_RTSP_TRANSPORT=tcp|udp` 调整
 
 ### NVIDIA 平台
 
@@ -203,6 +204,10 @@ Rockchip 构建后，可直接执行当前项目内的轻量回归：
 cd /edge/workspace/vision-inference-pipeline/build-rockchip
 ctest -R "(app_config_test|yolo_postproc_test|validate_app_config_test|rockchip_output_regression_script_syntax|rockchip_rtsp_regression_script_syntax)" --output-on-failure
 ```
+
+说明：
+
+- `validate_app_config_test` 仅在 Rockchip 相关后端都启用时注册
 
 ## Visual Styles
 

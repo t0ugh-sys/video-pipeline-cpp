@@ -14,6 +14,7 @@ MAX_FRAMES_DEFAULT="${MAX_FRAMES:-180}"
 FFPROBE_TIMEOUT_SEC="${FFPROBE_TIMEOUT_SEC:-15}"
 STREAM_READY_TIMEOUT_SEC="${STREAM_READY_TIMEOUT_SEC:-20}"
 STREAM_READY_POLL_INTERVAL_SEC="${STREAM_READY_POLL_INTERVAL_SEC:-1}"
+FFPROBE_RTSP_TRANSPORT="${FFPROBE_RTSP_TRANSPORT:-tcp}"
 
 BIN_PATH="${1:-$BIN_DEFAULT}"
 INPUT_RTSP_URL="${2:-$INPUT_RTSP_DEFAULT}"
@@ -32,6 +33,7 @@ echo "input_size=${INPUT_WIDTH}x${INPUT_HEIGHT}"
 echo "progress_every=${PROGRESS_EVERY}"
 echo "max_frames=${MAX_FRAMES}"
 echo "ffprobe_timeout_sec=${FFPROBE_TIMEOUT_SEC}"
+echo "ffprobe_rtsp_transport=${FFPROBE_RTSP_TRANSPORT}"
 echo "stream_ready_timeout_sec=${STREAM_READY_TIMEOUT_SEC}"
 echo "stream_ready_poll_interval_sec=${STREAM_READY_POLL_INTERVAL_SEC}"
 
@@ -83,7 +85,7 @@ trap cleanup EXIT
 
 probe_output_stream() {
   timeout "${FFPROBE_TIMEOUT_SEC}" \
-    ffprobe -v error -rtsp_transport tcp \
+    ffprobe -v error -rtsp_transport "${FFPROBE_RTSP_TRANSPORT}" \
     -select_streams v:0 \
     -show_entries stream=codec_name,width,height,avg_frame_rate \
     -of default=noprint_wrappers=1 "${OUTPUT_RTSP_URL}"
