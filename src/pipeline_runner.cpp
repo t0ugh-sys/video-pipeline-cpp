@@ -315,13 +315,13 @@ bool wantsHardwareEncodedAnnotatedOutput(const AppConfig& config) {
          hasSuffixIgnoreCase(outputTarget, ".mp4");
 }
 
+bool isRockchipRawHevcPath(const std::string& value) {
+  return hasSuffixIgnoreCase(value, ".h265") || hasSuffixIgnoreCase(value, ".hevc");
+}
+
 bool usesRgaAnnotatedOutput(const AppConfig& config) {
   return wantsHardwareEncodedAnnotatedOutput(config) &&
          config.visual.outputOverlayMode == OutputOverlayMode::kRga;
-}
-
-bool backendUsesNvidiaEncoder() {
-  return detectAvailableEncoderBackend() == EncoderBackendType::kNvidiaNvEnc;
 }
 
 int resolveEncoderFps(const AppConfig& config, const SourceVideoInfo& sourceVideoInfo) {
@@ -884,6 +884,7 @@ void validateAppConfig(const AppConfig& config) {
       isCompiledIn,
       availablePostprocBackends,
       toString);
+  const EncoderBackendType selectedEncoderBackend = detectAvailableEncoderBackend();
 
   if (!config.visual.outputVideo.empty() && !config.visual.outputRtsp.empty()) {
     throw std::runtime_error("Specify only one annotated output target: use either --output-video or --output-rtsp");
@@ -895,14 +896,18 @@ void validateAppConfig(const AppConfig& config) {
 
   if (hasAnnotatedOutputTarget(config) &&
       !wantsHardwareEncodedAnnotatedOutput(config) &&
-      detectAvailableEncoderBackend() == EncoderBackendType::kRockchipMpp) {
+      selectedEncoderBackend == EncoderBackendType::kRockchipMpp) {
     throw std::runtime_error(
         "On the Rockchip path, annotated output uses hardware encoding. "
-        "Use .h264/.264/.h265/.hevc raw bitstream, .mp4, or rtsp:// for muxed streaming output.");
+        "Use .h264/.264 raw bitstream, .mp4, or rtsp:// for muxed streaming output.");
   }
 
   if (!config.encoderOutput.empty()) {
     auto encoder = createEncoderBackend(EncoderBackendType::kAuto);
+    if (selectedEncoderBackend == EncoderBackendType::kRockchipMpp && config.encoderCodec == "h265") {
+      throw std::runtime_error(
+          "The Rockchip MPP encoder path does not support --encoder-codec h265 yet. Use h264.");
+    }
     if (!encoder->supportsDecodedFrameInput()) {
       throw std::runtime_error(
           "encoder-output currently requires an encoder backend that accepts decoded NV12 frames. "
@@ -910,13 +915,32 @@ void validateAppConfig(const AppConfig& config) {
           encoder->name() +
           "', which only accepts RGB images. Use --output-video for the NVIDIA path or switch to Rockchip MPP.");
     }
+    if (selectedEncoderBackend == EncoderBackendType::kRockchipMpp &&
+        isRockchipRawHevcPath(config.encoderOutput)) {
+      throw std::runtime_error(
+          "The Rockchip MPP encoder path does not support .h265/.hevc output yet. Use .h264 or .mp4.");
+    }
   }
 
   if (config.visual.outputOverlayMode == OutputOverlayMode::kRga &&
       hasAnnotatedOutputTarget(config) &&
-      backendUsesNvidiaEncoder()) {
+      selectedEncoderBackend == EncoderBackendType::kNvidiaNvEnc) {
     throw std::runtime_error(
         "output-overlay=rga is only available on the Rockchip RGA path. Use --output-overlay cpu on the NVIDIA platform.");
+  }
+
+  if (hasAnnotatedOutputTarget(config) &&
+      selectedEncoderBackend == EncoderBackendType::kRockchipMpp &&
+      config.encoderCodec == "h265") {
+    throw std::runtime_error(
+        "The Rockchip annotated output path does not support --encoder-codec h265 yet. Use h264.");
+  }
+
+  if (!config.visual.outputVideo.empty() &&
+      selectedEncoderBackend == EncoderBackendType::kRockchipMpp &&
+      isRockchipRawHevcPath(config.visual.outputVideo)) {
+    throw std::runtime_error(
+        "The Rockchip annotated output path does not support .h265/.hevc output yet. Use .h264, .mp4, or --output-rtsp.");
   }
 
   if (config.visual.display ||
@@ -1268,7 +1292,8 @@ void runPipeline(const AppConfig& config) {
       }
       if (annotatedVideoEncoder) {
         if (!annotatedVideoEncoderInitialized) {
-          throw std::runtime_error("output-video requested, but no frame reached the annotated video encoder");
+          throw std::runtime_error(
+              "annotated output requested, but no frame reached the annotated video encoder");
         }
         annotatedVideoEncoder->flush();
       }

@@ -150,6 +150,37 @@ bool testRtspOutputParsing() {
                 "expected input rtsp uri to be parsed");
 }
 
+bool testEncoderCodecAliasParsing() {
+  std::vector<std::string> arguments = {
+      "video_pipeline",
+      "--backend", "rockchip",
+      "--encoder-codec", "hevc",
+      "stream.mp4",
+      "model.rknn",
+      "640",
+      "640"};
+  std::vector<char*> argv = makeArgv(arguments);
+  const ParseResult result = parseAppConfig(static_cast<int>(argv.size()), argv.data());
+  return expect(result.status == ParseStatus::kOk, "expected encoder codec alias to parse successfully") &&
+         expect(result.config.encoderCodec == "h265", "expected hevc alias to normalize to h265");
+}
+
+bool testRejectInvalidEncoderCodec() {
+  std::vector<std::string> arguments = {
+      "video_pipeline",
+      "--backend", "rockchip",
+      "--encoder-codec", "foo",
+      "stream.mp4",
+      "model.rknn",
+      "640",
+      "640"};
+  std::vector<char*> argv = makeArgv(arguments);
+  const ParseResult result = parseAppConfig(static_cast<int>(argv.size()), argv.data());
+  return expect(result.status == ParseStatus::kError, "expected invalid encoder codec to fail") &&
+         expect(result.message.find("Unsupported encoder codec: foo") != std::string::npos,
+                "expected invalid encoder codec message");
+}
+
 bool testRejectInvalidVisualStyle() {
   std::vector<std::string> arguments = {
       "video_pipeline",
@@ -178,6 +209,8 @@ int main() {
   ok = ok && testRockchipStableOutputFlags();
   ok = ok && testVisualStyleParsing();
   ok = ok && testRtspOutputParsing();
+  ok = ok && testEncoderCodecAliasParsing();
+  ok = ok && testRejectInvalidEncoderCodec();
   ok = ok && testRejectInvalidVisualStyle();
   return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

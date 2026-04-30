@@ -82,6 +82,12 @@ PostprocBackendType parsePostprocBackend(const std::string& value) {
   throw std::runtime_error("Unsupported postprocessor backend: " + value);
 }
 
+std::string parseEncoderCodec(const std::string& value) {
+  if (value == "h264" || value == "avc") return "h264";
+  if (value == "h265" || value == "hevc") return "h265";
+  throw std::runtime_error("Unsupported encoder codec: " + value);
+}
+
 void applyBackendPreset(const std::string& backendName, AppConfig& config) {
   if (backendName == "rockchip" || backendName == "mpp") {
     config.decoderBackend = DecoderBackendType::kRockchipMpp;
@@ -154,7 +160,7 @@ ParseResult parseAppConfig(int argc, char* argv[]) {
       if (argument == "--output-video") { config.visual.outputVideo = requireNextArg(argc, argv, index, "--output-video"); continue; }
       if (argument == "--output-rtsp") { config.visual.outputRtsp = requireNextArg(argc, argv, index, "--output-rtsp"); continue; }
       if (argument == "--encoder-output") { config.encoderOutput = requireNextArg(argc, argv, index, "--encoder-output"); continue; }
-      if (argument == "--encoder-codec") { config.encoderCodec = requireNextArg(argc, argv, index, "--encoder-codec"); continue; }
+      if (argument == "--encoder-codec") { config.encoderCodec = parseEncoderCodec(requireNextArg(argc, argv, index, "--encoder-codec")); continue; }
       if (argument == "--encoder-bitrate") { config.encoderBitrate = parseIntValue(requireNextArg(argc, argv, index, "--encoder-bitrate"), "--encoder-bitrate"); continue; }
       if (argument == "--encoder-fps") { config.encoderFps = parseIntValue(requireNextArg(argc, argv, index, "--encoder-fps"), "--encoder-fps"); continue; }
       if (!argument.empty() && argument[0] == '-') throw std::runtime_error("Unknown option: " + argument);
@@ -197,10 +203,10 @@ std::string buildUsageMessage(const std::string& programName) {
   message += "  --display-max-height <n>                Max display-path height, 0 keeps source height\n";
   message += "  --output-overlay <cpu|rga>              Overlay mode for --output-video/--output-rtsp (default: cpu)\n";
   message += "  --visual-style <classic|yolo>           Detection label style (default: yolo)\n";
-  message += "  --output-video <path>                   Write annotated video to a file (.h264/.264/.h265/.hevc/.mp4 on Rockchip)\n";
+  message += "  --output-video <path>                   Write annotated video to a file (.h264/.264/.mp4 on Rockchip)\n";
   message += "  --output-rtsp <url>                     Stream annotated video to an RTSP server\n";
-  message += "  --encoder-output <path>                 Write raw decode stream (MPP h264/h265)\n";
-  message += "  --encoder-codec <h264|h265>             Encoder codec (default: h264)\n";
+  message += "  --encoder-output <path>                 Write encoded output stream (Rockchip currently h264 only)\n";
+  message += "  --encoder-codec <h264|h265>             Encoder codec (default: h264; Rockchip output currently h264 only)\n";
   message += "  --encoder-bitrate <bps>                 Encoder bitrate (default: 0 = auto)\n";
   message += "  --encoder-fps <n>                       Encoder fps (default: 0 = source fps)\n";
   message += "  -h, --help                              Show this help message\n";

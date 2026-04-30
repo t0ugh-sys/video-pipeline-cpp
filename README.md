@@ -62,7 +62,7 @@ RTSP 输入说明：
 - `--infer-workers 2` 是当前比较稳的吞吐/稳定性折中
 - `--rknn-zero-copy false` 是当前带框输出路径的稳态选项
 - `--encoder-fps 30` 用来避免把异常高输入帧率原样写进输出导致慢放/卡顿
-- `--output-video` 在 Rockchip 路径下支持裸码流 `.h264/.h265`、`.mp4`，也可以改用 `--output-rtsp rtsp://...`
+- `--output-video` 在 Rockchip 路径下当前支持裸码流 `.h264`、`.mp4`，也可以改用 `--output-rtsp rtsp://...`
 - 默认 `--output-overlay cpu` 走现有稳定的 CPU 画框 + RGA 颜色转换 + MPP 编码链路
 - `--output-overlay rga` 走可选的硬件叠加路径：
   `NV12 -> RGA RGBA scratch -> RGA blend -> RGA NV12 -> MPP encode`
@@ -86,6 +86,20 @@ ffmpeg -y -framerate 30 -i /edge/workspace/vis_modelzoo_full.h264 -c copy /edge/
 OUTPUT_OVERLAY_MODE=rga \
   /edge/workspace/vision-inference-pipeline/scripts/rockchip_output_regression.sh
 ```
+
+如需做 RTSP 输入/输出回归：
+
+```bash
+INPUT_RTSP_URL=rtsp://127.0.0.1:554/input \
+OUTPUT_RTSP_URL=rtsp://127.0.0.1:8554/live/test \
+  /edge/workspace/vision-inference-pipeline/scripts/rockchip_rtsp_regression.sh
+```
+
+说明：
+
+- 这个脚本假设板端已经有可访问的 RTSP 输入源
+- 这个脚本也假设输出 RTSP server 已经就绪，并允许推流到 `OUTPUT_RTSP_URL`
+- 脚本会先启动 `video_pipeline`，再用 `ffprobe` 从输出 RTSP 地址回拉一次视频流做基本验证
 
 ### NVIDIA 平台
 
@@ -165,10 +179,19 @@ Options:
   --output-video <path>                   输出带框视频
   --output-rtsp <url>                     输出带框 RTSP 推流
   --encoder-output <path>                 输出原始解码视频流
-  --encoder-codec <h264|h265>             编码格式
+  --encoder-codec <h264|h265>             编码格式（Rockchip 输出当前仅支持 h264）
   --encoder-bitrate <bps>                 编码码率
   --encoder-fps <n>                       编码帧率 (默认：0 = 跟随输入，异常高帧率时内部会回落)
   -h, --help                              显示帮助
+```
+
+## 测试
+
+Rockchip 构建后，可直接执行当前项目内的轻量回归：
+
+```bash
+cd /edge/workspace/vision-inference-pipeline/build-rockchip
+ctest -R "app_config_test|yolo_postproc_test|validate_app_config_test" --output-on-failure
 ```
 
 ## Visual Styles
@@ -294,7 +317,7 @@ vision-inference-pipeline/
 
 - 这是"最小可改造工程骨架"，不是完整生产工程
 - CUDA 预处理需要完整实现零拷贝路径
-- Rockchip 标注输出当前支持裸 `.h264/.h265`、`.mp4` 与 `rtsp://` 推流
+- Rockchip 标注输出当前支持裸 `.h264`、`.mp4` 与 `rtsp://` 推流
 - NVIDIA `--output-video` 现已通过 FFmpeg mux 写容器；代码路径已接通，但仍建议在目标机上用 `ffprobe` 做首轮验证
 - 输入视频帧率异常高时，Rockchip 输出路径会按目标编码帧率做丢帧，避免输出慢放
 - Rockchip 带框输出当前优先保证稳定性，不追求端到端零拷贝
