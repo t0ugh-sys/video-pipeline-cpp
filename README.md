@@ -16,6 +16,19 @@
 | **Rockchip** (RK3588/RK3568) | MPP 硬解 | RGA | RKNN NPU |
 | **NVIDIA** (GPU) | NVDEC 硬解 | CUDA | TensorRT |
 
+## 支持矩阵
+
+| 类别 | 当前支持 | 当前不支持 / 说明 |
+|------|----------|-------------------|
+| 输入源 | 本地视频文件、`rtsp://` 输入 | RTSP 长时间断流自动重连未实现 |
+| Rockchip 标注输出 | 裸 `.h264/.264`、`.mp4`、`--output-rtsp rtsp://...` | `.h265/.hevc` 当前禁用 |
+| Rockchip 原始编码输出 | `--encoder-output` 写 H.264 | H.265 当前禁用 |
+| NVIDIA 标注输出 | `--output-video` 容器输出 | RTSP 输出代码已接通，但未做同级别板端回归 |
+| YOLOv8 后处理 | 单头 dense、RKNN 多头 branch | 未知单输出 auto-layout 直接报错 |
+| YOLO26 后处理 | FP16 单头 dense、INT8 多头 branch | End-to-end `[1,300,6]` 当前不支持 |
+| 可视化风格 | `classic`、`yolo` | 无 |
+| 输出叠加模式 | `cpu`、`rga` | `rga` 仅限 Rockchip 路径 |
+
 ## 快速开始
 
 ### Rockchip 平台
@@ -91,6 +104,13 @@ ffmpeg -y -framerate 30 -i /edge/workspace/vis_modelzoo_full.h264 -c copy /edge/
 
 ```bash
 OUTPUT_OVERLAY_MODE=rga \
+  /edge/workspace/vision-inference-pipeline/scripts/rockchip_output_regression.sh
+```
+
+如需调整输出回归脚本使用的模型输入尺寸：
+
+```bash
+INPUT_WIDTH=1280 INPUT_HEIGHT=736 \
   /edge/workspace/vision-inference-pipeline/scripts/rockchip_output_regression.sh
 ```
 

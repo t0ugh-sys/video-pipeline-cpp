@@ -9,12 +9,16 @@ MODEL_DEFAULT="/edge/workspace/rk-video-pipeline-cpp/models/stall_int8.rknn"
 OUTPUT_H264_DEFAULT="/edge/workspace/vis_modelzoo_full.h264"
 OUTPUT_MP4_DEFAULT="/edge/workspace/vis_modelzoo_full.mp4"
 OUTPUT_OVERLAY_MODE="${OUTPUT_OVERLAY_MODE:-cpu}"
+INPUT_WIDTH_DEFAULT="${INPUT_WIDTH:-640}"
+INPUT_HEIGHT_DEFAULT="${INPUT_HEIGHT:-640}"
 
 BIN_PATH="${1:-$BIN_DEFAULT}"
 INPUT_PATH="${2:-$INPUT_DEFAULT}"
 MODEL_PATH="${3:-$MODEL_DEFAULT}"
 OUTPUT_H264_PATH="${4:-$OUTPUT_H264_DEFAULT}"
 OUTPUT_MP4_PATH="${5:-$OUTPUT_MP4_DEFAULT}"
+INPUT_WIDTH="${6:-$INPUT_WIDTH_DEFAULT}"
+INPUT_HEIGHT="${7:-$INPUT_HEIGHT_DEFAULT}"
 
 echo "bin=${BIN_PATH}"
 echo "input=${INPUT_PATH}"
@@ -22,6 +26,7 @@ echo "model=${MODEL_PATH}"
 echo "output_h264=${OUTPUT_H264_PATH}"
 echo "output_mp4=${OUTPUT_MP4_PATH}"
 echo "output_overlay=${OUTPUT_OVERLAY_MODE}"
+echo "input_size=${INPUT_WIDTH}x${INPUT_HEIGHT}"
 
 if [[ ! -x "${BIN_PATH}" ]]; then
   echo "error: video_pipeline binary not found or not executable: ${BIN_PATH}" >&2
@@ -66,7 +71,7 @@ rm -f "${OUTPUT_H264_PATH}" "${OUTPUT_MP4_PATH}"
   --output-video "${OUTPUT_H264_PATH}" \
   "${INPUT_PATH}" \
   "${MODEL_PATH}" \
-  640 640
+  "${INPUT_WIDTH}" "${INPUT_HEIGHT}"
 
 if [[ ! -s "${OUTPUT_H264_PATH}" ]]; then
   echo "error: output bitstream was not generated: ${OUTPUT_H264_PATH}" >&2

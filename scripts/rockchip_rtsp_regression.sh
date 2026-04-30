@@ -75,6 +75,11 @@ if ! command -v timeout >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ "${FFPROBE_RTSP_TRANSPORT}" != "tcp" && "${FFPROBE_RTSP_TRANSPORT}" != "udp" ]]; then
+  echo "error: FFPROBE_RTSP_TRANSPORT must be tcp or udp: ${FFPROBE_RTSP_TRANSPORT}" >&2
+  exit 1
+fi
+
 cleanup() {
   if [[ -n "${PIPELINE_PID:-}" ]]; then
     kill "${PIPELINE_PID}" >/dev/null 2>&1 || true

@@ -324,6 +324,26 @@ bool usesRgaAnnotatedOutput(const AppConfig& config) {
          config.visual.outputOverlayMode == OutputOverlayMode::kRga;
 }
 
+const char* visualStyleName(VisualStyle style) {
+  switch (style) {
+    case VisualStyle::kClassic:
+      return "classic";
+    case VisualStyle::kYolo:
+      return "yolo";
+  }
+  return "unknown";
+}
+
+const char* outputOverlayModeName(OutputOverlayMode mode) {
+  switch (mode) {
+    case OutputOverlayMode::kCpu:
+      return "cpu";
+    case OutputOverlayMode::kRga:
+      return "rga";
+  }
+  return "unknown";
+}
+
 int resolveEncoderFps(const AppConfig& config, const SourceVideoInfo& sourceVideoInfo) {
   if (config.encoderFps > 0) {
     return config.encoderFps;
@@ -963,8 +983,35 @@ void runPipeline(const AppConfig& config) {
   const std::size_t inferenceQueueCapacity = static_cast<std::size_t>(std::max(2, config.inferWorkers * 2));
   const std::size_t rgaMaxInflightFrames = static_cast<std::size_t>(std::max(1, config.inferWorkers * 2 + 4));
   const PostprocBackendType resolvedPostprocBackend = resolvePostprocBackend(config);
+  const DecoderBackendType selectedDecoderBackend =
+      config.decoderBackend == DecoderBackendType::kAuto ? detectAvailableDecoderBackend() : config.decoderBackend;
+  const PreprocBackendType selectedPreprocBackend =
+      config.preprocBackend == PreprocBackendType::kAuto ? detectAvailablePreprocBackend() : config.preprocBackend;
+  const InferBackendType selectedInferBackend =
+      config.inferBackend == InferBackendType::kAuto ? detectAvailableInferBackend() : config.inferBackend;
+  const EncoderBackendType selectedEncoderBackend = detectAvailableEncoderBackend();
 
   if (config.verbose) {
+    std::cerr << "[PIPELINE] capabilities"
+              << " compiled_decoder=" << availableDecoderBackends()
+              << " compiled_preproc=" << availablePreprocBackends()
+              << " compiled_infer=" << availableInferBackends()
+              << " compiled_postproc=" << availablePostprocBackends()
+              << " compiled_encoder=" << availableEncoderBackends()
+              << " selected_decoder=" << toString(selectedDecoderBackend)
+              << " selected_preproc=" << toString(selectedPreprocBackend)
+              << " selected_infer=" << toString(selectedInferBackend)
+              << " selected_postproc=" << toString(resolvedPostprocBackend)
+              << " selected_encoder=" << toString(selectedEncoderBackend)
+              << " input_uri=" << config.source.uri
+              << " annotated_output=" << (annotatedOutputPath.empty() ? "none" : annotatedOutputPath)
+              << " encoder_output=" << (config.encoderOutput.empty() ? "none" : config.encoderOutput)
+              << " overlay=" << outputOverlayModeName(config.visual.outputOverlayMode)
+              << " visual_style=" << visualStyleName(config.visual.style)
+              << " letterbox=" << (config.letterbox ? "on" : "off")
+              << " rknn_zero_copy=" << (config.rknnZeroCopy ? "on" : "off")
+              << " model_output_layout=" << toModelOutputLayoutName(config.modelOutputLayout)
+              << "\n";
     std::cerr << "[PIPELINE] postproc requested=" << toString(config.postprocBackend)
               << " resolved=" << toString(resolvedPostprocBackend)
               << " model_output_layout=" << toModelOutputLayoutName(config.modelOutputLayout)
@@ -998,9 +1045,7 @@ void runPipeline(const AppConfig& config) {
     }
     std::cerr << "[PIPELINE] stages decoder=" << decoder->name()
               << " preproc=" << preproc->name()
-              << " infer=" << toString(config.inferBackend == InferBackendType::kAuto
-                     ? detectAvailableInferBackend()
-                     : config.inferBackend)
+              << " infer=" << toString(selectedInferBackend)
               << " postproc=" << toString(resolvedPostprocBackend)
               << " source=" << sourceVideoInfo.width << "x" << sourceVideoInfo.height
               << " fps=" << sourceVideoInfo.fpsNum << "/" << sourceVideoInfo.fpsDen

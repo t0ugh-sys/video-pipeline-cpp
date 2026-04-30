@@ -44,12 +44,40 @@ bool isRtspUrl(const std::string& value) {
   return startsWithIgnoreCase(value, "rtsp://");
 }
 
+bool isAsciiDigits(const std::string& value) {
+  if (value.empty()) {
+    return false;
+  }
+  for (char ch : value) {
+    if (ch < '0' || ch > '9') {
+      return false;
+    }
+  }
+  return true;
+}
+
 std::string getenvOrDefault(const char* name, const char* defaultValue) {
   const char* value = std::getenv(name);
   if (value == nullptr || value[0] == '\0') {
     return std::string(defaultValue);
   }
   return std::string(value);
+}
+
+std::string getenvRtspTransport(const char* name, const char* defaultValue) {
+  const std::string value = toLowerAscii(getenvOrDefault(name, defaultValue));
+  if (value == "tcp" || value == "udp") {
+    return value;
+  }
+  throw std::runtime_error(std::string("Unsupported RTSP transport for ") + name + ": " + value);
+}
+
+std::string getenvPositiveIntegerString(const char* name, const char* defaultValue) {
+  const std::string value = getenvOrDefault(name, defaultValue);
+  if (!isAsciiDigits(value)) {
+    throw std::runtime_error(std::string("Expected a positive integer for ") + name + ": " + value);
+  }
+  return value;
 }
 
 bool envBoolEnabled(const char* name, bool defaultValue) {
@@ -83,8 +111,8 @@ void FFmpegPacketSource::open(const InputSourceConfig& config) {
 
   AVDictionary* inputOptions = nullptr;
   if (isRtspUrl(config.uri)) {
-    const std::string transport = getenvOrDefault("VIP_RTSP_TRANSPORT", "tcp");
-    const std::string stimeoutUs = getenvOrDefault("VIP_RTSP_STIMEOUT_US", "5000000");
+    const std::string transport = getenvRtspTransport("VIP_RTSP_TRANSPORT", "tcp");
+    const std::string stimeoutUs = getenvPositiveIntegerString("VIP_RTSP_STIMEOUT_US", "5000000");
     const bool lowDelayEnabled = envBoolEnabled("VIP_RTSP_LOW_DELAY", true);
     av_dict_set(&inputOptions, "rtsp_transport", transport.c_str(), 0);
     av_dict_set(&inputOptions, "stimeout", stimeoutUs.c_str(), 0);
