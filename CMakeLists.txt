@@ -331,6 +331,9 @@ if(BUILD_TESTING)
 
     if(NOT WIN32)
         add_test(
+            NAME rockchip_output_regression_script_syntax
+            COMMAND bash -n ${CMAKE_CURRENT_SOURCE_DIR}/scripts/rockchip_output_regression.sh)
+        add_test(
             NAME rockchip_rtsp_regression_script_syntax
             COMMAND bash -n ${CMAKE_CURRENT_SOURCE_DIR}/scripts/rockchip_rtsp_regression.sh)
     endif()

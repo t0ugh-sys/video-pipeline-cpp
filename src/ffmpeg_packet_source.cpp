@@ -8,6 +8,7 @@ extern "C" {
 
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -43,6 +44,33 @@ bool isRtspUrl(const std::string& value) {
   return startsWithIgnoreCase(value, "rtsp://");
 }
 
+std::string getenvOrDefault(const char* name, const char* defaultValue) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return std::string(defaultValue);
+  }
+  return std::string(value);
+}
+
+bool envBoolEnabled(const char* name, bool defaultValue) {
+  const char* value = std::getenv(name);
+  if (value == nullptr || value[0] == '\0') {
+    return defaultValue;
+  }
+  const std::string lowered = toLowerAscii(value);
+  if (lowered == "1" || lowered == "true" || lowered == "on" || lowered == "yes") {
+    return true;
+  }
+  if (lowered == "0" || lowered == "false" || lowered == "off" || lowered == "no") {
+    return false;
+  }
+  return defaultValue;
+}
+
+const char* boolToOnOff(bool value) {
+  return value ? "on" : "off";
+}
+
 }  // namespace
 
 FFmpegPacketSource::~FFmpegPacketSource() {
@@ -55,10 +83,21 @@ void FFmpegPacketSource::open(const InputSourceConfig& config) {
 
   AVDictionary* inputOptions = nullptr;
   if (isRtspUrl(config.uri)) {
-    av_dict_set(&inputOptions, "rtsp_transport", "tcp", 0);
-    av_dict_set(&inputOptions, "fflags", "nobuffer", 0);
-    av_dict_set(&inputOptions, "flags", "low_delay", 0);
-    av_dict_set(&inputOptions, "stimeout", "5000000", 0);
+    const std::string transport = getenvOrDefault("VIP_RTSP_TRANSPORT", "tcp");
+    const std::string stimeoutUs = getenvOrDefault("VIP_RTSP_STIMEOUT_US", "5000000");
+    const bool lowDelayEnabled = envBoolEnabled("VIP_RTSP_LOW_DELAY", true);
+    av_dict_set(&inputOptions, "rtsp_transport", transport.c_str(), 0);
+    av_dict_set(&inputOptions, "stimeout", stimeoutUs.c_str(), 0);
+    if (lowDelayEnabled) {
+      av_dict_set(&inputOptions, "fflags", "nobuffer", 0);
+      av_dict_set(&inputOptions, "flags", "low_delay", 0);
+    }
+    inputOptionsSummary_ =
+        "rtsp_transport=" + transport +
+        " stimeout_us=" + stimeoutUs +
+        " low_delay=" + boolToOnOff(lowDelayEnabled);
+  } else {
+    inputOptionsSummary_.clear();
   }
 
   int result = avformat_open_input(&formatContext_, config.uri.c_str(), nullptr, &inputOptions);
@@ -177,6 +216,10 @@ SourceVideoInfo FFmpegPacketSource::videoInfo() const {
   return videoInfo_;
 }
 
+const std::string& FFmpegPacketSource::inputOptionsSummary() const {
+  return inputOptionsSummary_;
+}
+
 VideoCodec FFmpegPacketSource::toVideoCodec(int codecId) {
   switch (codecId) {
     case AV_CODEC_ID_H264:
@@ -199,6 +242,7 @@ void FFmpegPacketSource::close() {
   codec_ = VideoCodec::kUnknown;
   bsfFlushed_ = false;
   videoInfo_ = {};
+  inputOptionsSummary_.clear();
 }
 
 bool FFmpegPacketSource::needsAnnexBFilter() const {

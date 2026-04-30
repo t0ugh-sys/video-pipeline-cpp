@@ -993,6 +993,9 @@ void runPipeline(const AppConfig& config) {
   const SourceVideoInfo sourceVideoInfo = packetSource.videoInfo();
   decoder->open(packetSource.codec());
   if (config.verbose) {
+    if (!packetSource.inputOptionsSummary().empty()) {
+      std::cerr << "[PIPELINE] input_options " << packetSource.inputOptionsSummary() << "\n";
+    }
     std::cerr << "[PIPELINE] stages decoder=" << decoder->name()
               << " preproc=" << preproc->name()
               << " infer=" << toString(config.inferBackend == InferBackendType::kAuto

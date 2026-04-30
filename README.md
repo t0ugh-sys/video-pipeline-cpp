@@ -38,6 +38,13 @@ RTSP 输入说明：
 - 输入源位置参数本身就支持 `rtsp://...`
 - 当前输入端显式按 RTSP 打开，并优先使用 `TCP`
 - 已设置低延迟/低缓冲打开参数；长时间断流自动重连仍未实现
+- 可通过环境变量调整 RTSP 输入行为：
+  `VIP_RTSP_TRANSPORT=tcp|udp`
+  `VIP_RTSP_STIMEOUT_US=<microseconds>`
+  `VIP_RTSP_LOW_DELAY=true|false`
+- `--verbose` 下会额外输出一行
+  `[PIPELINE] input_options ...`
+  用来确认实际生效的 RTSP 打开参数
 
 ### Rockchip 稳定参数
 
@@ -100,6 +107,9 @@ OUTPUT_RTSP_URL=rtsp://127.0.0.1:8554/live/test \
 - 这个脚本假设板端已经有可访问的 RTSP 输入源
 - 这个脚本也假设输出 RTSP server 已经就绪，并允许推流到 `OUTPUT_RTSP_URL`
 - 脚本会先启动 `video_pipeline`，再用 `ffprobe` 从输出 RTSP 地址回拉一次视频流做基本验证
+- 如果 RTSP server 起流较慢，可通过 `STREAM_READY_TIMEOUT_SEC` 调大等待时间
+- 如果希望更频繁或更保守地探测输出流，可通过 `STREAM_READY_POLL_INTERVAL_SEC` 调整轮询间隔
+- 如果 `ffprobe` 单次探测超时过短，可通过 `FFPROBE_TIMEOUT_SEC` 调整
 
 ### NVIDIA 平台
 
@@ -191,7 +201,7 @@ Rockchip 构建后，可直接执行当前项目内的轻量回归：
 
 ```bash
 cd /edge/workspace/vision-inference-pipeline/build-rockchip
-ctest -R "app_config_test|yolo_postproc_test|validate_app_config_test" --output-on-failure
+ctest -R "(app_config_test|yolo_postproc_test|validate_app_config_test|rockchip_output_regression_script_syntax|rockchip_rtsp_regression_script_syntax)" --output-on-failure
 ```
 
 ## Visual Styles

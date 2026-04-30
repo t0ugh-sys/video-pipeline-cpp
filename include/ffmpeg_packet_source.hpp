@@ -19,6 +19,7 @@ class FFmpegPacketSource {
   EncodedPacket readPacket();
   VideoCodec codec() const;
   SourceVideoInfo videoInfo() const;
+  const std::string& inputOptionsSummary() const;
 
  private:
   static VideoCodec toVideoCodec(int codecId);
@@ -34,4 +35,5 @@ class FFmpegPacketSource {
   VideoCodec codec_ = VideoCodec::kUnknown;
   bool bsfFlushed_ = false;
   SourceVideoInfo videoInfo_;
+  std::string inputOptionsSummary_;
 };
