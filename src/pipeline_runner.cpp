@@ -2,11 +2,13 @@
 
 #include "backend_registry.hpp"
 #include "decoder_interface.hpp"
+#include "encoder_timing.hpp"
 #include "encoder_interface.hpp"
 #include "ffmpeg_packet_source.hpp"
 #include "infer_interface.hpp"
 #include "postproc_interface.hpp"
 #include "preproc_interface.hpp"
+#include "rga_shared.hpp"
 #include "visualizer.hpp"
 
 #include "../../rknn_model_zoo/utils/font.h"
@@ -34,6 +36,7 @@ extern "C" {
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -315,13 +318,27 @@ bool wantsHardwareEncodedAnnotatedOutput(const AppConfig& config) {
          hasSuffixIgnoreCase(outputTarget, ".mp4");
 }
 
+OutputOverlayMode effectiveOutputOverlayMode(
+    const AppConfig& config,
+    EncoderBackendType selectedEncoderBackend) {
+  if (config.outputOverlayExplicit) {
+    return config.visual.outputOverlayMode;
+  }
+
+  if (hasAnnotatedOutputTarget(config) &&
+      selectedEncoderBackend == EncoderBackendType::kRockchipMpp) {
+    return OutputOverlayMode::kRga;
+  }
+
+  return config.visual.outputOverlayMode;
+}
+
 bool isRockchipRawHevcPath(const std::string& value) {
   return hasSuffixIgnoreCase(value, ".h265") || hasSuffixIgnoreCase(value, ".hevc");
 }
 
 bool usesRgaAnnotatedOutput(const AppConfig& config) {
-  return wantsHardwareEncodedAnnotatedOutput(config) &&
-         config.visual.outputOverlayMode == OutputOverlayMode::kRga;
+  return wantsHardwareEncodedAnnotatedOutput(config);
 }
 
 const char* visualStyleName(VisualStyle style) {
@@ -344,48 +361,6 @@ const char* outputOverlayModeName(OutputOverlayMode mode) {
   return "unknown";
 }
 
-int resolveEncoderFps(const AppConfig& config, const SourceVideoInfo& sourceVideoInfo) {
-  if (config.encoderFps > 0) {
-    return config.encoderFps;
-  }
-  if (sourceVideoInfo.fpsNum > 0 && sourceVideoInfo.fpsDen > 0) {
-    const int fps = std::max(1, (sourceVideoInfo.fpsNum + sourceVideoInfo.fpsDen / 2) / sourceVideoInfo.fpsDen);
-    if (fps > 60) {
-      return 30;
-    }
-    return fps;
-  }
-  return 30;
-}
-
-int resolveEncoderFpsNum(const AppConfig& config, const SourceVideoInfo& sourceVideoInfo) {
-  if (config.encoderFps > 0) {
-    return config.encoderFps;
-  }
-  if (sourceVideoInfo.fpsNum > 0 && sourceVideoInfo.fpsDen > 0) {
-    const int fps = std::max(1, (sourceVideoInfo.fpsNum + sourceVideoInfo.fpsDen / 2) / sourceVideoInfo.fpsDen);
-    if (fps > 60) {
-      return 30;
-    }
-    return sourceVideoInfo.fpsNum;
-  }
-  return 30;
-}
-
-int resolveEncoderFpsDen(const AppConfig& config, const SourceVideoInfo& sourceVideoInfo) {
-  if (config.encoderFps > 0) {
-    return 1;
-  }
-  if (sourceVideoInfo.fpsNum > 0 && sourceVideoInfo.fpsDen > 0) {
-    const int fps = std::max(1, (sourceVideoInfo.fpsNum + sourceVideoInfo.fpsDen / 2) / sourceVideoInfo.fpsDen);
-    if (fps > 60) {
-      return 1;
-    }
-    return sourceVideoInfo.fpsDen;
-  }
-  return 1;
-}
-
 int computeAutoEncoderBitrate(int width, int height, int fps) {
   const long long pixelsPerSecond =
       static_cast<long long>(std::max(1, width)) *
@@ -401,34 +376,6 @@ int resolveEncoderBitrate(const AppConfig& config, int width, int height, int fp
     return config.encoderBitrate;
   }
   return computeAutoEncoderBitrate(width, height, fps);
-}
-
-bool shouldKeepEncodedFrame(
-    std::size_t zeroBasedFrameIndex,
-    const SourceVideoInfo& sourceVideoInfo,
-    int targetFps) {
-  if (zeroBasedFrameIndex == 0) {
-    return true;
-  }
-  if (targetFps <= 0 || sourceVideoInfo.fpsNum <= 0 || sourceVideoInfo.fpsDen <= 0) {
-    return true;
-  }
-
-  const long long sourceNum = static_cast<long long>(sourceVideoInfo.fpsNum);
-  const long long sourceDen = static_cast<long long>(sourceVideoInfo.fpsDen);
-  const long long targetNum = static_cast<long long>(targetFps) * sourceDen;
-  if (targetNum >= sourceNum) {
-    return true;
-  }
-
-  // Map the input frame index onto the target output timeline using integer
-  // accumulation. We keep only frames that advance the output frame count, so
-  // high-fps sources can be encoded at a sane output fps without slow-motion.
-  const long long prevCount =
-      (static_cast<long long>(zeroBasedFrameIndex) * targetNum) / sourceNum;
-  const long long currCount =
-      (static_cast<long long>(zeroBasedFrameIndex + 1) * targetNum) / sourceNum;
-  return currCount != prevCount;
 }
 
 void fillRgbaRect(
@@ -656,6 +603,7 @@ DecodedFrame makeAnnotatedEncodeFrame(
     const DecodedFrame& frame,
     const DetectionResult& result,
     const VisualConfig& config) {
+  std::lock_guard<std::mutex> rgaLock(globalRgaMutex());
   if (frame.dmaFd < 0 || result.boxes.empty()) {
     return frame;
   }
@@ -905,6 +853,8 @@ void validateAppConfig(const AppConfig& config) {
       availablePostprocBackends,
       toString);
   const EncoderBackendType selectedEncoderBackend = detectAvailableEncoderBackend();
+  const OutputOverlayMode outputOverlayMode =
+      effectiveOutputOverlayMode(config, selectedEncoderBackend);
 
   if (!config.visual.outputVideo.empty() && !config.visual.outputRtsp.empty()) {
     throw std::runtime_error("Specify only one annotated output target: use either --output-video or --output-rtsp");
@@ -942,7 +892,7 @@ void validateAppConfig(const AppConfig& config) {
     }
   }
 
-  if (config.visual.outputOverlayMode == OutputOverlayMode::kRga &&
+  if (outputOverlayMode == OutputOverlayMode::kRga &&
       hasAnnotatedOutputTarget(config) &&
       selectedEncoderBackend == EncoderBackendType::kNvidiaNvEnc) {
     throw std::runtime_error(
@@ -964,7 +914,7 @@ void validateAppConfig(const AppConfig& config) {
   }
 
   if (config.visual.display ||
-      (hasAnnotatedOutputTarget(config) && config.visual.outputOverlayMode != OutputOverlayMode::kRga)) {
+      (hasAnnotatedOutputTarget(config) && outputOverlayMode != OutputOverlayMode::kRga)) {
     const auto visualizer = createVisualizer();
     if (!visualizer->isAvailable()) {
       throw std::runtime_error(
@@ -975,8 +925,12 @@ void validateAppConfig(const AppConfig& config) {
 
 void runPipeline(const AppConfig& config) {
   const std::string annotatedOutputPath = annotatedOutputTarget(config);
+  const EncoderBackendType selectedEncoderBackend = detectAvailableEncoderBackend();
+  const OutputOverlayMode outputOverlayMode =
+      effectiveOutputOverlayMode(config, selectedEncoderBackend);
   const bool needsHardwareEncodedAnnotatedVideo = wantsHardwareEncodedAnnotatedOutput(config);
-  const bool useRgaAnnotatedOutput = usesRgaAnnotatedOutput(config);
+  const bool useRgaAnnotatedOutput =
+      needsHardwareEncodedAnnotatedVideo && outputOverlayMode == OutputOverlayMode::kRga;
   const bool needsVisualizerDraw = config.visual.display ||
                                    (!annotatedOutputPath.empty() && !useRgaAnnotatedOutput);
   const bool needsDisplayFrame = needsVisualizerDraw || config.dumpFirstFrame;
@@ -989,7 +943,6 @@ void runPipeline(const AppConfig& config) {
       config.preprocBackend == PreprocBackendType::kAuto ? detectAvailablePreprocBackend() : config.preprocBackend;
   const InferBackendType selectedInferBackend =
       config.inferBackend == InferBackendType::kAuto ? detectAvailableInferBackend() : config.inferBackend;
-  const EncoderBackendType selectedEncoderBackend = detectAvailableEncoderBackend();
 
   if (config.verbose) {
     std::cerr << "[PIPELINE] capabilities"
@@ -1006,7 +959,7 @@ void runPipeline(const AppConfig& config) {
               << " input_uri=" << config.source.uri
               << " annotated_output=" << (annotatedOutputPath.empty() ? "none" : annotatedOutputPath)
               << " encoder_output=" << (config.encoderOutput.empty() ? "none" : config.encoderOutput)
-              << " overlay=" << outputOverlayModeName(config.visual.outputOverlayMode)
+              << " overlay=" << outputOverlayModeName(outputOverlayMode)
               << " visual_style=" << visualStyleName(config.visual.style)
               << " letterbox=" << (config.letterbox ? "on" : "off")
               << " rknn_zero_copy=" << (config.rknnZeroCopy ? "on" : "off")

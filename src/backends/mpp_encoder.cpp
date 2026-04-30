@@ -1,4 +1,5 @@
 #include "backends/mpp_encoder.hpp"
+#include "rga_shared.hpp"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -33,6 +34,7 @@ namespace {
 constexpr size_t kPacketBufferMinSize = 512 * 1024;
 constexpr auto kDrainRetrySleep = std::chrono::milliseconds(2);
 constexpr int kDrainRetryCount = 50;
+constexpr int kFlushDrainRetryCount = 5000;
 
 void checkMppStatus(MPP_RET status, const char* message) {
   if (status != MPP_OK) {
@@ -119,6 +121,16 @@ bool isRtspUrl(const std::string& value) {
   return startsWithIgnoreCase(value, "rtsp://");
 }
 
+int64_t computePacketDurationTicks(int fpsNum, int fpsDen, const AVRational& timeBase) {
+  const int safeFpsNum = std::max(1, fpsNum);
+  const int safeFpsDen = std::max(1, fpsDen);
+  const int64_t ticks = av_rescale_q(
+      1,
+      AVRational{safeFpsDen, safeFpsNum},
+      timeBase);
+  return std::max<int64_t>(1, ticks);
+}
+
 AVCodecID toAvCodecId(const std::string& codec) {
   if (codec == "hevc" || codec == "h265") {
     return AV_CODEC_ID_HEVC;
@@ -179,6 +191,71 @@ bool containsH264IdrNal(const std::uint8_t* data, std::size_t size) {
   return false;
 }
 
+bool isH264ParameterNalType(std::uint8_t nalType) {
+  return nalType == 7 || nalType == 8 || nalType == 9;
+}
+
+const std::uint8_t* filterRtspAnnexBPayload(
+    const std::uint8_t* data,
+    std::size_t size,
+    std::vector<std::uint8_t>& scratch,
+    std::size_t* filteredSize) {
+  if (data == nullptr || size == 0) {
+    *filteredSize = 0;
+    return nullptr;
+  }
+
+  scratch.clear();
+  bool removedParameterSets = false;
+  bool keptAnyNal = false;
+
+  std::size_t nalStart = 0;
+  while (nalStart < size) {
+    std::size_t startCodeSize = 0;
+    if (!hasAnnexBStartCode(data, size, nalStart, &startCodeSize)) {
+      ++nalStart;
+      continue;
+    }
+
+    const std::size_t nalHeaderOffset = nalStart + startCodeSize;
+    if (nalHeaderOffset >= size) {
+      break;
+    }
+
+    std::size_t nalEnd = nalHeaderOffset;
+    while (nalEnd < size) {
+      std::size_t nextStartCodeSize = 0;
+      if (hasAnnexBStartCode(data, size, nalEnd, &nextStartCodeSize)) {
+        break;
+      }
+      ++nalEnd;
+    }
+
+    const std::uint8_t nalType = data[nalHeaderOffset] & 0x1f;
+    if (isH264ParameterNalType(nalType)) {
+      removedParameterSets = true;
+    } else {
+      scratch.insert(scratch.end(), data + nalStart, data + nalEnd);
+      keptAnyNal = true;
+    }
+
+    nalStart = nalEnd;
+  }
+
+  if (!removedParameterSets) {
+    *filteredSize = size;
+    return data;
+  }
+
+  if (!keptAnyNal) {
+    *filteredSize = 0;
+    return nullptr;
+  }
+
+  *filteredSize = scratch.size();
+  return scratch.data();
+}
+
 }  // namespace
 
 MppEncoder::MppEncoder() = default;
@@ -216,6 +293,7 @@ void MppEncoder::init(const EncoderConfig& config) {
   fpsDen_ = config.fpsDen > 0 ? config.fpsDen : 1;
   nextPacketPts_ = 0;
   outputMuxingRequested_ = hasSuffixIgnoreCase(config.outputPath, ".mp4") || isRtspUrl(config.outputPath);
+  rtspOutput_ = isRtspUrl(config.outputPath);
   initOutputSink(config);
   logMppRgbEncodeStep("init_output_opened");
 
@@ -364,7 +442,7 @@ void MppEncoder::encode(const RgbImage& frame, int64_t pts) {
 
   logMppRgbEncodeStep("got_input_buffer");
   {
-    std::lock_guard<std::mutex> lock(rgaMutex_);
+    std::lock_guard<std::mutex> lock(globalRgaMutex());
     // Let RGA write directly into the MPP-owned dma-buf. Earlier host memset /
     // virtual-address staging paths were a source of visible line artifacts.
     rga_buffer_handle_t srcHandle =
@@ -420,7 +498,10 @@ void MppEncoder::encode(const RgbImage& frame, int64_t pts) {
     mpp_frame_set_hor_stride(inputFrame, horStride_);
     mpp_frame_set_ver_stride(inputFrame, verStride_);
     mpp_frame_set_fmt(inputFrame, frameFormat_);
-    mpp_frame_set_pts(inputFrame, pts >= 0 ? pts : frameIndex_);
+    // The pipeline PTS comes from the source demuxer time base, which is not
+    // available here. Feed MPP a monotonic frame index so downstream muxing
+    // uses a stable encoder-owned timeline for MP4/RTSP output.
+    mpp_frame_set_pts(inputFrame, frameIndex_);
     ++frameIndex_;
     mpp_frame_set_buffer(inputFrame, inputBuffer_);
 
@@ -428,9 +509,8 @@ void MppEncoder::encode(const RgbImage& frame, int64_t pts) {
     logMppRgbEncodeStep("encode_put_frame_done");
     mpp_frame_deinit(&inputFrame);
     bool gotPacket = false;
-    bool eoi = true;
     int retries = 0;
-    do {
+    while (true) {
       MppPacket encodedPacket = nullptr;
       checkMppStatus(api_->encode_get_packet(context_, &encodedPacket), "encode_get_packet failed");
       if (encodedPacket == nullptr) {
@@ -447,9 +527,9 @@ void MppEncoder::encode(const RgbImage& frame, int64_t pts) {
       retries = 0;
       logMppRgbEncodeStep("encode_get_packet_done");
       writePacket(encodedPacket);
-      eoi = mpp_packet_is_partition(encodedPacket) ? mpp_packet_is_eoi(encodedPacket) != 0 : true;
       mpp_packet_deinit(&encodedPacket);
-    } while (!eoi);
+      break;
+    }
     logMppRgbEncodeStep("encode_done");
   } catch (...) {
     if (inputFrame != nullptr) {
@@ -499,7 +579,10 @@ void MppEncoder::encodeDecodedFrame(const DecodedFrame& frame, int64_t pts) {
     mpp_frame_set_hor_stride(inputFrame, frame.horizontalStride > 0 ? frame.horizontalStride : horStride_);
     mpp_frame_set_ver_stride(inputFrame, frame.verticalStride > 0 ? frame.verticalStride : verStride_);
     mpp_frame_set_fmt(inputFrame, MPP_FMT_YUV420SP);
-    mpp_frame_set_pts(inputFrame, pts);
+    // Decoded-frame PTS values are still expressed in the source stream's time
+    // base. The MPP encoder/mux path owns a fixed FPS timeline, so use the
+    // encoded frame index instead of forwarding the demuxer time base directly.
+    mpp_frame_set_pts(inputFrame, frameIndex_);
     mpp_frame_set_buffer(inputFrame, inputBuffer);
 
     checkMppStatus(api_->encode_put_frame(context_, inputFrame), "encode_put_frame failed");
@@ -508,9 +591,8 @@ void MppEncoder::encodeDecodedFrame(const DecodedFrame& frame, int64_t pts) {
     mpp_buffer_put(inputBuffer);
     inputBuffer = nullptr;
     bool gotPacket = false;
-    bool eoi = true;
     int retries = 0;
-    do {
+    while (true) {
       MppPacket packet = nullptr;
       checkMppStatus(api_->encode_get_packet(context_, &packet), "encode_get_packet failed");
       if (packet == nullptr) {
@@ -523,9 +605,9 @@ void MppEncoder::encodeDecodedFrame(const DecodedFrame& frame, int64_t pts) {
       gotPacket = true;
       retries = 0;
       writePacket(packet);
-      eoi = mpp_packet_is_partition(packet) ? mpp_packet_is_eoi(packet) != 0 : true;
       mpp_packet_deinit(&packet);
-    } while (!eoi);
+      break;
+    }
   } catch (...) {
     if (inputFrame != nullptr) {
       mpp_frame_deinit(&inputFrame);
@@ -588,6 +670,8 @@ void MppEncoder::close() {
   initialized_ = false;
   flushSubmitted_ = false;
   outputMuxingRequested_ = false;
+  muxHeaderWritten_ = false;
+  rtspOutput_ = false;
   width_ = 0;
   height_ = 0;
   horStride_ = 0;
@@ -597,6 +681,9 @@ void MppEncoder::close() {
   fpsNum_ = 30;
   fpsDen_ = 1;
   nextPacketPts_ = 0;
+  packetDurationTicks_ = 1;
+  packetTimebaseNum_ = 1;
+  packetTimebaseDen_ = 1;
 }
 
 void MppEncoder::writePacket(void* opaquePacket) {
@@ -606,14 +693,22 @@ void MppEncoder::writePacket(void* opaquePacket) {
   }
 
   void* data = mpp_packet_get_pos(packet);
-  const size_t length = mpp_packet_get_length(packet);
+  size_t length = mpp_packet_get_length(packet);
   if (data == nullptr || length == 0) {
     return;
   }
 
   if (writesMp4Container()) {
-    const bool partitioned = mpp_packet_is_partition(packet) != 0;
-    const bool endOfFrame = !partitioned || mpp_packet_is_eoi(packet) != 0;
+    if (rtspOutput_) {
+      data = const_cast<std::uint8_t*>(filterRtspAnnexBPayload(
+          static_cast<const std::uint8_t*>(data),
+          length,
+          muxPacketScratch_,
+          &length));
+      if (data == nullptr || length == 0) {
+        return;
+      }
+    }
     // MPP gives Annex-B H.264. Mark IDR access units as keyframes so MP4 seeking stays sane.
     const bool isKeyframe = containsH264IdrNal(static_cast<const std::uint8_t*>(data), length);
     AVPacket muxPacket;
@@ -623,14 +718,15 @@ void MppEncoder::writePacket(void* opaquePacket) {
     muxPacket.stream_index = muxVideoStream_->index;
     muxPacket.pts = nextPacketPts_;
     muxPacket.dts = nextPacketPts_;
-    muxPacket.duration = endOfFrame ? 1 : 0;
+    muxPacket.duration = packetDurationTicks_;
     muxPacket.flags = isKeyframe ? AV_PKT_FLAG_KEY : 0;
-    av_packet_rescale_ts(&muxPacket, AVRational{fpsDen_, fpsNum_}, muxVideoStream_->time_base);
+    av_packet_rescale_ts(
+        &muxPacket,
+        AVRational{packetTimebaseNum_, packetTimebaseDen_},
+        muxVideoStream_->time_base);
     checkAvStatus(av_interleaved_write_frame(muxFormatContext_, &muxPacket),
                   "av_interleaved_write_frame failed");
-    if (endOfFrame) {
-      ++nextPacketPts_;
-    }
+    nextPacketPts_ += packetDurationTicks_;
     return;
   }
 
@@ -664,7 +760,11 @@ void MppEncoder::initMp4Muxer(const EncoderConfig& config) {
     throw std::runtime_error("avformat_new_stream failed");
   }
 
-  muxVideoStream_->time_base = AVRational{fpsDen_, fpsNum_};
+  if (outputRtsp) {
+    muxVideoStream_->time_base = AVRational{1, 90000};
+  } else {
+    muxVideoStream_->time_base = AVRational{fpsDen_, fpsNum_};
+  }
   muxVideoStream_->avg_frame_rate = AVRational{fpsNum_, fpsDen_};
   muxVideoStream_->codecpar->codec_type = AVMEDIA_TYPE_VIDEO;
   muxVideoStream_->codecpar->codec_id = toAvCodecId(config.codec);
@@ -690,15 +790,23 @@ void MppEncoder::initMp4Muxer(const EncoderConfig& config) {
   if (outputRtsp) {
     av_dict_set(&muxOptions, "rtsp_transport", "tcp", 0);
     av_dict_set(&muxOptions, "muxdelay", "0.1", 0);
+    av_dict_set(&muxOptions, "muxpreload", "0", 0);
   }
+  packetTimebaseNum_ = muxVideoStream_->time_base.num;
+  packetTimebaseDen_ = muxVideoStream_->time_base.den;
+  packetDurationTicks_ = computePacketDurationTicks(fpsNum_, fpsDen_, muxVideoStream_->time_base);
+  nextPacketPts_ = 0;
   const int headerStatus = avformat_write_header(muxFormatContext_, &muxOptions);
   av_dict_free(&muxOptions);
   checkAvStatus(headerStatus, "avformat_write_header failed");
+  muxHeaderWritten_ = true;
 }
 
 void MppEncoder::closeOutputSink() {
   if (muxFormatContext_ != nullptr) {
-    av_write_trailer(muxFormatContext_);
+    if (muxHeaderWritten_) {
+      av_write_trailer(muxFormatContext_);
+    }
     if ((muxFormatContext_->oformat->flags & AVFMT_NOFILE) == 0 && muxFormatContext_->pb != nullptr) {
       avio_closep(&muxFormatContext_->pb);
     }
@@ -706,6 +814,7 @@ void MppEncoder::closeOutputSink() {
     muxFormatContext_ = nullptr;
     muxVideoStream_ = nullptr;
     muxHeader_.clear();
+    muxHeaderWritten_ = false;
   }
   if (outputFile_.is_open()) {
     outputFile_.close();
@@ -718,7 +827,8 @@ void MppEncoder::drainPackets(bool untilEos) {
     MppPacket packet = nullptr;
     checkMppStatus(api_->encode_get_packet(context_, &packet), "encode_get_packet failed");
     if (packet == nullptr) {
-      if (untilEos && retries++ < kDrainRetryCount) {
+      const int maxRetries = untilEos ? kFlushDrainRetryCount : kDrainRetryCount;
+      if (untilEos && retries++ < maxRetries) {
         std::this_thread::sleep_for(kDrainRetrySleep);
         continue;
       }

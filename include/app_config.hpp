@@ -29,6 +29,7 @@ struct AppConfig {
   RknnCoreMaskMode rknnCoreMask = RknnCoreMaskMode::kAuto;
   int gpuId = 0;
   int maxFrames = 0;
+  bool outputOverlayExplicit = false;
   std::string encoderOutput;
   std::string encoderCodec = "h264";
   int encoderBitrate = 0;

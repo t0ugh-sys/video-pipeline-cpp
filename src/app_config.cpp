@@ -155,7 +155,11 @@ ParseResult parseAppConfig(int argc, char* argv[]) {
       if (argument == "--display") { config.visual.display = true; continue; }
       if (argument == "--display-max-width") { config.visual.displayMaxWidth = parseIntValue(requireNextArg(argc, argv, index, "--display-max-width"), "--display-max-width"); continue; }
       if (argument == "--display-max-height") { config.visual.displayMaxHeight = parseIntValue(requireNextArg(argc, argv, index, "--display-max-height"), "--display-max-height"); continue; }
-      if (argument == "--output-overlay") { config.visual.outputOverlayMode = parseOutputOverlayMode(requireNextArg(argc, argv, index, "--output-overlay")); continue; }
+      if (argument == "--output-overlay") {
+        config.visual.outputOverlayMode = parseOutputOverlayMode(requireNextArg(argc, argv, index, "--output-overlay"));
+        config.outputOverlayExplicit = true;
+        continue;
+      }
       if (argument == "--visual-style") { config.visual.style = parseVisualStyle(requireNextArg(argc, argv, index, "--visual-style")); continue; }
       if (argument == "--output-video") { config.visual.outputVideo = requireNextArg(argc, argv, index, "--output-video"); continue; }
       if (argument == "--output-rtsp") { config.visual.outputRtsp = requireNextArg(argc, argv, index, "--output-rtsp"); continue; }
@@ -201,7 +205,7 @@ std::string buildUsageMessage(const std::string& programName) {
   message += "  --display                               Enable display window\n";
   message += "  --display-max-width <n>                 Max display-path width, 0 keeps source width\n";
   message += "  --display-max-height <n>                Max display-path height, 0 keeps source height\n";
-  message += "  --output-overlay <cpu|rga>              Overlay mode for --output-video/--output-rtsp (default: cpu)\n";
+  message += "  --output-overlay <cpu|rga>              Overlay mode for --output-video/--output-rtsp (Rockchip annotated output auto: rga)\n";
   message += "  --visual-style <classic|yolo>           Detection label style (default: yolo)\n";
   message += "  --output-video <path>                   Write annotated video to a file (.h264/.264/.mp4 on Rockchip)\n";
   message += "  --output-rtsp <url>                     Stream annotated video to an RTSP server\n";

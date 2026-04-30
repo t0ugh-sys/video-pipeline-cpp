@@ -171,7 +171,7 @@ if(ENABLE_NVENC_ENCODER)
     endif()
 endif()
 
-set(COMMON_SOURCES src/app_config.cpp src/backend_registry.cpp src/main.cpp src/ffmpeg_packet_source.cpp src/pipeline_runner.cpp)
+set(COMMON_SOURCES src/app_config.cpp src/backend_registry.cpp src/encoder_timing.cpp src/main.cpp src/ffmpeg_packet_source.cpp src/pipeline_runner.cpp)
 set(DECODER_SOURCES src/backends/decoder_factory.cpp)
 set(PREPROC_SOURCES src/backends/preproc_factory.cpp)
 set(INFER_SOURCES src/backends/infer_factory.cpp)
@@ -295,6 +295,7 @@ if(BUILD_TESTING)
     set(TEST_PIPELINE_SOURCES
         src/app_config.cpp
         src/backend_registry.cpp
+        src/encoder_timing.cpp
         src/ffmpeg_packet_source.cpp
         src/pipeline_runner.cpp
         ${DECODER_SOURCES}
@@ -310,6 +311,16 @@ if(BUILD_TESTING)
     endif()
     target_include_directories(app_config_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     add_test(NAME app_config_test COMMAND $<TARGET_FILE:app_config_test>)
+
+    add_executable(
+        encoder_timing_test
+        src/encoder_timing.cpp
+        tests/encoder_timing_test.cpp)
+    if(MSVC)
+        set_property(TARGET encoder_timing_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    target_include_directories(encoder_timing_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME encoder_timing_test COMMAND $<TARGET_FILE:encoder_timing_test>)
 
     add_executable(yolo_postproc_test
         src/backends/yolo_postproc.cpp

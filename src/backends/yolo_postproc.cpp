@@ -19,7 +19,7 @@ struct DenseOrientationStats {
   float classMin = std::numeric_limits<float>::infinity();
   float classMax = -std::numeric_limits<float>::infinity();
 };
-constexpr std::size_t kMaxCandidatesBeforeNms = 200;
+constexpr std::size_t kMaxCandidatesBeforeNms = 8400;
 constexpr std::size_t kMaxDetectionsAfterNms = 50;
 
 const std::vector<std::string>& coco80Labels() {
@@ -445,30 +445,51 @@ DetectionResult YoloPostprocessor::postprocess(const InferenceOutput& output, co
 DetectionResult YoloPostprocessor::postprocessDenseTensor(const InferenceTensor& tensor, const RgbImage& modelInput, int originalWidth, int originalHeight, int64_t pts) const {
   DenseLayout layout;
   if (!buildDenseLayout(tensor, layout) || layout.attributes < 5) throw std::runtime_error("Unsupported dense YOLO tensor shape");
-  const std::vector<float> values = valuesAsFloat(tensor);
+  std::vector<float> ownedValues;
+  const std::vector<float>& values = tensor.data.empty() ? (ownedValues = valuesAsFloat(tensor)) : tensor.data;
   const bool hasObjectness = layout.attributes == 85;
   const int classOffset = hasObjectness ? 5 : 4;
   const int classCount = std::max(1, layout.attributes - classOffset);
   const auto& labels = labelsForClassCount(classCount);
   DetectionResult result{pts, {}, originalWidth, originalHeight};
   std::vector<BoundingBox> boxes;
-  const DenseOrientationStats primaryOrientation = evaluateDenseOrientation(
-      values, layout.proposals, layout.attributes, layout.transposed, hasObjectness, classOffset, classCount);
-  const DenseOrientationStats alternateOrientation = evaluateDenseOrientation(
-      values, layout.proposals, layout.attributes, !layout.transposed, hasObjectness, classOffset, classCount);
+  DenseOrientationStats primaryOrientation;
+  DenseOrientationStats alternateOrientation;
   bool useTransposed = layout.transposed;
-  // Some single-head exports report [1,84,8400] but must be read proposal-first.
-  // Prefer the orientation that exposes non-degenerate class channels.
-  const bool primaryLooksDead =
-      primaryOrientation.classMin == 0.0f && primaryOrientation.classMax == 0.0f;
-  const bool alternateHasSignal =
-      alternateOrientation.classMin != 0.0f || alternateOrientation.classMax != 0.0f;
-  if (primaryLooksDead && alternateHasSignal) {
-    useTransposed = !layout.transposed;
-  } else if (alternateOrientation.bestScore > primaryOrientation.bestScore + 1e-5f &&
-             (alternateOrientation.classMax - alternateOrientation.classMin) >
-                 (primaryOrientation.classMax - primaryOrientation.classMin) + 1e-5f) {
-    useTransposed = !layout.transposed;
+  const bool orientationCacheHit =
+      denseOrientationCached_ &&
+      denseOrientationCachedProposals_ == layout.proposals &&
+      denseOrientationCachedAttributes_ == layout.attributes &&
+      denseOrientationCachedClassOffset_ == classOffset &&
+      denseOrientationCachedClassCount_ == classCount &&
+      denseOrientationCachedHasObjectness_ == hasObjectness;
+  if (orientationCacheHit) {
+    useTransposed = denseOrientationUseTransposed_;
+  } else {
+    primaryOrientation = evaluateDenseOrientation(
+        values, layout.proposals, layout.attributes, layout.transposed, hasObjectness, classOffset, classCount);
+    alternateOrientation = evaluateDenseOrientation(
+        values, layout.proposals, layout.attributes, !layout.transposed, hasObjectness, classOffset, classCount);
+    // Some single-head exports report [1,84,8400] but must be read proposal-first.
+    // Prefer the orientation that exposes non-degenerate class channels.
+    const bool primaryLooksDead =
+        primaryOrientation.classMin == 0.0f && primaryOrientation.classMax == 0.0f;
+    const bool alternateHasSignal =
+        alternateOrientation.classMin != 0.0f || alternateOrientation.classMax != 0.0f;
+    if (primaryLooksDead && alternateHasSignal) {
+      useTransposed = !layout.transposed;
+    } else if (alternateOrientation.bestScore > primaryOrientation.bestScore + 1e-5f &&
+               (alternateOrientation.classMax - alternateOrientation.classMin) >
+                   (primaryOrientation.classMax - primaryOrientation.classMin) + 1e-5f) {
+      useTransposed = !layout.transposed;
+    }
+    denseOrientationCached_ = true;
+    denseOrientationCachedProposals_ = layout.proposals;
+    denseOrientationCachedAttributes_ = layout.attributes;
+    denseOrientationCachedClassOffset_ = classOffset;
+    denseOrientationCachedClassCount_ = classCount;
+    denseOrientationCachedHasObjectness_ = hasObjectness;
+    denseOrientationUseTransposed_ = useTransposed;
   }
   auto proposalValue = [&](int proposalIndex, int attributeIndex) -> float {
     return denseValueAt(values, layout.proposals, layout.attributes, useTransposed, proposalIndex, attributeIndex);
@@ -546,6 +567,7 @@ DetectionResult YoloPostprocessor::postprocessDenseTensor(const InferenceTensor&
               << boxMin[2] << ".." << boxMax[2] << ", "
               << boxMin[3] << ".." << boxMax[3] << "]"
               << " class_minmax=[" << classMin << ".." << classMax << "]"
+              << " orientation_cache=" << (orientationCacheHit ? "hit" : "miss")
               << " primary_best=" << primaryOrientation.bestScore
               << " primary_class_minmax=[" << primaryOrientation.classMin << ".." << primaryOrientation.classMax << "]"
               << " alternate_best=" << alternateOrientation.bestScore
@@ -560,7 +582,18 @@ DetectionResult YoloPostprocessor::postprocessDenseTensor(const InferenceTensor&
     std::cerr << "\n";
     denseTensorStatsLogged_ = true;
   }
+  if (boxes.size() > kMaxCandidatesBeforeNms) {
+    std::partial_sort(
+        boxes.begin(),
+        boxes.begin() + static_cast<std::ptrdiff_t>(kMaxCandidatesBeforeNms),
+    boxes.end(),
+        [](const BoundingBox& a, const BoundingBox& b) { return a.score > b.score; });
+    boxes.resize(kMaxCandidatesBeforeNms);
+  }
   boxes = nms(boxes, options_.nmsThreshold);
+  if (boxes.size() > kMaxDetectionsAfterNms) {
+    boxes.resize(kMaxDetectionsAfterNms);
+  }
   mapBoxesToOriginal(boxes, modelInput, originalWidth, originalHeight);
   result.boxes = std::move(boxes);
   return result;
@@ -696,7 +729,8 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
 DetectionResult YoloPostprocessor::postprocessYolo26E2E(const InferenceTensor& tensor, const RgbImage& modelInput, int originalWidth, int originalHeight, int64_t pts) const {
   DenseLayout layout;
   if (!buildDenseLayout(tensor, layout) || layout.attributes != 6) throw std::runtime_error("Unsupported YOLO26 end-to-end tensor shape");
-  const auto values = valuesAsFloat(tensor);
+  std::vector<float> ownedValues;
+  const std::vector<float>& values = tensor.data.empty() ? (ownedValues = valuesAsFloat(tensor)) : tensor.data;
   const auto& labels = labelsForClassCount(80);
   std::vector<BoundingBox> boxes;
   auto proposalValue = [&](int proposalIndex, int attributeIndex) -> float {

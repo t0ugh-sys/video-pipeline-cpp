@@ -55,4 +55,11 @@ class YoloPostprocessor : public IPostprocessor {
   mutable bool autoLayoutLogged_ = false;
   mutable bool denseTensorStatsLogged_ = false;
   mutable bool flatExperimentalLogged_ = false;
+  mutable bool denseOrientationCached_ = false;
+  mutable int denseOrientationCachedProposals_ = 0;
+  mutable int denseOrientationCachedAttributes_ = 0;
+  mutable int denseOrientationCachedClassOffset_ = 0;
+  mutable int denseOrientationCachedClassCount_ = 0;
+  mutable bool denseOrientationCachedHasObjectness_ = false;
+  mutable bool denseOrientationUseTransposed_ = false;
 };

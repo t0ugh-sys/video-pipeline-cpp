@@ -50,10 +50,13 @@ class MppEncoder : public IEncoderBackend {
   AVFormatContext* muxFormatContext_ = nullptr;
   AVStream* muxVideoStream_ = nullptr;
   std::vector<std::uint8_t> muxHeader_;
+  std::vector<std::uint8_t> muxPacketScratch_;
   std::mutex rgaMutex_;
   bool initialized_ = false;
   bool flushSubmitted_ = false;
   bool outputMuxingRequested_ = false;
+  bool muxHeaderWritten_ = false;
+  bool rtspOutput_ = false;
   int width_ = 0;
   int height_ = 0;
   int horStride_ = 0;
@@ -65,4 +68,7 @@ class MppEncoder : public IEncoderBackend {
   int fpsNum_ = 30;
   int fpsDen_ = 1;
   int64_t nextPacketPts_ = 0;
+  int64_t packetDurationTicks_ = 1;
+  int packetTimebaseNum_ = 1;
+  int packetTimebaseDen_ = 1;
 };

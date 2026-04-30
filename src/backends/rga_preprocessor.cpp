@@ -1,4 +1,5 @@
 #include "backends/rga_preprocessor.hpp"
+#include "rga_shared.hpp"
 
 extern "C" {
 #include <mpp_buffer.h>
@@ -11,6 +12,7 @@ extern "C" {
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -307,6 +309,7 @@ RgbImage RgaPreprocessor::convertAndResize(
     int outputWidth,
     int outputHeight,
     const PreprocessOptions& options) {
+  std::lock_guard<std::mutex> rgaLock(globalRgaMutex());
   if (frame.dmaFd < 0) {
     throw std::runtime_error("Decoded frame does not provide a valid dma fd");
   }
@@ -436,7 +439,6 @@ RgbImage RgaPreprocessor::convertAndResize(
           checkRgaOp(
               imcvtcolor(resizedNv12, resizedRgb, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
               "imcvtcolor(NV12->RGB)");
-
           const int top = output.letterbox.padTop;
           const int bottom = output.letterbox.padBottom;
           const int left = output.letterbox.padLeft;
