@@ -15,6 +15,9 @@ class YoloPostprocessor : public IPostprocessor {
 
   std::string name() const override;
 
+  static float computeIoU(const BoundingBox& a, const BoundingBox& b);
+  static std::vector<BoundingBox> nms(std::vector<BoundingBox>& boxes, float iouThreshold);
+
  private:
   DetectionResult postprocessDenseTensor(
       const InferenceTensor& tensor,
@@ -40,8 +43,6 @@ class YoloPostprocessor : public IPostprocessor {
   std::vector<float> valuesAsFloat(const InferenceTensor& tensor) const;
   int classChannelCount(const InferenceOutput& output) const;
 
-  static float computeIoU(const BoundingBox& a, const BoundingBox& b);
-  static std::vector<BoundingBox> nms(std::vector<BoundingBox>& boxes, float iouThreshold);
   static void mapBoxesToOriginal(
       std::vector<BoundingBox>& boxes,
       const RgbImage& modelInput,
