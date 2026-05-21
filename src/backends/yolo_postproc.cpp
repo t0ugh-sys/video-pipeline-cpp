@@ -58,7 +58,9 @@ std::vector<std::string> loadLabels(const std::string& path) {
   if (path.empty()) return labels;
   std::ifstream file(path);
   std::string line;
-  while (std::getline(file, line)) if (!line.empty()) labels.push_back(line);
+  while (std::getline(file, line)) {
+    if (!line.empty()) labels.push_back(line);
+  }
   return labels;
 }
 
@@ -310,19 +312,21 @@ bool scoreAtLeastThresholdRaw(const InferenceTensor& tensor, const TensorView& v
   return false;
 }
 
+// Returns true if the fast INT8/UINT8 path was used to find the best class.
+// The caller is responsible for checking whether *bestScore >= confThreshold.
+// Returns false when the tensor is not affine-quantized, signaling the caller
+// to fall back to the generic float path.
 bool bestClassRawAffine(
     const InferenceTensor& tensor,
     const TensorView& view,
     int y,
     int x,
-    float confThreshold,
     int* bestClass,
     float* bestScore) {
   if (tensor.quantization != TensorQuantizationType::kAffineAsymmetric || tensor.scale <= 0.0f) {
     return false;
   }
 
-  const int rawThreshold = static_cast<int>(std::ceil(confThreshold / tensor.scale + tensor.zeroPoint));
   int bestRaw = std::numeric_limits<int>::min();
   int bestRawClass = 0;
   switch (tensor.dataType) {
@@ -349,12 +353,6 @@ bool bestClassRawAffine(
     }
     default:
       return false;
-  }
-
-  if (bestRaw < rawThreshold) {
-    *bestScore = (static_cast<float>(bestRaw - tensor.zeroPoint) * tensor.scale);
-    *bestClass = bestRawClass;
-    return true;
   }
 
   *bestClass = bestRawClass;
@@ -406,7 +404,9 @@ bool yolo26BoxesLookLikeModelContentCoords(
 
 YoloPostprocessor::YoloPostprocessor(YoloVersion version, PostprocessOptions options)
     : version_(version), options_(std::move(options)) {
-  if (options_.labels.empty() && !options_.labelsPath.empty()) options_.labels = loadLabels(options_.labelsPath);
+  if (options_.labels.empty() && !options_.labelsPath.empty()) {
+    options_.labels = loadLabels(options_.labelsPath);
+  }
 }
 
 std::string YoloPostprocessor::name() const {
@@ -418,7 +418,9 @@ const std::vector<std::string>& YoloPostprocessor::labelsForClassCount(int class
   if (classCount == 80) return coco80Labels();
   if (static_cast<int>(cachedGeneratedLabels_.size()) < classCount) {
     cachedGeneratedLabels_.clear();
-    for (int i = 0; i < classCount; ++i) cachedGeneratedLabels_.push_back("class_" + std::to_string(i));
+    for (int i = 0; i < classCount; ++i) {
+      cachedGeneratedLabels_.push_back("class_" + std::to_string(i));
+    }
   }
   return cachedGeneratedLabels_;
 }
@@ -538,9 +540,15 @@ ModelOutputLayout YoloPostprocessor::inferLayout(const InferenceOutput& output) 
 DetectionResult YoloPostprocessor::postprocess(const InferenceOutput& output, const RgbImage& modelInput, int originalWidth, int originalHeight, int64_t pts) {
   const ModelOutputLayout layout = inferLayout(output);
   if (layout == ModelOutputLayout::kYolo26E2E) {
+    // YOLO26 E2E export includes torch.topk in the ONNX graph, which is not
+    // supported on the RKNN NPU (confirmed upstream: ultralytics/ultralytics).
+    // Workaround: monkey-patch head.Detect.forward before export to force
+    // multi-head output, then route through postprocessBranchOutputs().
+    // postprocessYolo26E2E() is retained for TensorRT/CPU paths where TopK
+    // is supported natively.
     throw std::runtime_error(
-        "YOLO26 end-to-end [1,300,6] output is currently unsupported in this project. "
-        "Use FP16 YOLO26 or multi-head INT8 exports whose postprocess matches the YOLOv8 path.");
+        "YOLO26 E2E layout unsupported on RKNN (TopK not on NPU). "
+        "Export with patched Detect.forward to get multi-head output.");
   }
   if (layout == ModelOutputLayout::kYolov8Flat && !flatExperimentalLogged_) {
     std::cerr
@@ -559,7 +567,9 @@ DetectionResult YoloPostprocessor::postprocess(const InferenceOutput& output, co
 
 DetectionResult YoloPostprocessor::postprocessDenseTensor(const InferenceTensor& tensor, const RgbImage& modelInput, int originalWidth, int originalHeight, int64_t pts) const {
   DenseLayout layout;
-  if (!buildDenseLayout(tensor, layout) || layout.attributes < 5) throw std::runtime_error("Unsupported dense YOLO tensor shape");
+  if (!buildDenseLayout(tensor, layout) || layout.attributes < 5) {
+    throw std::runtime_error("Unsupported dense YOLO tensor shape");
+  }
   std::vector<float> ownedValues;
   const std::vector<float>& values = tensor.data.empty() ? (ownedValues = valuesAsFloat(tensor)) : tensor.data;
   const bool hasObjectness = layout.attributes == 85;
@@ -634,7 +644,9 @@ DetectionResult YoloPostprocessor::postprocessDenseTensor(const InferenceTensor&
     float objectness = 1.0f;
     if (hasObjectness) {
       objectness = proposalValue(i, 4);
-      if (objectness > 1.0f || objectness < 0.0f) objectness = sigmoid(objectness);
+      if (objectness > 1.0f || objectness < 0.0f) {
+        objectness = sigmoid(objectness);
+      }
     }
     float bestScore = 0.0f;
     int bestClass = 0;
@@ -643,8 +655,13 @@ DetectionResult YoloPostprocessor::postprocessDenseTensor(const InferenceTensor&
       classMin = std::min(classMin, rawCls);
       classMax = std::max(classMax, rawCls);
       float cls = rawCls;
-      if (cls > 1.0f || cls < 0.0f) cls = sigmoid(cls);
-      if (cls > bestScore) { bestScore = cls; bestClass = c; }
+      if (cls > 1.0f || cls < 0.0f) {
+        cls = sigmoid(cls);
+      }
+      if (cls > bestScore) {
+        bestScore = cls;
+        bestClass = c;
+      }
     }
     const float score = bestScore * objectness;
     if (score > debugBestScore) {
@@ -659,12 +676,21 @@ DetectionResult YoloPostprocessor::postprocessDenseTensor(const InferenceTensor&
     float w = proposalValue(i, 2);
     float h = proposalValue(i, 3);
     if (std::max({std::fabs(cx), std::fabs(cy), std::fabs(w), std::fabs(h)}) <= 2.0f) {
-      cx *= modelInput.width; cy *= modelInput.height; w *= modelInput.width; h *= modelInput.height;
+      cx *= modelInput.width;
+      cy *= modelInput.height;
+      w *= modelInput.width;
+      h *= modelInput.height;
     }
     BoundingBox box;
-    box.x1 = cx - w * 0.5f; box.y1 = cy - h * 0.5f; box.x2 = cx + w * 0.5f; box.y2 = cy + h * 0.5f;
-    box.score = score; box.classId = bestClass;
-    if (bestClass >= 0 && bestClass < static_cast<int>(labels.size())) box.label = labels[bestClass];
+    box.x1 = cx - w * 0.5f;
+    box.y1 = cy - h * 0.5f;
+    box.x2 = cx + w * 0.5f;
+    box.y2 = cy + h * 0.5f;
+    box.score = score;
+    box.classId = bestClass;
+    if (bestClass >= 0 && bestClass < static_cast<int>(labels.size())) {
+      box.label = labels[bestClass];
+    }
     boxes.push_back(box);
   }
   if (options_.verbose && !denseTensorStatsLogged_) {
@@ -892,10 +918,13 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
             }
           }
           bestScore = static_cast<float>(bestRaw - branch.cls->zeroPoint) * branch.cls->scale;
-        } else if (!bestClassRawAffine(*branch.cls, clsAccessor.view, y, x, options_.confThreshold, &bestClass, &bestScore)) {
+        } else if (!bestClassRawAffine(*branch.cls, clsAccessor.view, y, x, &bestClass, &bestScore)) {
           for (int c = 0; c < clsAccessor.view.channels; ++c) {
             const float cls = tensorValueAt(clsAccessor, c, y, x);
-            if (cls > bestScore) { bestScore = cls; bestClass = c; }
+            if (cls > bestScore) {
+              bestScore = cls;
+              bestClass = c;
+            }
           }
         }
         if (bestScore < options_.confThreshold) continue;
@@ -931,14 +960,23 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
             }
             return denominator > 0.0f ? numerator / denominator : 0.0f;
           };
-          left = decode(0); top = decode(bins); right = decode(bins * 2); bottom = decode(bins * 3);
+          left = decode(0);
+          top = decode(bins);
+          right = decode(bins * 2);
+          bottom = decode(bins * 3);
         }
         BoundingBox box;
         const float centerX = (static_cast<float>(x) + 0.5f) * strideX;
         const float centerY = (static_cast<float>(y) + 0.5f) * strideY;
-        box.x1 = centerX - left * strideX; box.y1 = centerY - top * strideY; box.x2 = centerX + right * strideX; box.y2 = centerY + bottom * strideY;
-        box.score = bestScore; box.classId = bestClass;
-        if (bestClass >= 0 && bestClass < static_cast<int>(labels.size())) box.label = labels[bestClass];
+        box.x1 = centerX - left * strideX;
+        box.y1 = centerY - top * strideY;
+        box.x2 = centerX + right * strideX;
+        box.y2 = centerY + bottom * strideY;
+        box.score = bestScore;
+        box.classId = bestClass;
+        if (bestClass >= 0 && bestClass < static_cast<int>(labels.size())) {
+          box.label = labels[bestClass];
+        }
         boxes.push_back(box);
       }
     }
@@ -979,7 +1017,9 @@ DetectionResult YoloPostprocessor::postprocessBranchOutputs(const InferenceOutpu
 
 DetectionResult YoloPostprocessor::postprocessYolo26E2E(const InferenceTensor& tensor, const RgbImage& modelInput, int originalWidth, int originalHeight, int64_t pts) const {
   DenseLayout layout;
-  if (!buildDenseLayout(tensor, layout) || layout.attributes != 6) throw std::runtime_error("Unsupported YOLO26 end-to-end tensor shape");
+  if (!buildDenseLayout(tensor, layout) || layout.attributes != 6) {
+    throw std::runtime_error("Unsupported YOLO26 end-to-end tensor shape");
+  }
   std::vector<float> ownedValues;
   const std::vector<float>& values = tensor.data.empty() ? (ownedValues = valuesAsFloat(tensor)) : tensor.data;
   const auto& labels = labelsForClassCount(80);
@@ -1034,7 +1074,9 @@ DetectionResult YoloPostprocessor::postprocessYolo26E2E(const InferenceTensor& t
     }
     box.score = conf;
     box.classId = static_cast<int>(std::round(clsValue));
-    if (box.classId >= 0 && box.classId < static_cast<int>(labels.size())) box.label = labels[box.classId];
+    if (box.classId >= 0 && box.classId < static_cast<int>(labels.size())) {
+      box.label = labels[box.classId];
+    }
     boxes.push_back(box);
   }
   std::sort(boxes.begin(), boxes.end(), [](const BoundingBox& a, const BoundingBox& b) {
@@ -1092,27 +1134,43 @@ DetectionResult YoloPostprocessor::postprocessYolo26E2E(const InferenceTensor& t
 }
 
 float YoloPostprocessor::computeIoU(const BoundingBox& a, const BoundingBox& b) {
-  const float x1 = std::max(a.x1, b.x1); const float y1 = std::max(a.y1, b.y1); const float x2 = std::min(a.x2, b.x2); const float y2 = std::min(a.y2, b.y2);
-  const float interW = std::max(0.0f, x2 - x1); const float interH = std::max(0.0f, y2 - y1); const float interArea = interW * interH;
-  const float unionArea = a.area() + b.area() - interArea; return unionArea <= 0.0f ? 0.0f : interArea / unionArea;
+  const float x1 = std::max(a.x1, b.x1);
+  const float y1 = std::max(a.y1, b.y1);
+  const float x2 = std::min(a.x2, b.x2);
+  const float y2 = std::min(a.y2, b.y2);
+  const float interW = std::max(0.0f, x2 - x1);
+  const float interH = std::max(0.0f, y2 - y1);
+  const float interArea = interW * interH;
+  const float unionArea = a.area() + b.area() - interArea;
+  return unionArea <= 0.0f ? 0.0f : interArea / unionArea;
 }
 
 std::vector<BoundingBox> YoloPostprocessor::nms(std::vector<BoundingBox>& boxes, float iouThreshold) {
   if (boxes.empty()) return {};
-  std::sort(boxes.begin(), boxes.end(), [](const BoundingBox& a, const BoundingBox& b) { return a.score > b.score; });
-  std::vector<BoundingBox> result; std::vector<bool> suppressed(boxes.size(), false);
+
+  std::sort(boxes.begin(), boxes.end(),
+            [](const BoundingBox& a, const BoundingBox& b) { return a.score > b.score; });
+
+  std::vector<BoundingBox> result;
+  std::vector<bool> suppressed(boxes.size(), false);
   for (std::size_t i = 0; i < boxes.size(); ++i) {
     if (suppressed[i]) continue;
     result.push_back(boxes[i]);
     for (std::size_t j = i + 1; j < boxes.size(); ++j) {
       if (suppressed[j] || boxes[i].classId != boxes[j].classId) continue;
-      if (computeIoU(boxes[i], boxes[j]) > iouThreshold) suppressed[j] = true;
+      if (computeIoU(boxes[i], boxes[j]) > iouThreshold) {
+        suppressed[j] = true;
+      }
     }
   }
   return result;
 }
 
-void YoloPostprocessor::mapBoxesToOriginal(std::vector<BoundingBox>& boxes, const RgbImage& modelInput, int originalWidth, int originalHeight) {
+void YoloPostprocessor::mapBoxesToOriginal(
+    std::vector<BoundingBox>& boxes,
+    const RgbImage& modelInput,
+    int originalWidth,
+    int originalHeight) {
   if (modelInput.letterbox.enabled) {
     for (auto& box : boxes) {
       box.x1 = (box.x1 - static_cast<float>(modelInput.letterbox.padLeft)) / modelInput.letterbox.scale;
@@ -1124,7 +1182,10 @@ void YoloPostprocessor::mapBoxesToOriginal(std::vector<BoundingBox>& boxes, cons
     const float scaleX = static_cast<float>(originalWidth) / static_cast<float>(modelInput.width);
     const float scaleY = static_cast<float>(originalHeight) / static_cast<float>(modelInput.height);
     for (auto& box : boxes) {
-      box.x1 *= scaleX; box.y1 *= scaleY; box.x2 *= scaleX; box.y2 *= scaleY;
+      box.x1 *= scaleX;
+      box.y1 *= scaleY;
+      box.x2 *= scaleX;
+      box.y2 *= scaleY;
     }
   }
   clampBoxes(boxes, originalWidth, originalHeight);
