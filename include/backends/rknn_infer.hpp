@@ -25,6 +25,7 @@ class RknnInfer : public IInferenceBackend {
   std::vector<std::uint8_t> readModelFile(const std::string& path) const;
   void queryTensorInfo();
   void close();
+  std::vector<std::string> checkFdInputReasons(const RgbImage& image) const;
 
   rknn_context context_ = 0;
   std::vector<std::uint8_t> model_data_;
@@ -36,8 +37,10 @@ class RknnInfer : public IInferenceBackend {
   bool has_last_fd_decision_ = false;
   bool last_can_use_fd_input_ = false;
   bool has_native_input_attr_ = false;
+  bool use_float_output_for_flat_yolo_ = false;
   InferRuntimeConfig runtime_config_ = {};
   rknn_tensor_attr input_attr_ = {};
   rknn_tensor_attr native_input_attr_ = {};
   InferenceOutput output_templates_;
+  std::vector<std::string> static_fd_reasons_;
 };

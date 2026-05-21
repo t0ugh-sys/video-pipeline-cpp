@@ -286,9 +286,10 @@ void RknnInfer::open(const ModelConfig& config, const InferRuntimeConfig& runtim
 
   queryTensorInfo();
 
+  static_fd_reasons_ =
+      buildStaticFdInputReasons(is_nhwc_, has_native_input_attr_, input_width_, input_height_, native_input_attr_);
+
   if (verbose_) {
-    const auto staticReasons =
-        buildStaticFdInputReasons(is_nhwc_, has_native_input_attr_, input_width_, input_height_, native_input_attr_);
     std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
               << "/" << runtime_config_.workerCount
               << " init_flags=async"
@@ -300,8 +301,8 @@ void RknnInfer::open(const ModelConfig& config, const InferRuntimeConfig& runtim
       std::cerr << " native_input_attr={unavailable}";
     }
     std::cerr << " static_fd_input="
-              << (staticReasons.empty() ? "possible" : "fallback")
-              << " reason=" << joinReasons(staticReasons)
+              << (static_fd_reasons_.empty() ? "possible" : "fallback")
+              << " reason=" << joinReasons(static_fd_reasons_)
               << "\n";
   }
 }
@@ -314,47 +315,13 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
     throw std::runtime_error("RGB image size does not match RKNN input tensor");
   }
 
-  const bool canUseFdInput =
-      is_nhwc_ &&
-      has_native_input_attr_ &&
-      image.format == PixelFormat::kRgb888 &&
-      image.dmaFd >= 0 &&
-      image.wstride == static_cast<int>(native_input_attr_.w_stride) &&
-      image.dmaSize >= static_cast<std::size_t>(
-          native_input_attr_.size_with_stride != 0 ? native_input_attr_.size_with_stride : native_input_attr_.size);
-
-  std::vector<std::string> fdInputReasons;
-  if (!is_nhwc_) {
-    fdInputReasons.emplace_back("input layout is not NHWC");
-  }
-  if (!has_native_input_attr_) {
-    fdInputReasons.emplace_back("RKNN native input attr unavailable");
-  }
-  if (image.format != PixelFormat::kRgb888) {
-    fdInputReasons.emplace_back("image format is not RGB888");
-  }
-  if (image.dmaFd < 0) {
-    fdInputReasons.emplace_back("image dmaFd is invalid");
-  }
-  if (has_native_input_attr_ && image.wstride != static_cast<int>(native_input_attr_.w_stride)) {
-    fdInputReasons.emplace_back(
-        "image wstride=" + std::to_string(image.wstride) +
-        " expected=" + std::to_string(native_input_attr_.w_stride));
-  }
-  if (has_native_input_attr_) {
-    const std::size_t nativeInputBytes =
-        native_input_attr_.size_with_stride != 0 ? native_input_attr_.size_with_stride : native_input_attr_.size;
-    if (image.dmaSize < nativeInputBytes) {
-      fdInputReasons.emplace_back(
-          "image dmaSize=" + std::to_string(image.dmaSize) +
-          " smaller than native input bytes=" + std::to_string(nativeInputBytes));
-    }
-  }
+  const auto fdReasons = checkFdInputReasons(image);
+  const bool canUseFdInput = fdReasons.empty();
 
   if (verbose_ && (!has_last_fd_decision_ || last_can_use_fd_input_ != canUseFdInput)) {
     std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
               << " input_path=" << (canUseFdInput ? "dma-fd" : "host-copy")
-              << " reason=" << (canUseFdInput ? "all zero-copy conditions satisfied" : joinReasons(fdInputReasons))
+              << " reason=" << (canUseFdInput ? "all zero-copy conditions satisfied" : joinReasons(fdReasons))
               << "\n";
   }
   has_last_fd_decision_ = true;
@@ -378,11 +345,14 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
     } else {
       const std::size_t planeSize = static_cast<std::size_t>(image.width * image.height);
       inputBuffer.resize(planeSize * 3);
-      for (std::size_t i = 0; i < planeSize; ++i) {
-        const std::size_t src = i * 3;
-        inputBuffer[i] = image.data[src];
-        inputBuffer[planeSize + i] = image.data[src + 1];
-        inputBuffer[planeSize * 2 + i] = image.data[src + 2];
+      const uint8_t* src = image.data.data();
+      uint8_t* r_plane = inputBuffer.data();
+      uint8_t* g_plane = r_plane + planeSize;
+      uint8_t* b_plane = g_plane + planeSize;
+      for (std::size_t i = 0; i < planeSize; ++i, src += 3) {
+        r_plane[i] = src[0];
+        g_plane[i] = src[1];
+        b_plane[i] = src[2];
       }
     }
 
@@ -399,13 +369,11 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
   checkRknnStatus(rknn_run(context_, nullptr), "rknn_run failed");
 
   std::vector<rknn_output> outputs(output_templates_.size());
-  const bool useFloatOutputsForFlatSingleOutput =
-      output_templates_.size() == 1 && looksLikeFlatYolov8Tensor(output_templates_.front());
   for (std::size_t i = 0; i < outputs.size(); ++i) {
     outputs[i].want_float =
-        (output_templates_[i].dataType == TensorDataType::kFloat32 || useFloatOutputsForFlatSingleOutput) ? 1 : 0;
+        (output_templates_[i].dataType == TensorDataType::kFloat32 || use_float_output_for_flat_yolo_) ? 1 : 0;
   }
-  if (verbose_ && useFloatOutputsForFlatSingleOutput) {
+  if (verbose_ && use_float_output_for_flat_yolo_) {
     std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
               << " output_path=float reason=single-output flat YOLO tensor uses runtime float decode\n";
   }
@@ -504,13 +472,17 @@ void RknnInfer::queryTensorInfo() {
     tensor.rawData.reserve(tensorElementCount(outputAttr) * tensorTypeBytes(outputAttr.type));
     output_templates_.push_back(std::move(tensor));
   }
+
+  use_float_output_for_flat_yolo_ =
+      output_templates_.size() == 1 && looksLikeFlatYolov8Tensor(output_templates_.front());
 }
 
 void RknnInfer::close() {
   if (context_ != 0) {
-    rknn_destroy(context_);
+    rknn_context ctx = context_;
+    context_ = 0;
+    rknn_destroy(ctx);
   }
-  context_ = 0;
   model_data_.clear();
   input_width_ = 0;
   input_height_ = 0;
@@ -524,4 +496,31 @@ void RknnInfer::close() {
   input_attr_ = {};
   native_input_attr_ = {};
   output_templates_.clear();
+  static_fd_reasons_.clear();
+  use_float_output_for_flat_yolo_ = false;
+}
+
+std::vector<std::string> RknnInfer::checkFdInputReasons(const RgbImage& image) const {
+  std::vector<std::string> reasons = static_fd_reasons_;
+  if (image.format != PixelFormat::kRgb888) {
+    reasons.emplace_back("image format is not RGB888");
+  }
+  if (image.dmaFd < 0) {
+    reasons.emplace_back("image dmaFd is invalid");
+  }
+  if (has_native_input_attr_ && image.wstride != static_cast<int>(native_input_attr_.w_stride)) {
+    reasons.emplace_back(
+        "image wstride=" + std::to_string(image.wstride) +
+        " expected=" + std::to_string(native_input_attr_.w_stride));
+  }
+  if (has_native_input_attr_) {
+    const std::size_t nativeInputBytes =
+        native_input_attr_.size_with_stride != 0 ? native_input_attr_.size_with_stride : native_input_attr_.size;
+    if (image.dmaSize < nativeInputBytes) {
+      reasons.emplace_back(
+          "image dmaSize=" + std::to_string(image.dmaSize) +
+          " smaller than native input bytes=" + std::to_string(nativeInputBytes));
+    }
+  }
+  return reasons;
 }
