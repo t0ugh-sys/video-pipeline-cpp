@@ -23,6 +23,7 @@ class TrtInfer : public IInferenceBackend {
   TrtInfer& operator=(const TrtInfer&) = delete;
 
   void open(const ModelConfig& config, const InferRuntimeConfig& runtime = {}) override;
+  void close() override;
   InferenceOutput infer(const RgbImage& image) override;
   int inputWidth() const override { return input_width_; }
   int inputHeight() const override { return input_height_; }
@@ -35,7 +36,6 @@ class TrtInfer : public IInferenceBackend {
   void configureBindings();
   const char* copyInputToDevice(const RgbImage& image);
   void releaseBuffers();
-  void close();
 
   struct BindingInfo {
     std::size_t index = 0;

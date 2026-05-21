@@ -187,7 +187,7 @@ std::vector<std::int64_t> toShape(const rknn_tensor_attr& attr) {
   return shape;
 }
 
-bool looksLikeFlatYolov8Tensor(const InferenceTensor& tensor) {
+bool matchesFlatYolov8Tensor(const InferenceTensor& tensor) {
   if (tensor.shape.size() != 3 || tensor.quantization != TensorQuantizationType::kAffineAsymmetric) {
     return false;
   }
@@ -199,7 +199,7 @@ bool looksLikeFlatYolov8Tensor(const InferenceTensor& tensor) {
   return (dim1 == 84 || dim1 == 85 || dim2 == 84 || dim2 == 85);
 }
 
-bool looksLikeYolo26E2ETensor(const InferenceTensor& tensor) {
+bool matchesYolo26E2ETensor(const InferenceTensor& tensor) {
   if (tensor.quantization != TensorQuantizationType::kAffineAsymmetric) {
     return false;
   }
@@ -368,7 +368,8 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
 
   checkRknnStatus(rknn_run(context_, nullptr), "rknn_run failed");
 
-  std::vector<rknn_output> outputs(output_templates_.size());
+  auto& outputs = output_buffers_;
+  std::fill(outputs.begin(), outputs.end(), rknn_output{});
   for (std::size_t i = 0; i < outputs.size(); ++i) {
     outputs[i].want_float =
         (output_templates_[i].dataType == TensorDataType::kFloat32 || use_float_output_for_flat_yolo_) ? 1 : 0;
@@ -377,7 +378,7 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
     std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
               << " output_path=float reason=single-output flat YOLO tensor uses runtime float decode\n";
   }
-  if (verbose_ && output_templates_.size() == 1 && looksLikeYolo26E2ETensor(output_templates_.front())) {
+  if (verbose_ && output_templates_.size() == 1 && matchesYolo26E2ETensor(output_templates_.front())) {
     std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
               << " output_path=int8 reason=yolo26_e2e uses postprocess-side affine dequant\n";
   }
@@ -474,7 +475,9 @@ void RknnInfer::queryTensorInfo() {
   }
 
   use_float_output_for_flat_yolo_ =
-      output_templates_.size() == 1 && looksLikeFlatYolov8Tensor(output_templates_.front());
+      output_templates_.size() == 1 && matchesFlatYolov8Tensor(output_templates_.front());
+
+  output_buffers_.resize(output_templates_.size());
 }
 
 void RknnInfer::close() {
@@ -496,6 +499,7 @@ void RknnInfer::close() {
   input_attr_ = {};
   native_input_attr_ = {};
   output_templates_.clear();
+  output_buffers_.clear();
   static_fd_reasons_.clear();
   use_float_output_for_flat_yolo_ = false;
 }

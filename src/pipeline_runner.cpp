@@ -92,14 +92,15 @@ class BoundedQueue {
  public:
   explicit BoundedQueue(std::size_t capacity) : capacity_(capacity) {}
 
-  void push(T value) {
+  bool push(T value) {
     std::unique_lock<std::mutex> lock(mutex_);
     notFull_.wait(lock, [&] { return closed_ || queue_.size() < capacity_; });
     if (closed_) {
-      throw std::runtime_error("queue closed");
+      return false;
     }
     queue_.push_back(std::move(value));
     notEmpty_.notify_one();
+    return true;
   }
 
   bool pop(T& value) {
@@ -1211,7 +1212,9 @@ void runPipeline(const AppConfig& config) {
           processed.preprocMs = prepared.preprocMs;
           processed.inferMs = Ms(inferEnd - inferStart).count();
           processed.postprocMs = Ms(postEnd - postStart).count();
-          processedQueue.push(std::move(processed));
+          if (!processedQueue.push(std::move(processed))) {
+            break;
+          }
         }
       } catch (...) {
         storeError(std::current_exception());
@@ -1258,6 +1261,158 @@ void runPipeline(const AppConfig& config) {
       double totalOverlayMs = 0.0;
       double totalAnnotatedEncodeMs = 0.0;
       std::size_t timedAnnotatedFrames = 0;
+
+      auto handleRawEncoder = [&](const ProcessedFrame& current) {
+        if (encoder && current.decodedFrame.dmaFd < 0) {
+          throw std::runtime_error(
+              "encoder-output requested, but decoded frame does not provide a valid dma fd");
+        }
+        if (encoder && !encoderInitialized) {
+          EncoderConfig encCfg;
+          encCfg.outputPath = config.encoderOutput;
+          encCfg.codec = config.encoderCodec;
+          encCfg.fps = outputEncoderFps;
+          encCfg.fpsNum = resolveEncoderFpsNum(config, sourceVideoInfo);
+          encCfg.fpsDen = resolveEncoderFpsDen(config, sourceVideoInfo);
+          encCfg.width = current.decodedFrame.width;
+          encCfg.height = current.decodedFrame.height;
+          encCfg.horStride = current.decodedFrame.horizontalStride > 0
+              ? current.decodedFrame.horizontalStride
+              : current.decodedFrame.width;
+          encCfg.verStride = current.decodedFrame.verticalStride > 0
+              ? current.decodedFrame.verticalStride
+              : current.decodedFrame.height;
+          encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
+          encCfg.inputFormat = PixelFormat::kNv12;
+          encCfg.lowLatency = config.encoderLowLatency;
+          if (config.verbose) {
+            std::cerr << "[PIPELINE] init_raw_encoder backend=" << encoder->name()
+                      << " codec=" << encCfg.codec
+                      << " path=" << encCfg.outputPath
+                      << " size=" << encCfg.width << "x" << encCfg.height
+                      << " stride=" << encCfg.horStride << "x" << encCfg.verStride
+                      << " fps=" << encCfg.fpsNum << "/" << encCfg.fpsDen
+                      << " bitrate=" << encCfg.bitrate << "\n";
+          }
+          encoder->init(encCfg);
+          encoderInitialized = true;
+        }
+        const bool keepEncodedFrame =
+            shouldKeepEncodedFrame(displayedCount - 1, sourceVideoInfo, outputEncoderFps);
+        if (encoder && encoderInitialized && keepEncodedFrame) {
+          encoder->encodeDecodedFrame(current.decodedFrame, current.pts);
+        }
+      };
+
+      auto handleAnnotatedEncoder = [&](const ProcessedFrame& current,
+                                         const std::optional<RgbImage>& displayImage,
+                                         const std::optional<DetectionResult>& displayResult) {
+        auto initAnnotatedEncoder = [&](int width, int height, PixelFormat fmt,
+                                       int horStride = 0, int verStride = 0) {
+          EncoderConfig encCfg;
+          encCfg.outputPath = annotatedOutputPath;
+          encCfg.codec = config.encoderCodec;
+          encCfg.fps = outputEncoderFps;
+          encCfg.fpsNum = resolveEncoderFpsNum(config, sourceVideoInfo);
+          encCfg.fpsDen = resolveEncoderFpsDen(config, sourceVideoInfo);
+          encCfg.width = width;
+          encCfg.height = height;
+          if (horStride > 0) {
+            encCfg.horStride = horStride;
+          }
+          if (verStride > 0) {
+            encCfg.verStride = verStride;
+          }
+          encCfg.bitrate = resolveEncoderBitrate(config, width, height, outputEncoderFps);
+          encCfg.inputFormat = fmt;
+          encCfg.lowLatency = config.encoderLowLatency;
+          if (config.verbose) {
+            std::cerr << "[PIPELINE] init_annotated_encoder backend=" << annotatedVideoEncoder->name()
+                      << " codec=" << encCfg.codec
+                      << " path=" << encCfg.outputPath
+                      << " size=" << width << "x" << height;
+            if (horStride > 0) {
+              std::cerr << " stride=" << horStride << "x" << verStride;
+            }
+            std::cerr << " fps=" << encCfg.fpsNum << "/" << encCfg.fpsDen
+                      << " bitrate=" << encCfg.bitrate
+                      << " input_format=" << (fmt == PixelFormat::kNv12 ? "NV12" : "RGB888")
+                      << "\n";
+          }
+          annotatedVideoEncoder->init(encCfg);
+          annotatedVideoEncoderInitialized = true;
+        };
+
+        const bool keepEncodedFrame =
+            shouldKeepEncodedFrame(displayedCount - 1, sourceVideoInfo, outputEncoderFps);
+
+        if (needsVisualizerDraw && displayImage.has_value() && displayResult.has_value()) {
+          if (!visualizerInitialized) {
+            VisualConfig visualConfig = config.visual;
+            if (needsHardwareEncodedAnnotatedVideo) {
+              visualConfig.outputVideo.clear();
+              visualConfig.outputRtsp.clear();
+            }
+            if (config.verbose) {
+              std::cerr << "[PIPELINE] init_visualizer size="
+                        << displayImage->width << "x" << displayImage->height << "\n";
+            }
+            visualizer->init(displayImage->width, displayImage->height, visualConfig);
+            visualizerInitialized = true;
+          }
+          const RgbImage drawnImage = visualizer->draw(displayImage.value(), displayResult.value());
+          if (annotatedVideoEncoder) {
+            if (!annotatedVideoEncoderInitialized) {
+              if (useRgaAnnotatedOutput) {
+                const int hs = current.decodedFrame.horizontalStride > 0
+                    ? current.decodedFrame.horizontalStride : current.decodedFrame.width;
+                const int vs = current.decodedFrame.verticalStride > 0
+                    ? current.decodedFrame.verticalStride : current.decodedFrame.height;
+                initAnnotatedEncoder(current.decodedFrame.width, current.decodedFrame.height,
+                                     PixelFormat::kNv12, hs, vs);
+              } else {
+                initAnnotatedEncoder(drawnImage.width, drawnImage.height, PixelFormat::kRgb888);
+              }
+            }
+            if (keepEncodedFrame) {
+              if (useRgaAnnotatedOutput) {
+                const auto overlayStart = Clock::now();
+                DecodedFrame annotatedFrame =
+                    makeAnnotatedEncodeFrame(current.decodedFrame, current.result, config.visual);
+                totalOverlayMs += Ms(Clock::now() - overlayStart).count();
+                const auto encodeStart = Clock::now();
+                annotatedVideoEncoder->encodeDecodedFrame(annotatedFrame, current.pts);
+                totalAnnotatedEncodeMs += Ms(Clock::now() - encodeStart).count();
+                ++timedAnnotatedFrames;
+              } else {
+                annotatedVideoEncoder->encode(drawnImage, current.pts);
+              }
+            }
+          }
+          (void)drawnImage;
+          visualizer->show();
+        } else if (annotatedVideoEncoder && useRgaAnnotatedOutput) {
+          if (!annotatedVideoEncoderInitialized) {
+            const int hs = current.decodedFrame.horizontalStride > 0
+                ? current.decodedFrame.horizontalStride : current.decodedFrame.width;
+            const int vs = current.decodedFrame.verticalStride > 0
+                ? current.decodedFrame.verticalStride : current.decodedFrame.height;
+            initAnnotatedEncoder(current.decodedFrame.width, current.decodedFrame.height,
+                                 PixelFormat::kNv12, hs, vs);
+          }
+          if (keepEncodedFrame) {
+            const auto overlayStart = Clock::now();
+            DecodedFrame annotatedFrame =
+                makeAnnotatedEncodeFrame(current.decodedFrame, current.result, config.visual);
+            totalOverlayMs += Ms(Clock::now() - overlayStart).count();
+            const auto encodeStart = Clock::now();
+            annotatedVideoEncoder->encodeDecodedFrame(annotatedFrame, current.pts);
+            totalAnnotatedEncodeMs += Ms(Clock::now() - encodeStart).count();
+            ++timedAnnotatedFrames;
+          }
+        }
+      };
+
       ProcessedFrame processed;
       while (processedQueue.pop(processed)) {
         pending.emplace(processed.index, std::move(processed));
@@ -1271,45 +1426,7 @@ void runPipeline(const AppConfig& config) {
           pending.erase(it);
           ++displayedCount;
 
-          if (encoder && current.decodedFrame.dmaFd < 0) {
-            throw std::runtime_error(
-                "encoder-output requested, but decoded frame does not provide a valid dma fd");
-          }
-          if (encoder && !encoderInitialized) {
-            EncoderConfig encCfg;
-            encCfg.outputPath = config.encoderOutput;
-            encCfg.codec = config.encoderCodec;
-            encCfg.fps = outputEncoderFps;
-            encCfg.fpsNum = resolveEncoderFpsNum(config, sourceVideoInfo);
-            encCfg.fpsDen = resolveEncoderFpsDen(config, sourceVideoInfo);
-            encCfg.width = current.decodedFrame.width;
-            encCfg.height = current.decodedFrame.height;
-            encCfg.horStride = current.decodedFrame.horizontalStride > 0
-                ? current.decodedFrame.horizontalStride
-                : current.decodedFrame.width;
-            encCfg.verStride = current.decodedFrame.verticalStride > 0
-                ? current.decodedFrame.verticalStride
-                : current.decodedFrame.height;
-            encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
-            encCfg.inputFormat = PixelFormat::kNv12;
-            encCfg.lowLatency = config.encoderLowLatency;
-            if (config.verbose) {
-              std::cerr << "[PIPELINE] init_raw_encoder backend=" << encoder->name()
-                        << " codec=" << encCfg.codec
-                        << " path=" << encCfg.outputPath
-                        << " size=" << encCfg.width << "x" << encCfg.height
-                        << " stride=" << encCfg.horStride << "x" << encCfg.verStride
-                        << " fps=" << encCfg.fpsNum << "/" << encCfg.fpsDen
-                        << " bitrate=" << encCfg.bitrate << "\n";
-            }
-            encoder->init(encCfg);
-            encoderInitialized = true;
-          }
-          const bool keepEncodedFrame =
-              shouldKeepEncodedFrame(displayedCount - 1, sourceVideoInfo, outputEncoderFps);
-          if (encoder && encoderInitialized && keepEncodedFrame) {
-            encoder->encodeDecodedFrame(current.decodedFrame, current.pts);
-          }
+          handleRawEncoder(current);
 
           double displayPreprocMs = 0.0;
           std::optional<RgbImage> displayImage;
@@ -1360,107 +1477,7 @@ void runPipeline(const AppConfig& config) {
             maybeDumpFirstFrame(config, displayImage.value(), displayedCount);
           }
 
-          if (needsVisualizerDraw && displayImage.has_value() && displayResult.has_value()) {
-            if (!visualizerInitialized) {
-              VisualConfig visualConfig = config.visual;
-              if (needsHardwareEncodedAnnotatedVideo) {
-                visualConfig.outputVideo.clear();
-                visualConfig.outputRtsp.clear();
-              }
-              if (config.verbose) {
-                std::cerr << "[PIPELINE] init_visualizer size="
-                          << displayImage->width << "x" << displayImage->height << "\n";
-              }
-              visualizer->init(displayImage->width, displayImage->height, visualConfig);
-              visualizerInitialized = true;
-            }
-            const RgbImage drawnImage = visualizer->draw(displayImage.value(), displayResult.value());
-            if (annotatedVideoEncoder) {
-              if (!annotatedVideoEncoderInitialized) {
-                EncoderConfig encCfg;
-                encCfg.outputPath = annotatedOutputPath;
-                encCfg.codec = config.encoderCodec;
-                encCfg.fps = outputEncoderFps;
-                encCfg.fpsNum = resolveEncoderFpsNum(config, sourceVideoInfo);
-                encCfg.fpsDen = resolveEncoderFpsDen(config, sourceVideoInfo);
-                encCfg.width = useRgaAnnotatedOutput ? current.decodedFrame.width : drawnImage.width;
-                encCfg.height = useRgaAnnotatedOutput ? current.decodedFrame.height : drawnImage.height;
-                encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
-                encCfg.inputFormat = useRgaAnnotatedOutput ? PixelFormat::kNv12 : PixelFormat::kRgb888;
-                encCfg.lowLatency = config.encoderLowLatency;
-                if (config.verbose) {
-                  std::cerr << "[PIPELINE] init_annotated_encoder backend=" << annotatedVideoEncoder->name()
-                            << " codec=" << encCfg.codec
-                            << " path=" << encCfg.outputPath
-                            << " size=" << encCfg.width << "x" << encCfg.height
-                            << " fps=" << encCfg.fpsNum << "/" << encCfg.fpsDen
-                            << " bitrate=" << encCfg.bitrate
-                            << " input_format=" << (encCfg.inputFormat == PixelFormat::kNv12 ? "NV12" : "RGB888")
-                            << "\n";
-                }
-                annotatedVideoEncoder->init(encCfg);
-                annotatedVideoEncoderInitialized = true;
-              }
-              if (keepEncodedFrame) {
-                if (useRgaAnnotatedOutput) {
-                  const auto overlayStart = Clock::now();
-                  DecodedFrame annotatedFrame =
-                      makeAnnotatedEncodeFrame(current.decodedFrame, current.result, config.visual);
-                  totalOverlayMs += Ms(Clock::now() - overlayStart).count();
-                  const auto encodeStart = Clock::now();
-                  annotatedVideoEncoder->encodeDecodedFrame(annotatedFrame, current.pts);
-                  totalAnnotatedEncodeMs += Ms(Clock::now() - encodeStart).count();
-                  ++timedAnnotatedFrames;
-                } else {
-                  annotatedVideoEncoder->encode(drawnImage, current.pts);
-                }
-              }
-            }
-            (void)drawnImage;
-            visualizer->show();
-          } else if (annotatedVideoEncoder && useRgaAnnotatedOutput) {
-            if (!annotatedVideoEncoderInitialized) {
-              EncoderConfig encCfg;
-              encCfg.outputPath = annotatedOutputPath;
-              encCfg.codec = config.encoderCodec;
-              encCfg.fps = outputEncoderFps;
-              encCfg.fpsNum = resolveEncoderFpsNum(config, sourceVideoInfo);
-              encCfg.fpsDen = resolveEncoderFpsDen(config, sourceVideoInfo);
-              encCfg.width = current.decodedFrame.width;
-              encCfg.height = current.decodedFrame.height;
-              encCfg.horStride = current.decodedFrame.horizontalStride > 0
-                  ? current.decodedFrame.horizontalStride
-                  : current.decodedFrame.width;
-              encCfg.verStride = current.decodedFrame.verticalStride > 0
-                  ? current.decodedFrame.verticalStride
-                  : current.decodedFrame.height;
-              encCfg.bitrate = resolveEncoderBitrate(config, encCfg.width, encCfg.height, outputEncoderFps);
-              encCfg.inputFormat = PixelFormat::kNv12;
-              encCfg.lowLatency = config.encoderLowLatency;
-              if (config.verbose) {
-                std::cerr << "[PIPELINE] init_annotated_encoder backend=" << annotatedVideoEncoder->name()
-                          << " codec=" << encCfg.codec
-                          << " path=" << encCfg.outputPath
-                          << " size=" << encCfg.width << "x" << encCfg.height
-                          << " stride=" << encCfg.horStride << "x" << encCfg.verStride
-                          << " fps=" << encCfg.fpsNum << "/" << encCfg.fpsDen
-                          << " bitrate=" << encCfg.bitrate
-                          << " input_format=NV12\n";
-              }
-              annotatedVideoEncoder->init(encCfg);
-              annotatedVideoEncoderInitialized = true;
-            }
-            if (keepEncodedFrame) {
-              const auto overlayStart = Clock::now();
-              DecodedFrame annotatedFrame =
-                  makeAnnotatedEncodeFrame(current.decodedFrame, current.result, config.visual);
-              totalOverlayMs += Ms(Clock::now() - overlayStart).count();
-              const auto encodeStart = Clock::now();
-              annotatedVideoEncoder->encodeDecodedFrame(annotatedFrame, current.pts);
-              totalAnnotatedEncodeMs += Ms(Clock::now() - encodeStart).count();
-              ++timedAnnotatedFrames;
-            }
-          }
+          handleAnnotatedEncoder(current, displayImage, displayResult);
 
           ++nextIndex;
         }
@@ -1537,7 +1554,9 @@ void runPipeline(const AppConfig& config) {
         const auto preprocEnd = Clock::now();
         prepared.preprocMs = Ms(preprocEnd - preprocStart).count();
 
-        preparedQueue.push(std::move(prepared));
+        if (!preparedQueue.push(std::move(prepared))) {
+          break;
+        }
         ++producedFrames;
         if (config.maxFrames > 0 && producedFrames >= static_cast<std::size_t>(config.maxFrames)) {
           break;

@@ -31,6 +31,8 @@ class IInferenceBackend {
 
   virtual void open(const ModelConfig& config, const InferRuntimeConfig& runtime = {}) = 0;
 
+  virtual void close() = 0;
+
   virtual InferenceOutput infer(const RgbImage& image) = 0;
 
   virtual int inputWidth() const = 0;

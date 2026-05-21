@@ -100,12 +100,12 @@ bool buildTensorView(const InferenceTensor& tensor, TensorView& view) {
   return view.channels > 0 && view.height > 0 && view.width > 0;
 }
 
-bool looksLikeYolo26E2E(const InferenceTensor& tensor) {
+bool matchesYolo26E2E(const InferenceTensor& tensor) {
   DenseLayout layout;
   return buildDenseLayout(tensor, layout) && layout.attributes == 6;
 }
 
-bool looksLikeYolov8Flat(const InferenceTensor& tensor) {
+bool matchesYolov8Flat(const InferenceTensor& tensor) {
   DenseLayout layout;
   if (!buildDenseLayout(tensor, layout)) {
     return false;
@@ -183,7 +183,7 @@ float normalizeYolo26Confidence(float value) {
   return value;
 }
 
-bool looksLikeDiscreteClassId(float value, int classCount) {
+bool matchesDiscreteClassId(float value, int classCount) {
   if (value < -0.5f || value > static_cast<float>(classCount) - 0.5f) {
     return false;
   }
@@ -499,12 +499,12 @@ ModelOutputLayout YoloPostprocessor::inferLayout(const InferenceOutput& output) 
   std::string reason;
 
   if (output.size() == 1) {
-    if (looksLikeYolo26E2E(output.front())) {
+    if (matchesYolo26E2E(output.front())) {
       const ModelOutputLayout resolved = ModelOutputLayout::kYolo26E2E;
       reason = "single-output shape matches [N,6] end-to-end layout";
       return resolved;
     }
-    if (!looksLikeYolov8Flat(output.front())) {
+    if (!matchesYolov8Flat(output.front())) {
       throw std::runtime_error(
           "Unsupported single-output YOLO tensor in auto layout mode. "
           "Only YOLOv8-compatible [1,84,8400]/[1,8400,84] dense exports and "

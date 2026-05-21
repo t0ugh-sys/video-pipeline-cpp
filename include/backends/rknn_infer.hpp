@@ -16,6 +16,7 @@ class RknnInfer : public IInferenceBackend {
   RknnInfer& operator=(const RknnInfer&) = delete;
 
   void open(const ModelConfig& config, const InferRuntimeConfig& runtime = {}) override;
+  void close() override;
   InferenceOutput infer(const RgbImage& image) override;
   int inputWidth() const override { return input_width_; }
   int inputHeight() const override { return input_height_; }
@@ -24,7 +25,6 @@ class RknnInfer : public IInferenceBackend {
  private:
   std::vector<std::uint8_t> readModelFile(const std::string& path) const;
   void queryTensorInfo();
-  void close();
   std::vector<std::string> checkFdInputReasons(const RgbImage& image) const;
 
   rknn_context context_ = 0;
@@ -42,5 +42,6 @@ class RknnInfer : public IInferenceBackend {
   rknn_tensor_attr input_attr_ = {};
   rknn_tensor_attr native_input_attr_ = {};
   InferenceOutput output_templates_;
+  std::vector<rknn_output> output_buffers_;
   std::vector<std::string> static_fd_reasons_;
 };
