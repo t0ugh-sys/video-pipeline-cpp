@@ -63,6 +63,7 @@ class TrtInfer : public IInferenceBackend {
   std::size_t input_binding_ = 0;
   std::size_t input_bytes_ = 0;
   void* owned_input_buffer_ = nullptr;
+  void* stream_ = nullptr;
   bool verbose_ = false;
   bool logged_input_mode_ = false;
   std::vector<BindingInfo> output_bindings_;

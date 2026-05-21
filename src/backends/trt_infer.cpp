@@ -34,8 +34,9 @@ struct TrtDestroy {
 class Logger : public nvinfer1::ILogger {
  public:
   void log(Severity severity, const char* message) noexcept override {
-    (void)severity;
-    (void)message;
+    if (severity <= Severity::kWARNING) {
+      std::cerr << "[TRT] " << static_cast<int>(severity) << " " << message << "\n";
+    }
   }
 };
 
@@ -101,47 +102,26 @@ std::size_t bytesPerElement(nvinfer1::DataType type) {
   }
 }
 
+template <typename T>
 void packRgbToNchw(
     const RgbImage& image,
     int channels,
-    std::vector<std::uint8_t>& destination) {
+    std::vector<T>& destination) {
   const std::size_t planeSize = static_cast<std::size_t>(image.width * image.height);
   destination.resize(planeSize * static_cast<std::size_t>(channels));
 
-  for (std::size_t index = 0; index < planeSize; ++index) {
-    const std::size_t src = index * 3;
-    destination[index] = image.data[src];
-    if (channels > 1) {
-      destination[planeSize + index] = image.data[src + 1];
-    }
-    if (channels > 2) {
-      destination[planeSize * 2 + index] = image.data[src + 2];
+  const uint8_t* src = image.data.data();
+  for (std::size_t i = 0; i < planeSize; ++i, src += 3) {
+    for (int c = 0; c < channels; ++c) {
+      destination[static_cast<std::size_t>(c) * planeSize + i] = static_cast<T>(src[c]);
     }
   }
 }
 
-void packRgbToNchwFloat(
-    const RgbImage& image,
-    int channels,
-    std::vector<float>& destination) {
-  const std::size_t planeSize = static_cast<std::size_t>(image.width * image.height);
-  destination.resize(planeSize * static_cast<std::size_t>(channels));
-
-  for (std::size_t index = 0; index < planeSize; ++index) {
-    const std::size_t src = index * 3;
-    destination[index] = static_cast<float>(image.data[src]);
-    if (channels > 1) {
-      destination[planeSize + index] = static_cast<float>(image.data[src + 1]);
-    }
-    if (channels > 2) {
-      destination[planeSize * 2 + index] = static_cast<float>(image.data[src + 2]);
-    }
-  }
-}
-
-__global__ void rgbNhwcUint8ToNchwUint8Kernel(
+template <typename DstT, bool kToNchw>
+__global__ void rgbConvertKernel(
     const std::uint8_t* src,
-    std::uint8_t* dst,
+    DstT* dst,
     int width,
     int height,
     int channels) {
@@ -155,47 +135,12 @@ __global__ void rgbNhwcUint8ToNchwUint8Kernel(
   const std::size_t srcBase = pixelIndex * channels;
   const std::size_t planeSize = static_cast<std::size_t>(width) * height;
   for (int c = 0; c < channels; ++c) {
-    dst[static_cast<std::size_t>(c) * planeSize + pixelIndex] = src[srcBase + c];
-  }
-}
-
-__global__ void rgbNhwcUint8ToNhwcFloatKernel(
-    const std::uint8_t* src,
-    float* dst,
-    int width,
-    int height,
-    int channels) {
-  const int x = blockIdx.x * blockDim.x + threadIdx.x;
-  const int y = blockIdx.y * blockDim.y + threadIdx.y;
-  if (x >= width || y >= height) {
-    return;
-  }
-
-  const std::size_t pixelIndex = static_cast<std::size_t>(y) * width + x;
-  const std::size_t base = pixelIndex * channels;
-  for (int c = 0; c < channels; ++c) {
-    dst[base + c] = static_cast<float>(src[base + c]);
-  }
-}
-
-__global__ void rgbNhwcUint8ToNchwFloatKernel(
-    const std::uint8_t* src,
-    float* dst,
-    int width,
-    int height,
-    int channels) {
-  const int x = blockIdx.x * blockDim.x + threadIdx.x;
-  const int y = blockIdx.y * blockDim.y + threadIdx.y;
-  if (x >= width || y >= height) {
-    return;
-  }
-
-  const std::size_t pixelIndex = static_cast<std::size_t>(y) * width + x;
-  const std::size_t srcBase = pixelIndex * channels;
-  const std::size_t planeSize = static_cast<std::size_t>(width) * height;
-  for (int c = 0; c < channels; ++c) {
-    dst[static_cast<std::size_t>(c) * planeSize + pixelIndex] =
-        static_cast<float>(src[srcBase + c]);
+    const DstT val = static_cast<DstT>(src[srcBase + c]);
+    if constexpr (kToNchw) {
+      dst[static_cast<std::size_t>(c) * planeSize + pixelIndex] = val;
+    } else {
+      dst[srcBase + c] = val;
+    }
   }
 }
 
@@ -209,6 +154,9 @@ void TrtInfer::open(const ModelConfig& config, const InferRuntimeConfig& runtime
   close();
   verbose_ = runtime.verbose;
   loadEngine(config.modelPath);
+  cudaStream_t s = nullptr;
+  checkCudaStatus(cudaStreamCreate(&s), "Failed to create CUDA stream");
+  stream_ = s;
 }
 
 InferenceOutput TrtInfer::infer(const RgbImage& image) {
@@ -244,7 +192,9 @@ InferenceOutput TrtInfer::infer(const RgbImage& image) {
               << " outputs=" << output_bindings_.size() << "\n";
   }
 
-  checkTrtStatus(context_->executeV2(bindings.data()), "TensorRT execute failed");
+  const auto stream = static_cast<cudaStream_t>(stream_);
+  checkTrtStatus(context_->enqueueV2(bindings.data(), stream, nullptr), "TensorRT enqueue failed");
+  checkCudaStatus(cudaStreamSynchronize(stream), "TensorRT stream sync failed");
 
   InferenceOutput output;
   output.reserve(output_bindings_.size());
@@ -324,6 +274,9 @@ void TrtInfer::configureBindings() {
     if (isInput) {
       input_binding_ = static_cast<std::size_t>(index);
       checkTrtStatus(dims.nbDims == 4, "TensorRT input must be a 4D tensor");
+      // Layout detection heuristic: assumes channel dim <= 4.
+      // For robust detection, use engine_->getBindingFormat() (TensorRT 8.x+)
+      // or specify layout explicitly in model export config.
       if (dims.d[1] > 0 && dims.d[1] <= 4) {
         input_is_nchw_ = true;
         input_channels_ = dims.d[1];
@@ -368,6 +321,7 @@ void TrtInfer::configureBindings() {
     binding.dataType = toTensorDataType(dataType);
     binding.shape = dimsToShape(dims);
     if (dims.nbDims == 4) {
+      // Same layout heuristic as input — channel dim assumed to be small.
       if (dims.d[1] > 0 && dims.d[1] <= 4096) {
         binding.channels = dims.d[1];
         binding.height = dims.d[2];
@@ -399,6 +353,8 @@ void TrtInfer::configureBindings() {
 }
 
 const char* TrtInfer::copyInputToDevice(const RgbImage& image) {
+  const auto stream = static_cast<cudaStream_t>(stream_);
+
   if (image.isOnDevice && image.devicePtr != 0) {
     const dim3 block(16, 16);
     const dim3 grid(
@@ -408,7 +364,7 @@ const char* TrtInfer::copyInputToDevice(const RgbImage& image) {
     const auto* deviceInput = reinterpret_cast<const std::uint8_t*>(image.devicePtr);
     if (input_data_type_ == TensorDataType::kUint8) {
       if (input_is_nchw_) {
-        rgbNhwcUint8ToNchwUint8Kernel<<<grid, block>>>(
+        rgbConvertKernel<uint8_t, true><<<grid, block, 0, stream>>>(
             deviceInput,
             reinterpret_cast<std::uint8_t*>(owned_input_buffer_),
             image.width,
@@ -417,16 +373,15 @@ const char* TrtInfer::copyInputToDevice(const RgbImage& image) {
         checkCudaStatus(cudaGetLastError(), "Failed to launch TensorRT uint8 NCHW input kernel");
       } else {
         checkCudaStatus(
-            cudaMemcpy(owned_input_buffer_, deviceInput, input_bytes_, cudaMemcpyDeviceToDevice),
+            cudaMemcpyAsync(owned_input_buffer_, deviceInput, input_bytes_, cudaMemcpyDeviceToDevice, stream),
             "Failed to copy TensorRT uint8 NHWC input on device");
       }
-      checkCudaStatus(cudaDeviceSynchronize(), "TensorRT uint8 input staging failed");
       return input_is_nchw_ ? "device-kernel-nchw-u8" : "device-copy-nhwc-u8";
     }
 
     if (input_data_type_ == TensorDataType::kFloat32) {
       if (input_is_nchw_) {
-        rgbNhwcUint8ToNchwFloatKernel<<<grid, block>>>(
+        rgbConvertKernel<float, true><<<grid, block, 0, stream>>>(
             deviceInput,
             reinterpret_cast<float*>(owned_input_buffer_),
             image.width,
@@ -434,7 +389,7 @@ const char* TrtInfer::copyInputToDevice(const RgbImage& image) {
             input_channels_);
         checkCudaStatus(cudaGetLastError(), "Failed to launch TensorRT float NCHW input kernel");
       } else {
-        rgbNhwcUint8ToNhwcFloatKernel<<<grid, block>>>(
+        rgbConvertKernel<float, false><<<grid, block, 0, stream>>>(
             deviceInput,
             reinterpret_cast<float*>(owned_input_buffer_),
             image.width,
@@ -442,7 +397,6 @@ const char* TrtInfer::copyInputToDevice(const RgbImage& image) {
             input_channels_);
         checkCudaStatus(cudaGetLastError(), "Failed to launch TensorRT float NHWC input kernel");
       }
-      checkCudaStatus(cudaDeviceSynchronize(), "TensorRT float input staging failed");
       return input_is_nchw_ ? "device-kernel-nchw-f32" : "device-kernel-nhwc-f32";
     }
   }
@@ -458,32 +412,34 @@ const char* TrtInfer::copyInputToDevice(const RgbImage& image) {
   if (input_data_type_ == TensorDataType::kUint8) {
     const void* hostInput = image.data.data();
     if (input_is_nchw_) {
-      packRgbToNchw(image, input_channels_, host_input_buffer_);
+      packRgbToNchw<std::uint8_t>(image, input_channels_, host_input_buffer_);
       hostInput = host_input_buffer_.data();
     }
 
     checkCudaStatus(
-        cudaMemcpy(owned_input_buffer_, hostInput, input_bytes_, cudaMemcpyHostToDevice),
+        cudaMemcpyAsync(owned_input_buffer_, hostInput, input_bytes_, cudaMemcpyHostToDevice, stream),
         "Failed to copy TensorRT uint8 input to device");
     return input_is_nchw_ ? "host-pack-nchw-u8" : "host-copy-nhwc-u8";
   }
 
   if (input_data_type_ == TensorDataType::kFloat32) {
     if (input_is_nchw_) {
-      packRgbToNchwFloat(image, input_channels_, host_input_f32_buffer_);
+      packRgbToNchw<float>(image, input_channels_, host_input_f32_buffer_);
     } else {
       host_input_f32_buffer_.resize(static_cast<std::size_t>(image.width * image.height * input_channels_));
-      for (std::size_t index = 0; index < host_input_f32_buffer_.size(); ++index) {
-        host_input_f32_buffer_[index] = static_cast<float>(image.data[index]);
+      const uint8_t* src = image.data.data();
+      for (std::size_t i = 0; i < host_input_f32_buffer_.size(); ++i) {
+        host_input_f32_buffer_[i] = static_cast<float>(src[i]);
       }
     }
 
     checkCudaStatus(
-        cudaMemcpy(
+        cudaMemcpyAsync(
             owned_input_buffer_,
             host_input_f32_buffer_.data(),
             input_bytes_,
-            cudaMemcpyHostToDevice),
+            cudaMemcpyHostToDevice,
+            stream),
         "Failed to copy TensorRT float input to device");
     return input_is_nchw_ ? "host-pack-nchw-f32" : "host-pack-nhwc-f32";
   }
@@ -506,6 +462,10 @@ void TrtInfer::releaseBuffers() {
 }
 
 void TrtInfer::close() {
+  if (stream_ != nullptr) {
+    cudaStreamDestroy(static_cast<cudaStream_t>(stream_));
+    stream_ = nullptr;
+  }
   releaseBuffers();
   context_.reset();
   engine_.reset();
