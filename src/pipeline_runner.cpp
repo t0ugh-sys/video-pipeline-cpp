@@ -21,6 +21,7 @@ extern "C" {
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <condition_variable>
@@ -1003,6 +1004,12 @@ void validateAppConfig(const AppConfig& config) {
   if (config.inferWorkers < 0) {
     throw std::runtime_error("inferWorkers must be greater than or equal to 0");
   }
+  if (!std::isfinite(config.confThreshold) || config.confThreshold < 0.0f || config.confThreshold > 1.0f) {
+    throw std::runtime_error("confThreshold must be a finite value in [0, 1]");
+  }
+  if (!std::isfinite(config.nmsThreshold) || config.nmsThreshold < 0.0f || config.nmsThreshold > 1.0f) {
+    throw std::runtime_error("nmsThreshold must be a finite value in [0, 1]");
+  }
 
   requireCompiledIn(config.decoderBackend, "decoder", isCompiledIn, availableDecoderBackends, toString);
   requireCompiledIn(config.preprocBackend, "preprocessor", isCompiledIn, availablePreprocBackends, toString);
@@ -1173,6 +1180,7 @@ void runPipeline(const AppConfig& config) {
 
   std::exception_ptr workerError;
   std::mutex errorMutex;
+  std::atomic<bool> stopRequested{false};
   auto storeError = [&](std::exception_ptr error) {
     std::lock_guard<std::mutex> lock(errorMutex);
     if (!workerError) {
@@ -1217,6 +1225,8 @@ void runPipeline(const AppConfig& config) {
           }
         }
       } catch (...) {
+        stopRequested.store(true, std::memory_order_release);
+        packetSource.requestCancel();
         storeError(std::current_exception());
         preparedQueue.close();
         processedQueue.close();
@@ -1504,6 +1514,8 @@ void runPipeline(const AppConfig& config) {
       storeError(std::current_exception());
       preparedQueue.close();
       processedQueue.close();
+      stopRequested.store(true, std::memory_order_release);
+      packetSource.requestCancel();
     }
   });
 
@@ -1511,12 +1523,14 @@ void runPipeline(const AppConfig& config) {
     bool eosSubmitted = false;
     std::size_t producedFrames = 0;
     bool loggedFirstDecodedFrame = false;
-    while (!eosSubmitted && (config.maxFrames == 0 || producedFrames < static_cast<std::size_t>(config.maxFrames))) {
+    bool ingestionStopped = false;
+    while (!eosSubmitted && !ingestionStopped && !stopRequested.load(std::memory_order_acquire) &&
+           (config.maxFrames == 0 || producedFrames < static_cast<std::size_t>(config.maxFrames))) {
       const EncodedPacket packet = packetSource.readPacket();
       decoder->submitPacket(packet);
       eosSubmitted = packet.endOfStream;
 
-      while (true) {
+      while (!stopRequested.load(std::memory_order_acquire)) {
         const auto decodeStart = Clock::now();
         std::optional<DecodedFrame> decodedFrame = decoder->receiveFrame();
         const auto decodeEnd = Clock::now();
@@ -1554,7 +1568,9 @@ void runPipeline(const AppConfig& config) {
         const auto preprocEnd = Clock::now();
         prepared.preprocMs = Ms(preprocEnd - preprocStart).count();
 
-        if (!preparedQueue.push(std::move(prepared))) {
+        if (stopRequested.load(std::memory_order_acquire) || !preparedQueue.push(std::move(prepared))) {
+          stopRequested.store(true, std::memory_order_release);
+          ingestionStopped = true;
           break;
         }
         ++producedFrames;
@@ -1564,6 +1580,7 @@ void runPipeline(const AppConfig& config) {
       }
     }
   } catch (...) {
+    stopRequested.store(true, std::memory_order_release);
     storeError(std::current_exception());
   }
 

@@ -2,8 +2,8 @@
 
 #include "pipeline_types.hpp"
 
+#include <atomic>
 #include <string>
-
 struct AVBSFContext;
 struct AVFormatContext;
 
@@ -16,6 +16,7 @@ class FFmpegPacketSource {
   FFmpegPacketSource& operator=(const FFmpegPacketSource&) = delete;
 
   void open(const InputSourceConfig& config);
+  void requestCancel() noexcept;
   EncodedPacket readPacket();
   VideoCodec codec() const;
   SourceVideoInfo videoInfo() const;
@@ -35,5 +36,6 @@ class FFmpegPacketSource {
   VideoCodec codec_ = VideoCodec::kUnknown;
   bool bsfFlushed_ = false;
   SourceVideoInfo videoInfo_;
+  std::atomic<bool> cancelRequested_{false};
   std::string inputOptionsSummary_;
 };

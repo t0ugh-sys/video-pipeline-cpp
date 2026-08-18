@@ -98,6 +98,12 @@ bool envBoolEnabled(const char* name, bool defaultValue) {
 const char* boolToOnOff(bool value) {
   return value ? "on" : "off";
 }
+static int ffmpegInterruptCallback(void* opaque) noexcept {
+  return static_cast<const std::atomic<bool>*>(opaque)
+             ->load(std::memory_order_acquire)
+         ? 1
+         : 0;
+}
 
 }  // namespace
 
@@ -107,8 +113,8 @@ FFmpegPacketSource::~FFmpegPacketSource() {
 
 void FFmpegPacketSource::open(const InputSourceConfig& config) {
   close();
+  cancelRequested_.store(false, std::memory_order_relaxed);
   avformat_network_init();
-
   AVDictionary* inputOptions = nullptr;
   if (isRtspUrl(config.uri)) {
     const std::string transport = getenvRtspTransport("VIP_RTSP_TRANSPORT", "tcp");
@@ -127,6 +133,17 @@ void FFmpegPacketSource::open(const InputSourceConfig& config) {
   } else {
     inputOptionsSummary_.clear();
   }
+
+  // Pre-allocate context so we can wire the interrupt callback before the
+  // blocking avformat_open_input() call. If open fails FFmpeg frees the
+  // context and sets the pointer to null — no double-free on our side.
+  formatContext_ = avformat_alloc_context();
+  if (!formatContext_) {
+    av_dict_free(&inputOptions);
+    throw std::runtime_error("Failed to allocate AVFormatContext");
+  }
+  formatContext_->interrupt_callback.callback = ffmpegInterruptCallback;
+  formatContext_->interrupt_callback.opaque = &cancelRequested_;
 
   int result = avformat_open_input(&formatContext_, config.uri.c_str(), nullptr, &inputOptions);
   av_dict_free(&inputOptions);
@@ -203,6 +220,11 @@ EncodedPacket FFmpegPacketSource::readPacket() {
       return eosPacket;
     }
     if (result < 0) {
+      if (result == AVERROR_EXIT) {
+        EncodedPacket eosPacket;
+        eosPacket.endOfStream = true;
+        return eosPacket;
+      }
       throwFfmpegError("Failed to read frame", result);
     }
 
@@ -271,6 +293,10 @@ void FFmpegPacketSource::close() {
   bsfFlushed_ = false;
   videoInfo_ = {};
   inputOptionsSummary_.clear();
+}
+
+void FFmpegPacketSource::requestCancel() noexcept {
+  cancelRequested_.store(true, std::memory_order_release);
 }
 
 bool FFmpegPacketSource::needsAnnexBFilter() const {

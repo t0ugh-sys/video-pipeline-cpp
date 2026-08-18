@@ -270,7 +270,14 @@ float tensorValueAt(const InferenceTensor& tensor, const TensorView& view, int c
       const auto* raw = reinterpret_cast<const std::int32_t*>(tensor.rawData.data());
       return static_cast<float>(raw[index]);
     }
-    case TensorDataType::kFloat32:
+    case TensorDataType::kFloat32: {
+      if (tensor.rawData.size() >= (index + 1) * sizeof(float)) {
+        float v;
+        std::memcpy(&v, tensor.rawData.data() + index * sizeof(float), sizeof(float));
+        return v;
+      }
+      return 0.0f;
+    }
     default:
       return 0.0f;
   }
@@ -470,7 +477,14 @@ std::vector<float> YoloPostprocessor::valuesAsFloat(const InferenceTensor& tenso
       for (std::size_t i = 0; i < count; ++i) values[i] = static_cast<float>(raw[i]);
       break;
     }
-    case TensorDataType::kFloat32:
+    case TensorDataType::kFloat32: {
+      const auto count = tensor.rawData.size() / sizeof(float);
+      values.resize(count);
+      for (std::size_t i = 0; i < count; ++i) {
+        std::memcpy(&values[i], tensor.rawData.data() + i * sizeof(float), sizeof(float));
+      }
+      break;
+    }
     default:
       break;
   }
