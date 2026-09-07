@@ -24,6 +24,7 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -230,11 +231,16 @@ RknnCoreMaskMode resolveAutoRknnCoreMask(int workerIndex, int workerCount) {
   }
 }
 
-InferRuntimeConfig makeInferRuntimeConfig(const AppConfig& config, int workerIndex, int workerCount) {
+InferRuntimeConfig makeInferRuntimeConfig(
+    const AppConfig& config,
+    int workerIndex,
+    int workerCount,
+    bool usePersistentInputMemory) {
   InferRuntimeConfig runtime;
   runtime.workerIndex = workerIndex;
   runtime.workerCount = std::max(1, workerCount);
   runtime.verbose = config.verbose;
+  runtime.usePersistentInputMemory = usePersistentInputMemory;
   runtime.rknnCoreMask =
       config.rknnCoreMask == RknnCoreMaskMode::kAuto
           ? resolveAutoRknnCoreMask(workerIndex, runtime.workerCount)
@@ -1109,6 +1115,10 @@ void runPipeline(const AppConfig& config) {
       config.preprocBackend == PreprocBackendType::kAuto ? detectAvailablePreprocBackend() : config.preprocBackend;
   const InferBackendType selectedInferBackend =
       config.inferBackend == InferBackendType::kAuto ? detectAvailableInferBackend() : config.inferBackend;
+  const bool useOfficialRknnZeroCopyPath =
+      config.rknnZeroCopy &&
+      selectedPreprocBackend == PreprocBackendType::kRockchipRga &&
+      selectedInferBackend == InferBackendType::kRockchipRknn;
   const int resolvedInferWorkers = resolveInferWorkerCount(config, selectedInferBackend);
   const std::size_t inferenceQueueCapacity = static_cast<std::size_t>(std::max(2, resolvedInferWorkers * 2));
   const std::size_t rgaMaxInflightFrames = static_cast<std::size_t>(std::max(1, resolvedInferWorkers * 2 + 4));
@@ -1132,6 +1142,7 @@ void runPipeline(const AppConfig& config) {
               << " visual_style=" << visualStyleName(config.visual.style)
               << " letterbox=" << (config.letterbox ? "on" : "off")
               << " rknn_zero_copy=" << (config.rknnZeroCopy ? "on" : "off")
+              << " rknn_zero_copy_path=" << (useOfficialRknnZeroCopyPath ? "official-input-mem" : "legacy")
               << " model_output_layout=" << toModelOutputLayoutName(config.modelOutputLayout)
               << " infer_workers=" << resolvedInferWorkers
               << "\n";
@@ -1145,7 +1156,9 @@ void runPipeline(const AppConfig& config) {
   int inferInputHeight = config.model.inputHeight;
   {
     auto inferProbe = createInferBackend(config.inferBackend);
-    inferProbe->open(config.model, makeInferRuntimeConfig(config, 0, resolvedInferWorkers));
+    inferProbe->open(
+        config.model,
+        makeInferRuntimeConfig(config, 0, resolvedInferWorkers, useOfficialRknnZeroCopyPath));
     inferInputWidth = inferProbe->inputWidth() > 0 ? inferProbe->inputWidth() : config.model.inputWidth;
     inferInputHeight = inferProbe->inputHeight() > 0 ? inferProbe->inputHeight() : config.model.inputHeight;
     if (config.verbose) {
@@ -1194,11 +1207,44 @@ void runPipeline(const AppConfig& config) {
     inferWorkers.emplace_back([&, workerIndex] {
       try {
         auto infer = createInferBackend(config.inferBackend);
-        infer->open(config.model, makeInferRuntimeConfig(config, workerIndex, resolvedInferWorkers));
+        infer->open(
+            config.model,
+            makeInferRuntimeConfig(
+                config, workerIndex, resolvedInferWorkers, useOfficialRknnZeroCopyPath));
         auto postproc = createPostprocBackend(resolvedPostprocBackend, makePostprocessOptions(config));
 
         PreparedFrame prepared;
         while (preparedQueue.pop(prepared)) {
+          if (useOfficialRknnZeroCopyPath && prepared.inferenceImage.width == 0) {
+            const InferenceInputMemory target = infer->inputMemory();
+            if (!target.valid()) {
+              throw std::runtime_error(
+                  "Official RKNN zero-copy path did not provide a valid persistent input memory");
+            }
+
+            const auto preprocStart = Clock::now();
+            PreprocessOptions options;
+            options.letterbox = config.letterbox;
+            options.paddingValue = 114;
+            options.needsCpuData = false;
+            options.outputDmaFd = target.dmaFd;
+            options.outputDmaSize = target.dmaSize;
+            options.outputVirtAddr = target.virtAddr;
+            options.outputPhysAddr = target.physAddr;
+            options.outputOffset = target.offset;
+            options.outputFlags = target.flags;
+            options.outputPrivData = target.privData;
+            options.outputWstride = target.wstride;
+            options.outputHstride = target.hstride;
+            options.strictZeroCopy = true;
+            prepared.inferenceImage = preproc->convertAndResize(
+                prepared.decodedFrame,
+                infer->inputWidth(),
+                infer->inputHeight(),
+                options);
+            prepared.preprocMs = Ms(Clock::now() - preprocStart).count();
+          }
+
           const auto inferStart = Clock::now();
           const InferenceOutput output = infer->infer(prepared.inferenceImage);
           const auto inferEnd = Clock::now();
@@ -1224,7 +1270,8 @@ void runPipeline(const AppConfig& config) {
             break;
           }
         }
-      } catch (...) {
+      } catch (const std::exception& error) {
+        std::cerr << '[' << 'P' << 'I' << 'P' << 'E' << 'L' << 'I' << 'N' << 'E' << ']' << ' ' << error.what() << std::endl;
         stopRequested.store(true, std::memory_order_release);
         packetSource.requestCancel();
         storeError(std::current_exception());
@@ -1499,6 +1546,7 @@ void runPipeline(const AppConfig& config) {
               "encoder-output requested, but no decodable frame with a valid dma fd reached the output stage");
         }
         encoder->flush();
+        encoder->close();
       }
       if (annotatedVideoEncoder) {
         if (!annotatedVideoEncoderInitialized) {
@@ -1506,6 +1554,7 @@ void runPipeline(const AppConfig& config) {
               "annotated output requested, but no frame reached the annotated video encoder");
         }
         annotatedVideoEncoder->flush();
+        annotatedVideoEncoder->close();
       }
       if (visualizer) {
         visualizer->close();
@@ -1558,15 +1607,20 @@ void runPipeline(const AppConfig& config) {
         prepared.originalHeight = decodedFrame->height;
         prepared.decodeMs = Ms(decodeEnd - decodeStart).count();
 
-        const auto preprocStart = Clock::now();
-        prepared.inferenceImage = preproc->convertAndResize(
-            decodedFrame.value(),
-            inferInputWidth,
-            inferInputHeight,
-            PreprocessOptions{config.letterbox, 114, !config.rknnZeroCopy});
+        if (!useOfficialRknnZeroCopyPath) {
+          const auto preprocStart = Clock::now();
+          PreprocessOptions options;
+          options.letterbox = config.letterbox;
+          options.paddingValue = 114;
+          options.needsCpuData = !config.rknnZeroCopy;
+          prepared.inferenceImage = preproc->convertAndResize(
+              decodedFrame.value(),
+              inferInputWidth,
+              inferInputHeight,
+              options);
+          prepared.preprocMs = Ms(Clock::now() - preprocStart).count();
+        }
         prepared.decodedFrame = std::move(decodedFrame.value());
-        const auto preprocEnd = Clock::now();
-        prepared.preprocMs = Ms(preprocEnd - preprocStart).count();
 
         if (stopRequested.load(std::memory_order_acquire) || !preparedQueue.push(std::move(prepared))) {
           stopRequested.store(true, std::memory_order_release);
@@ -1592,22 +1646,6 @@ void runPipeline(const AppConfig& config) {
   outputThread.join();
 
   if (workerError) {
-    try {
-      std::rethrow_exception(workerError);
-    } catch (const std::exception& error) {
-      std::cerr << "\n[ERROR] Pipeline failed: " << error.what() << '\n';
-    } catch (...) {
-      std::cerr << "\n[ERROR] Pipeline failed with an unknown error\n";
-    }
-    std::cout.flush();
-    std::cerr.flush();
-    std::_Exit(1);
+    std::rethrow_exception(workerError);
   }
-
-  // Some board-side Rockchip library combinations still crash during process
-  // teardown after a fully successful run. Once all work is completed and no
-  // error is pending, exit immediately to avoid destructing backend objects.
-  std::cout.flush();
-  std::cerr.flush();
-  std::_Exit(0);
 }

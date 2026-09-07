@@ -289,6 +289,60 @@ void RknnInfer::open(const ModelConfig& config, const InferRuntimeConfig& runtim
   static_fd_reasons_ =
       buildStaticFdInputReasons(is_nhwc_, has_native_input_attr_, input_width_, input_height_, native_input_attr_);
 
+  if (runtime_config_.usePersistentInputMemory) {
+    if (!has_native_input_attr_) {
+      throw std::runtime_error(
+          "RKNN persistent input memory requires RKNN_QUERY_NATIVE_INPUT_ATTR");
+    }
+
+    const uint32_t nativeInputBytes =
+        native_input_attr_.size_with_stride != 0
+            ? native_input_attr_.size_with_stride
+            : native_input_attr_.size;
+    if (nativeInputBytes == 0) {
+      throw std::runtime_error("RKNN native input tensor has zero buffer size");
+    }
+
+    // Match the official RKNN zero-copy sample: let RKNN perform the
+    // uint8 input conversion/quantization after RGA has filled this buffer.
+    native_input_attr_.type = RKNN_TENSOR_UINT8;
+    input_mem_ = rknn_create_mem(context_, nativeInputBytes);
+    if (input_mem_ == nullptr) {
+      throw std::runtime_error("rknn_create_mem for persistent input failed");
+    }
+    checkRknnStatus(
+        rknn_set_io_mem(context_, input_mem_, &native_input_attr_),
+        "rknn_set_io_mem for persistent input failed");
+
+    input_memory_.dmaFd = input_mem_->fd;
+    input_memory_.virtAddr = input_mem_->virt_addr;
+    input_memory_.physAddr = input_mem_->phys_addr;
+    input_memory_.offset = input_mem_->offset;
+    input_memory_.flags = input_mem_->flags;
+    input_memory_.privData = input_mem_->priv_data;
+    input_memory_.dmaSize = input_mem_->size != 0 ? input_mem_->size : nativeInputBytes;
+    input_memory_.wstride = native_input_attr_.w_stride != 0
+        ? static_cast<int>(native_input_attr_.w_stride)
+        : input_width_;
+    input_memory_.hstride = native_input_attr_.h_stride != 0
+        ? static_cast<int>(native_input_attr_.h_stride)
+        : input_height_;
+    persistent_input_bound_ = input_memory_.valid();
+    if (verbose_) {
+      std::cerr << '[' << 'R' << 'K' << 'N' << 'N' << ']' << ' '
+                << input_memory_.dmaFd << ' '
+                << input_memory_.virtAddr << ' '
+                << input_memory_.physAddr << ' '
+                << input_memory_.offset << ' '
+                << input_memory_.dmaSize << ' '
+                << input_memory_.flags << ' '
+                << input_memory_.privData << std::endl;
+    }
+    if (!persistent_input_bound_) {
+      throw std::runtime_error("RKNN persistent input memory returned invalid DMA-BUF metadata");
+    }
+  }
+
   if (verbose_) {
     std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
               << "/" << runtime_config_.workerCount
@@ -303,6 +357,7 @@ void RknnInfer::open(const ModelConfig& config, const InferRuntimeConfig& runtim
     std::cerr << " static_fd_input="
               << (static_fd_reasons_.empty() ? "possible" : "fallback")
               << " reason=" << joinReasons(static_fd_reasons_)
+              << " input_path=" << (persistent_input_bound_ ? "persistent-dma-fd" : "per-frame")
               << "\n";
   }
 }
@@ -315,13 +370,30 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
     throw std::runtime_error("RGB image size does not match RKNN input tensor");
   }
 
-  const auto fdReasons = checkFdInputReasons(image);
-  const bool canUseFdInput = fdReasons.empty();
+  std::vector<std::string> fdReasons;
+  bool canUseFdInput = false;
+  if (persistent_input_bound_) {
+    if (image.format != PixelFormat::kRgb888) {
+      throw std::runtime_error("Persistent RKNN input requires an RGB888 image");
+    }
+    if (image.dmaFd != input_memory_.dmaFd) {
+      throw std::runtime_error(
+          "Persistent RKNN input DMA-BUF fd does not match the worker input memory");
+    }
+    canUseFdInput = true;
+  } else {
+    fdReasons = checkFdInputReasons(image);
+    canUseFdInput = fdReasons.empty();
+  }
 
   if (verbose_ && (!has_last_fd_decision_ || last_can_use_fd_input_ != canUseFdInput)) {
     std::cerr << "[RKNN] worker=" << runtime_config_.workerIndex
-              << " input_path=" << (canUseFdInput ? "dma-fd" : "host-copy")
-              << " reason=" << (canUseFdInput ? "all zero-copy conditions satisfied" : joinReasons(fdReasons))
+              << " input_path="
+              << (persistent_input_bound_ ? "persistent-dma-fd" : (canUseFdInput ? "dma-fd" : "host-copy"))
+              << " reason="
+              << (persistent_input_bound_
+                      ? "official persistent RKNN input memory"
+                      : (canUseFdInput ? "all zero-copy conditions satisfied" : joinReasons(fdReasons)))
               << "\n";
   }
   has_last_fd_decision_ = true;
@@ -330,7 +402,11 @@ InferenceOutput RknnInfer::infer(const RgbImage& image) {
   std::vector<std::uint8_t> inputBuffer;
   RknnTensorMemGuard tensorMemGuard(context_);
 
-  if (canUseFdInput) {
+  if (persistent_input_bound_) {
+    // The input memory was bound once in open(). This is the same contract as
+    // the official yolov8_zero_copy.cc sample, so no per-frame memory import or
+    // rknn_set_io_mem call is needed here.
+  } else if (canUseFdInput) {
     const uint32_t nativeInputBytes =
         native_input_attr_.size_with_stride != 0 ? native_input_attr_.size_with_stride : native_input_attr_.size;
     auto* mem = rknn_create_mem_from_fd(context_, image.dmaFd, nullptr, nativeInputBytes, 0);
@@ -481,6 +557,7 @@ void RknnInfer::queryTensorInfo() {
 }
 
 void RknnInfer::close() {
+  releasePersistentInputMemory();
   if (context_ != 0) {
     rknn_context ctx = context_;
     context_ = 0;
@@ -502,6 +579,21 @@ void RknnInfer::close() {
   output_buffers_.clear();
   static_fd_reasons_.clear();
   use_float_output_for_flat_yolo_ = false;
+}
+
+void RknnInfer::releasePersistentInputMemory() {
+  if (input_mem_ != nullptr) {
+    if (context_ != 0) {
+      rknn_destroy_mem(context_, input_mem_);
+    }
+    input_mem_ = nullptr;
+  }
+  persistent_input_bound_ = false;
+  input_memory_ = {};
+}
+
+InferenceInputMemory RknnInfer::inputMemory() const {
+  return input_memory_;
 }
 
 std::vector<std::string> RknnInfer::checkFdInputReasons(const RgbImage& image) const {

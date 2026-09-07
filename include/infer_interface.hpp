@@ -2,6 +2,7 @@
 
 #include "pipeline_types.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -22,7 +23,22 @@ struct InferRuntimeConfig {
   int workerIndex = 0;
   int workerCount = 1;
   bool verbose = false;
+  bool usePersistentInputMemory = false;
   RknnCoreMaskMode rknnCoreMask = RknnCoreMaskMode::kAuto;
+};
+
+struct InferenceInputMemory {
+  int dmaFd = -1;
+  void* virtAddr = nullptr;
+  std::uint64_t physAddr = 0;
+  int offset = 0;
+  std::uint32_t flags = 0;
+  void* privData = nullptr;
+  std::size_t dmaSize = 0;
+  int wstride = 0;
+  int hstride = 0;
+
+  bool valid() const { return dmaFd >= 0 && dmaSize > 0 && wstride > 0 && hstride > 0; }
 };
 
 class IInferenceBackend {
@@ -34,6 +50,8 @@ class IInferenceBackend {
   virtual void close() = 0;
 
   virtual InferenceOutput infer(const RgbImage& image) = 0;
+
+  virtual InferenceInputMemory inputMemory() const { return {}; }
 
   virtual int inputWidth() const = 0;
 

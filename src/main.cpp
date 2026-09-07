@@ -44,7 +44,7 @@ int main(int argc, char* argv[]) {
     runPipeline(parseResult.config);
     std::cout.flush();
     std::cerr.flush();
-    std::_Exit(0);
+    return 0;
   } catch (const std::exception& error) {
     std::cerr << "\n[ERROR] Pipeline failed: " << error.what() << '\n';
     return 1;

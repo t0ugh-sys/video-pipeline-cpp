@@ -30,7 +30,8 @@ inline int alignUp(int value, int alignment) {
 void checkRgaOp(IM_STATUS status, const char* stage) {
   if (status != IM_STATUS_SUCCESS) {
     throw std::runtime_error(
-        std::string("RGA ") + stage + " failed: " + imStrError_t(status));
+        std::string("RGA ") + stage + " failed (status=" +
+        std::to_string(static_cast<int>(status)) + "): " + imStrError_t(status));
   }
 }
 
@@ -38,7 +39,7 @@ void checkRgaOp(IM_STATUS status, const char* stage) {
 void checkRgaVerify(int ret, const char* stage) {
   if (ret != IM_STATUS_NOERROR) {
     throw std::runtime_error(
-        std::string("RGA imcheck before ") + stage + " failed: " +
+        std::string("RGA imcheck before ") + stage + " failed (status=" + std::to_string(ret) + "): " +
         imStrError_t(static_cast<IM_STATUS>(ret)));
   }
 }
@@ -347,45 +348,54 @@ RgbImage RgaPreprocessor::convertAndResize(
       const int resizedNv12Hstride = alignUp(resizedHeight, 2);
       const int resizedRgbWstride = alignUp(resizedWidth, kRgaStrideAlign);
       const int resizedRgbHstride = resizedHeight;
-      const int outputRgbWstride = alignUp(outputWidth, kRgaStrideAlign);
-      const int outputRgbHstride = outputHeight;
+      const bool externalOutput = options.outputDmaFd >= 0;
+      const int outputRgbWstride = externalOutput && options.outputWstride > 0
+          ? options.outputWstride
+          : alignUp(outputWidth, kRgaStrideAlign);
+      const int outputRgbHstride = externalOutput && options.outputHstride > 0
+          ? options.outputHstride
+          : outputHeight;
       const std::size_t resizedNv12Bytes =
           needsResize ? static_cast<std::size_t>(nv12BytesForStride(resizedNv12Wstride, resizedNv12Hstride)) : 0;
       const std::size_t resizedRgbBytes =
           static_cast<std::size_t>(rgb888BytesForStride(resizedRgbWstride, resizedRgbHstride));
-      const std::size_t outputAlignedRgbBytes =
+      const std::size_t requiredOutputBytes =
           static_cast<std::size_t>(rgb888BytesForStride(outputRgbWstride, outputRgbHstride));
+      const std::size_t outputAlignedRgbBytes = externalOutput && options.outputDmaSize > 0
+          ? options.outputDmaSize
+          : requiredOutputBytes;
+      if (externalOutput && outputAlignedRgbBytes < requiredOutputBytes) {
+        throw std::runtime_error("RKNN input DMA-BUF is smaller than the RGA RGB target");
+      }
       const std::size_t maxBufferBytes =
           std::max(outputAlignedRgbBytes, std::max(resizedNv12Bytes, resizedRgbBytes));
       ensureBufferGroup(maxBufferBytes);
 
-      outputBuffer = allocateBuffer(static_cast<MppBufferGroup>(bufferGroup_), outputAlignedRgbBytes, "RGA output");
-      output.dmaFd = mpp_buffer_get_fd(outputBuffer);
-      if (output.dmaFd < 0) {
-        throw std::runtime_error("mpp_buffer_get_fd failed for RGA output buffer");
-      }
-      output.wstride = outputRgbWstride;
-      output.hstride = outputRgbHstride;
-      output.dmaSize = outputAlignedRgbBytes;
-      output.nativeHandle = makeMppBufferHandle(outputBuffer);
-      outputBuffer = nullptr;
-
-      outputHandle = importbuffer_fd(output.dmaFd, static_cast<int>(outputAlignedRgbBytes));
-      if (outputHandle == 0) {
-        throw std::runtime_error("Failed to import RGA output DRM buffer");
-      }
-
-      srcHandle = importbuffer_fd(
-          frame.dmaFd,
-          frame.horizontalStride,
-          frame.verticalStride,
-          RK_FORMAT_YCbCr_420_SP);
-      if (srcHandle == 0) {
-        throw std::runtime_error("RGA importbuffer_fd failed for decoded frame");
+      if (externalOutput) {
+        output.dmaFd = options.outputDmaFd;
+        output.wstride = outputRgbWstride;
+        output.hstride = outputRgbHstride;
+        output.dmaSize = outputAlignedRgbBytes;
+      } else {
+        outputBuffer = allocateBuffer(static_cast<MppBufferGroup>(bufferGroup_), outputAlignedRgbBytes, "RGA output");
+        output.dmaFd = mpp_buffer_get_fd(outputBuffer);
+        if (output.dmaFd < 0) {
+          throw std::runtime_error("mpp_buffer_get_fd failed for RGA output buffer");
+        }
+        output.wstride = outputRgbWstride;
+        output.hstride = outputRgbHstride;
+        output.dmaSize = outputAlignedRgbBytes;
+        output.nativeHandle = makeMppBufferHandle(outputBuffer);
+        outputBuffer = nullptr;
       }
 
       const im_rect emptyRect = {};
       const rga_buffer_t emptyPat = {};
+      // All buffers in an RGA operation must use the same handle-based API.
+      srcHandle = importbuffer_fd(frame.dmaFd, frame.horizontalStride, frame.verticalStride, RK_FORMAT_YCbCr_420_SP);
+      if (srcHandle == 0) {
+        throw std::runtime_error("RGA importbuffer_fd failed for decoded frame");
+      }
       rga_buffer_t src = wrapbuffer_handle(
           srcHandle,
           frame.width,
@@ -393,6 +403,10 @@ RgbImage RgaPreprocessor::convertAndResize(
           RK_FORMAT_YCbCr_420_SP,
           frame.horizontalStride,
           frame.verticalStride);
+      outputHandle = importbuffer_fd(output.dmaFd, outputRgbWstride, outputRgbHstride, RK_FORMAT_RGB_888);
+      if (outputHandle == 0) {
+        throw std::runtime_error("RGA importbuffer_fd failed for RGB target");
+      }
       rga_buffer_t outputRgb = wrapbuffer_handle(
           outputHandle,
           outputWidth,
@@ -400,7 +414,6 @@ RgbImage RgaPreprocessor::convertAndResize(
           RK_FORMAT_RGB_888,
           outputRgbWstride,
           outputRgbHstride);
-
       if (needsResize) {
         ensureResizedNv12Buffer(
             resizedWidth,
@@ -439,27 +452,19 @@ RgbImage RgaPreprocessor::convertAndResize(
           checkRgaOp(
               imcvtcolor(resizedNv12, resizedRgb, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
               "imcvtcolor(NV12->RGB)");
-          const int top = output.letterbox.padTop;
-          const int bottom = output.letterbox.padBottom;
-          const int left = output.letterbox.padLeft;
-          const int right = output.letterbox.padRight;
-
-          const IM_STATUS borderStatus = immakeBorder(
-              resizedRgb,
-              outputRgb,
-              top,
-              bottom,
-              left,
-              right,
-              IM_BORDER_CONSTANT,
-              static_cast<int>(options.paddingValue),
-              1,
-              -1,
-              nullptr);
-          if (borderStatus != IM_STATUS_SUCCESS) {
-            throw std::runtime_error(
-                std::string("RGA immakeBorder failed: ") + imStrError_t(borderStatus));
-          }
+          const int padding = static_cast<int>(options.paddingValue);
+          const int color = padding | (padding << 8) | (padding << 16);
+          const im_rect fullRect = {0, 0, outputWidth, outputHeight};
+          const im_rect sourceRect = {0, 0, resizedWidth, resizedHeight};
+          const im_rect targetRect = {
+              output.letterbox.padLeft, output.letterbox.padTop,
+              resizedWidth, resizedHeight};
+          checkRgaOp(imfill(outputRgb, fullRect, color), "imfill(letterbox)");
+          checkRgaOp(
+              improcess(resizedRgb, outputRgb, emptyPat,
+                        sourceRect, targetRect, emptyRect,
+                        -1, nullptr, nullptr, IM_SYNC),
+              "improcess(letterbox ROI)");
         } else {
           checkRgaOp(
               imcvtcolor(resizedNv12, outputRgb, RK_FORMAT_YCbCr_420_SP, RK_FORMAT_RGB_888),
@@ -475,6 +480,15 @@ RgbImage RgaPreprocessor::convertAndResize(
       releaseHandle(outputHandle);
       return output;
     } catch (const std::exception& error) {
+      const bool strictExternalOutput = options.outputDmaFd >= 0 && options.strictZeroCopy;
+      if (strictExternalOutput) {
+        releaseHandle(srcHandle);
+        releaseHandle(outputHandle);
+        if (outputBuffer != nullptr) {
+          mpp_buffer_put(outputBuffer);
+        }
+        throw;
+      }
       static bool loggedZeroCopyFallback = false;
       if (!loggedZeroCopyFallback) {
         loggedZeroCopyFallback = true;

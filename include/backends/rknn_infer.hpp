@@ -18,6 +18,7 @@ class RknnInfer : public IInferenceBackend {
   void open(const ModelConfig& config, const InferRuntimeConfig& runtime = {}) override;
   void close() override;
   InferenceOutput infer(const RgbImage& image) override;
+  InferenceInputMemory inputMemory() const override;
   int inputWidth() const override { return input_width_; }
   int inputHeight() const override { return input_height_; }
   std::string name() const override { return "Rockchip RKNN"; }
@@ -26,8 +27,12 @@ class RknnInfer : public IInferenceBackend {
   std::vector<std::uint8_t> readModelFile(const std::string& path) const;
   void queryTensorInfo();
   std::vector<std::string> checkFdInputReasons(const RgbImage& image) const;
+  void releasePersistentInputMemory();
 
   rknn_context context_ = 0;
+  rknn_tensor_mem* input_mem_ = nullptr;
+  bool persistent_input_bound_ = false;
+  InferenceInputMemory input_memory_ = {};
   std::vector<std::uint8_t> model_data_;
   int input_width_ = 0;
   int input_height_ = 0;

@@ -70,15 +70,19 @@ int MppDecoder::toMppCodec(VideoCodec codec) const {
 void MppDecoder::close() {
   readyFrames_.clear();
   eosSubmitted_ = false;
-  if (externalBufferGroup_ != nullptr) {
-    mpp_buffer_group_put(externalBufferGroup_);
-    externalBufferGroup_ = nullptr;
-  }
   if (context_ != nullptr) {
+    if (api_ != nullptr) {
+      api_->reset(context_);
+    }
     mpp_destroy(context_);
   }
   context_ = nullptr;
   api_ = nullptr;
+  // The decoder must release its buffer references before the pool is freed.
+  if (externalBufferGroup_ != nullptr) {
+    mpp_buffer_group_put(externalBufferGroup_);
+    externalBufferGroup_ = nullptr;
+  }
 }
 
 void MppDecoder::submitPacket(const EncodedPacket& packet) {

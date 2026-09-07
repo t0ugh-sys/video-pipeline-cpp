@@ -45,7 +45,8 @@ bool testRejectsYolo26E2E() {
     return expect(false, "expected yolo26_e2e to throw unsupported");
   } catch (const std::exception& error) {
     return expect(
-        std::string(error.what()).find("currently unsupported") != std::string::npos,
+        std::string(error.what()).find("YOLO26 E2E layout unsupported on RKNN") !=
+            std::string::npos,
         "expected yolo26_e2e unsupported message");
   }
 }
@@ -147,7 +148,7 @@ bool testNmsKeepsHigherScore() {
   // A (score=0.95) suppresses B (score=0.8), C (score=0.7) survives
   std::vector<BoundingBox> boxes = {
       makeBox(10, 10, 50, 50, 0.95f, 0),
-      makeBox(30, 30, 70, 70, 0.80f, 0),
+      makeBox(20, 20, 60, 60, 0.80f, 0),
       makeBox(200, 200, 240, 240, 0.70f, 0),
   };
   auto result = YoloPostprocessor::nms(boxes, 0.3f);
